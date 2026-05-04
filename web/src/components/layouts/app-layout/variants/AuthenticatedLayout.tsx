@@ -11,6 +11,8 @@ import { AppSidebar } from "@/src/components/nav/app-sidebar";
 import { Toaster } from "@/src/components/ui/sonner";
 import { TopBannerProvider } from "@/src/features/top-banner";
 import { ResizableContent } from "../components/ResizableContent";
+import { AssistantShell } from "@/src/features/in-app-agent/components";
+import useIsFeatureEnabled from "@/src/features/feature-flags/hooks/useIsFeatureEnabled";
 import { ThemeToggle } from "@/src/features/theming/ThemeToggle";
 import {
   getAvailableCloudRegionOptions,
@@ -102,6 +104,7 @@ export function AuthenticatedLayout({
   onSignOut,
 }: AuthenticatedLayoutProps) {
   const { isLangfuseCloud, region: currentRegion } = useLangfuseCloudRegion();
+  const assistantEnabled = useIsFeatureEnabled("inAppAgent");
 
   // Safe assertion: AuthenticatedLayout is only rendered after auth checks pass
   // in AppLayout, which guarantees session.user exists at this point
@@ -156,6 +159,14 @@ export function AuthenticatedLayout({
     ],
   };
 
+  const mainContent = assistantEnabled ? (
+    <AssistantShell>
+      <ResizableContent>{children}</ResizableContent>
+    </AssistantShell>
+  ) : (
+    <ResizableContent>{children}</ResizableContent>
+  );
+
   return (
     <>
       <Head>
@@ -183,7 +194,7 @@ export function AuthenticatedLayout({
                 userNavProps={userNavProps}
               />
               <SidebarInset className="h-screen-with-banner max-w-full md:peer-data-[state=collapsed]:w-[calc(100vw-var(--sidebar-width-icon))] md:peer-data-[state=expanded]:w-[calc(100vw-var(--sidebar-width))]">
-                <ResizableContent>{children}</ResizableContent>
+                {mainContent}
                 <Toaster visibleToasts={1} />
                 <CommandMenu mainNavigation={navigation.navigation} />
               </SidebarInset>
