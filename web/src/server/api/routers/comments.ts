@@ -11,7 +11,7 @@ import { auditLog } from "@/src/features/audit-logs/auditLog";
 import { TRPCError } from "@trpc/server";
 import { validateCommentReferenceObject } from "@/src/features/comments/validateCommentReferenceObject";
 import {
-  getTracesIdentifierForSession,
+  getTracesIdentifierForSessionFromEvents,
   logger,
   NotificationQueue,
   QueueJobs,
@@ -358,7 +358,7 @@ export const commentsRouter = createTRPCRouter({
         scope: "comments:read",
       });
 
-      const clickhouseTraces = await getTracesIdentifierForSession(
+      const clickhouseTraces = await getTracesIdentifierForSessionFromEvents(
         input.projectId,
         input.sessionId,
       );
@@ -394,7 +394,7 @@ export const commentsRouter = createTRPCRouter({
         scope: "comments:read",
       });
 
-      const clickhouseTraces = await getTracesIdentifierForSession(
+      const clickhouseTraces = await getTracesIdentifierForSessionFromEvents(
         input.projectId,
         input.sessionId,
       );
