@@ -111,14 +111,26 @@ describe("blobStorageIntegration tRPC", () => {
       ]);
     });
 
-    it("rejects an empty exportFieldGroups array", async () => {
+    it("rejects an empty exportFieldGroups array when exportSource is EVENTS", async () => {
       await expect(
         caller.blobStorageIntegration.update({
           projectId,
           ...baseConfig,
+          exportSource: "EVENTS" as const,
           exportFieldGroups: [],
         }),
       ).rejects.toThrow();
+    });
+
+    it("accepts an empty exportFieldGroups array when exportSource is TRACES_OBSERVATIONS", async () => {
+      await expect(
+        caller.blobStorageIntegration.update({
+          projectId,
+          ...baseConfig,
+          exportSource: "TRACES_OBSERVATIONS" as const,
+          exportFieldGroups: [],
+        }),
+      ).resolves.not.toThrow();
     });
 
     it("overwrites stored subset when a new subset is submitted", async () => {
