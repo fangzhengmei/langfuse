@@ -122,6 +122,17 @@ describe("blobStorageIntegration tRPC", () => {
       ).rejects.toThrow();
     });
 
+    it("rejects an empty exportFieldGroups array when exportSource is TRACES_OBSERVATIONS_EVENTS", async () => {
+      await expect(
+        caller.blobStorageIntegration.update({
+          projectId,
+          ...baseConfig,
+          exportSource: "TRACES_OBSERVATIONS_EVENTS" as const,
+          exportFieldGroups: [],
+        }),
+      ).rejects.toThrow();
+    });
+
     it("accepts an empty exportFieldGroups array when exportSource is TRACES_OBSERVATIONS", async () => {
       await expect(
         caller.blobStorageIntegration.update({
