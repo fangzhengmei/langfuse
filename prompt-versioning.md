@@ -77,30 +77,44 @@ const removeLabelsFromPreviousPromptVersions = async ({
 
 ---
 
-## 3. AB 实验与路由机制
+## 3. Prompt 获取完整链路
 
-### 3.1 Prompt 获取路由
-在 `web/src/pages/api/public/prompts.ts` 中实现：
-
-**获取逻辑优先级**：
+### 3.1 请求参数接收与解析
+API 端点位于 `web/src/pages/api/public/prompts.ts`：
 
 ```typescript
-// web/src/features/prompts/server/actions/getPromptByName.ts
+// GET 请求参数 schema 定义在 packages/shared/src/server/api/prompts.ts
+const GetPromptSchema = z.object({
+  name: z.string(),
+  version: z.coerce.number().optional(),
+  label: z.string().optional(),
+});
+```
+
+### 3.2 请求路由与优先级
+请求转发到 `web/src/features/prompts/server/actions/getPromptByName.ts`：
+
+```typescript
 export const getPromptByName = async (params) => {
   const { promptName, projectId, version, label, resolve = true } = params;
 
-  // 1. 若指定 version，按版本号获取
+  // 优先级 1: 若指定 version，按版本号精确获取
   if (version)
-    return promptService.getPrompt({ projectId, promptName, version, label: undefined, resolve });
+    return promptService.getPrompt({ 
+      projectId, promptName, version, 
+      label: undefined, resolve 
+    });
 
-  // 2. 若指定 label，按标签获取
+  // 优先级 2: 若指定 label，按标签路由获取（用于 AB 实验）
   if (label)
-    return promptService.getPrompt({ projectId, promptName, label, version: undefined, resolve });
+    return promptService.getPrompt({ 
+      projectId, promptName, label, 
+      version: undefined, resolve 
+    });
 
-  // 3. 默认返回 production 标签版本
+  // 优先级 3: 默认返回 production 标签版本
   return promptService.getPrompt({
-    projectId,
-    promptName,
+    projectId, promptName,
     label: PRODUCTION_LABEL,
     version: undefined,
     resolve,
@@ -108,48 +122,132 @@ export const getPromptByName = async (params) => {
 };
 ```
 
-### 3.2 API 使用方式
-
-```bash
-# 获取 production 版本（默认）
-GET /api/public/prompts?name=my-prompt
-
-# 获取指定版本
-GET /api/public/prompts?name=my-prompt&version=3
-
-# 获取指定标签版本（用于实验）
-GET /api/public/prompts?name=my-prompt&label=experiment-a
-```
-
-### 3.3 AB 实验架构
-
-#### 3.3.1 实验配置方式
-实验配置存储在 `datasetRuns.metadata` 中：
+### 3.3 PromptService 缓存与数据库查询
+在 `packages/shared/src/server/services/PromptService/index.ts` 中：
 
 ```typescript
-// worker/src/features/experiments/utils.ts
-const ExperimentMetadataSchema = z.object({
-  prompt_id: z.string(),          // 使用的 prompt ID
-  provider: z.string(),           // LLM 提供商
-  model: z.string(),              // 模型名称
-  model_params: z.object(),       // 模型参数
-  experiment_name: z.string(),    // 实验名称
-  experiment_run_name: z.string(),// 实验运行名称
-  dataset_version: z.date().optional(),
-  structured_output_schema: z.object().optional(),
+public async getPrompt(params: PromptParams): Promise<PromptResult | null> {
+  // 1. 尝试从 Redis 缓存获取
+  if (this.cacheEnabled) {
+    const cachedPrompt = await this.getCachedPrompt(params);
+    if (cachedPrompt) return cachedPrompt;
+  }
+
+  // 2. 缓存未命中，查询数据库
+  const dbPrompt = await this.findPrompt(params);
+  
+  // 3. 解析依赖关系（如果启用）
+  const resolvedPrompt = await this.resolvePrompt(dbPrompt);
+  
+  // 4. 回填缓存并返回
+  if (this.cacheEnabled && resolvedPrompt) {
+    await this.cachePrompt({ ...params, prompt: resolvedPrompt });
+  }
+  
+  return resolvedPrompt;
+}
+
+// 底层数据库查询
+private async findPrompt(params: PromptParams): Promise<Prompt | null> {
+  const { projectId, promptName, version, label } = params;
+
+  if (version) {
+    return this.prisma.prompt.findFirst({
+      where: { projectId, name: promptName, version },
+    });
+  }
+
+  if (label) {
+    return this.prisma.prompt.findFirst({
+      where: { 
+        projectId, 
+        name: promptName, 
+        labels: { has: label }  // 数组包含查询
+      },
+    });
+  }
+
+  return null;
+}
+```
+
+### 3.4 依赖图递归解析
+```typescript
+public async buildAndResolvePromptGraph(params: {
+  projectId: string;
+  parentPrompt: PartialPrompt;
+  dependencies?: ParsedPromptDependencyTag[];
+}) {
+  // 1. 递归检测循环依赖（防止死循环）
+  // 2. 按依赖关系顺序递归解析子 prompt
+  // 3. 将实际 prompt 内容替换占位符标签
+  // 4. 返回完全解析后的 prompt + 依赖图结构
+}
+```
+
+### 3.5 API 响应返回
+在 `prompts.ts` 中最终返回：
+
+```typescript
+return res.status(200).json({
+  ...prompt,
+  isActive: prompt.labels.includes(PRODUCTION_LABEL), // 标记是否为生产版本
 });
 ```
 
-#### 3.3.2 实验执行流程
+---
+
+## 4. AB 实验架构与责任边界
+
+### 4.1 实验配置方式
+实验元数据 Schema 定义在 `packages/shared/src/server/llm/types.ts`：
+
+```typescript
+export const ExperimentMetadataSchema = z
+  .object({
+    prompt_id: z.string(),          // 使用的 prompt ID
+    provider: z.string(),           // LLM 提供商
+    model: z.string(),              // 模型名称
+    model_params: ZodModelConfig,   // 模型参数
+    structured_output_schema: LLMJSONSchema.optional(),
+    experiment_name: z.string().optional(),    // 实验名称
+    experiment_run_name: z.string().optional(), // 实验运行名称
+    error: z.string().optional(),
+    dataset_version: z.coerce.date().optional(),
+  })
+  .strict();
+```
+
+实验事件队列定义在 `packages/shared/src/server/queues.ts`：
+```typescript
+export const ExperimentCreateEventSchema = z.object({
+  projectId: z.string(),
+  datasetId: z.string(),
+  runId: z.string(),
+  description: z.string().optional(),
+});
+```
+
+实验配置存储在 `datasetRuns.metadata` 字段中，通过实验队列异步执行。
+
+### 4.2 实验执行流程
 在 `worker/src/features/experiments/experimentServiceClickhouse.ts` 中实现：
 
 1. **验证实验配置**：检查 prompt、API 密钥、数据集配置
-2. **获取数据集项**：批量获取用于实验的测试数据
+2. **获取数据集项**：批量获取用于实验的测试用例
 3. **变量替换**：将数据集中的变量值注入到 prompt 模板
 4. **并行执行 LLM 调用**：为每个数据集项执行 prompt
 5. **结果存储**：将实验结果存储到 ClickHouse 进行分析
 
-#### 3.3.3 流量切分策略
+### 4.3 流量切分策略与责任边界
+
+| 责任方 | 职责 | 实现机制 |
+|--------|------|----------|
+| **业务应用侧** | 流量分流决策 | 基于用户 ID 哈希、白名单、灰度比例等选择版本标签 |
+| **Langfuse 平台** | 标签路由与版本解析 | 根据传入的 `version` 或 `label` 参数精确命中 prompt 版本 |
+| **Langfuse 平台** | 缓存管理 | 项目级 epoch 缓存版本控制，确保切换时一致性 |
+| **Langfuse 平台** | 指标收集 | 自动关联 trace、observation、评分到 prompt 版本 |
+| **业务应用侧** | 实验观测分析 | 通过 Langfuse UI 对比不同版本的质量、延迟、成本指标 |
 
 **基于标签的路由**是 Langfuse 实现 AB 实验的核心机制：
 
@@ -157,13 +255,43 @@ const ExperimentMetadataSchema = z.object({
 |------|----------|----------|
 | **标签路由** | 为不同 prompt 版本分配不同标签（如 `variant-a`、`variant-b`），应用代码根据用户分群或流量比例选择调用哪个标签 | 简单 AB 测试、灰度发布 |
 | **版本固定** | 直接指定版本号调用，确保实验期间 prompt 内容不变 | 对照实验、基准测试 |
-| **生产标签切换** | 将 `production` 标签从旧版本切换到新版本实现全量发布 | 正式发布 |
+| **生产标签切换** | 将 `production` 标签从旧版本移动到新版本实现全量发布 | 正式发布、回滚 |
+
+### 4.4 线上 AB 切流完整流程
+
+```
+业务应用                              Langfuse 平台
+    |                                     |
+    |-- 1. 用户请求到达 -----------------> |
+    |                                     |
+    |-- 2. 分流逻辑 ------------------>  |
+    |   (基于 userId 哈希/白名单)         |
+    |                                     |
+    |-- 3. 调用 getPrompt(name, label) -> |
+    |                                     |
+    |                                     |-- 4. Redis 缓存查询
+    |                                     |-- 5. 数据库按标签查找版本
+    |                                     |-- 6. 递归解析依赖图
+    |                                     |-- 7. 缓存回填
+    |                                     |
+    | <-- 8. 返回 prompt 内容 ------------ |
+    |                                     |
+    |-- 9. 调用 LLM --------------------> |
+    |   (使用 prompt 内容)                 |
+    |                                     |
+    |-- 10. 上报 trace/observation ------> |
+    |                                     |-- 11. 关联到 prompt 版本
+    |                                     |-- 12. 指标聚合计算
+    |                                     |
+    |-- 13. 查看实验结果 ---------------> |
+    |                                     |-- 14. 对比版本差异
+```
 
 ---
 
-## 4. PromptService 核心服务
+## 5. PromptService 核心服务
 
-### 4.1 缓存机制
+### 5.1 缓存机制
 在 `packages/shared/src/server/services/PromptService/index.ts` 中实现：
 
 ```typescript
@@ -187,7 +315,7 @@ public async invalidateCache(params: { projectId: string }): Promise<void> {
 }
 ```
 
-### 4.2 依赖图构建与解析
+### 5.2 依赖图构建与解析
 ```typescript
 public async buildAndResolvePromptGraph(params: {
   projectId: string;
@@ -203,14 +331,14 @@ public async buildAndResolvePromptGraph(params: {
 
 ---
 
-## 5. 典型 AB 实验工作流
+## 6. 典型 AB 实验工作流
 
-### 5.1 准备阶段
+### 6.1 准备阶段
 1. 创建 prompt 版本 A（当前 production）
 2. 创建 prompt 版本 B（实验变体）
 3. 为版本 B 添加标签 `experiment-b`
 
-### 5.2 实验执行
+### 6.2 实验执行
 1. **服务端分流**：在应用代码中根据用户 ID 哈希、流量比例等条件决定调用标签
    ```typescript
    // 应用侧示例代码
@@ -223,27 +351,27 @@ public async buildAndResolvePromptGraph(params: {
    - 创建 dataset run，分别配置 prompt 版本 A 和 B
    - 执行实验并对比结果指标
 
-### 5.3 结果分析
+### 6.3 结果分析
 1. 通过 Langfuse UI 查看不同 prompt 版本的使用统计
 2. 关联观察指标（延迟、成本、质量评分）
 3. 根据实验数据决定是否全量发布
 
-### 5.4 全量发布
+### 6.4 全量发布
 1. 将 `production` 标签从版本 A 移动到版本 B
 2. 无需修改应用代码，所有流量自动切换
 3. 保留版本 A 以便必要时回滚
 
 ---
 
-## 6. 事件溯源与自动化
+## 7. 事件溯源与自动化
 
-### 6.1 Prompt 变更事件
+### 7.1 Prompt 变更事件
 在 `web/src/features/prompts/server/promptChangeEventSourcing.ts` 中：
 - 创建、更新、删除 prompt 时触发事件
 - 事件包含完整 prompt 数据和操作类型
 - 通过 entity change queue 异步处理
 
-### 6.2 自动化集成
+### 7.2 自动化集成
 在 `worker/src/features/entityChange/promptVersionProcessor.ts` 中：
 - 监听 prompt 版本变更事件
 - 触发配置的自动化规则（如 webhook 通知）
@@ -251,25 +379,30 @@ public async buildAndResolvePromptGraph(params: {
 
 ---
 
-## 7. 关键设计决策
+## 8. 关键设计决策
 
-### 7.1 标签 vs 分支
+### 8.1 标签 vs 分支
 - **选择标签机制**而非传统分支模型
 - **优点**：实现简单、查询高效、易于回滚
 - **约束**：每个标签在同一 prompt 名称下只能指向一个版本
 
-### 7.2 版本号单调递增
+### 8.2 版本号单调递增
 - 不支持语义化版本或自定义版本号
 - 版本号仅用于标识先后顺序，避免版本命名冲突
 
-### 7.3 生产环境默认约定
+### 8.3 生产环境默认约定
 - 默认获取 `production` 标签版本，而非 `latest`
 - 确保开发迭代不会意外影响生产流量
 - 显式的标签提升操作确保发布可控
 
+### 8.4 责任分离设计
+- **平台不做流量决策**：Langfuse 只提供标签路由机制，分流逻辑由业务方控制
+- **平台保证一致性**：相同标签始终返回相同 prompt 版本，直到标签被移动
+- **平台负责可观测**：自动关联所有调用到对应版本，提供实验分析能力
+
 ---
 
-## 8. 核心文件索引
+## 9. 核心文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
@@ -278,6 +411,8 @@ public async buildAndResolvePromptGraph(params: {
 | Prompt 核心服务 | `packages/shared/src/server/services/PromptService/index.ts` |
 | 公共 API 端点 | `web/src/pages/api/public/prompts.ts` |
 | 标签常量定义 | `packages/shared/src/features/prompts/constants.ts` |
+| 实验元数据 Schema | `packages/shared/src/server/llm/types.ts` |
+| 实验事件队列 | `packages/shared/src/server/queues.ts` |
 | 实验服务 | `worker/src/features/experiments/experimentServiceClickhouse.ts` |
 | 实验工具函数 | `worker/src/features/experiments/utils.ts` |
 | Prompt 变更处理器 | `worker/src/features/entityChange/promptVersionProcessor.ts` |
