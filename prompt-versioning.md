@@ -1,0 +1,283 @@
+# Prompt 版本控制与 AB 实验实现报告
+
+## 1. 版本存储机制
+
+### 1.1 数据库模型
+- **多版本共存**：同一个 prompt 名称下可以存在多个版本，每个版本拥有唯一的数字版本号 (`version`)
+- **版本标识**：使用 `(projectId, name, version)` 三元组唯一标识一个 prompt 版本
+- **存储表**：`Prompt` 表存储所有版本，`PromptDependency` 表存储 prompt 间的依赖关系
+
+### 1.2 版本创建流程
+在 `web/src/features/prompts/server/actions/createPrompt.ts` 中实现：
+
+```typescript
+// 1. 查询最新版本
+const latestPrompt = await prisma.prompt.findFirst({
+  where: { projectId, name },
+  orderBy: [{ version: "desc" }],
+});
+
+// 2. 新版本号自动递增
+version: latestPrompt?.version ? latestPrompt.version + 1 : 1
+
+// 3. 新创建的 prompt 自动获得 'latest' 标签
+const finalLabels = [...labels, LATEST_PROMPT_LABEL];
+```
+
+### 1.3 依赖关系处理
+- 支持 prompt 嵌套引用，通过 `@@@langfusePrompt:name=xxx|version=xxx@@@` 标签语法
+- 引用方式可通过版本号 (`version`) 或标签 (`label`)
+- 依赖关系存储在 `promptDependency` 表中，支持递归解析
+
+---
+
+## 2. 标签系统详解
+
+### 2.1 内置标签定义
+在 `packages/shared/src/features/prompts/constants.ts` 中定义：
+
+| 标签 | 用途 |
+|------|------|
+| `latest` | 始终指向最新创建的版本，新 prompt 自动获得此标签 |
+| `production` | 生产环境默认使用的版本 |
+
+### 2.2 标签唯一性约束
+标签在同一 prompt 名称下具有唯一性，当为新版本添加标签时，系统会自动从旧版本移除该标签：
+
+```typescript
+// web/src/features/prompts/server/utils/updatePromptLabels.ts
+const removeLabelsFromPreviousPromptVersions = async ({
+  prisma,
+  projectId,
+  promptName,
+  labelsToRemove,
+}) => {
+  // 从旧版本中移除标签以保证唯一性
+  const previousLabeledPrompts = await prisma.prompt.findMany({
+    where: {
+      projectId,
+      name: promptName,
+      labels: { hasSome: labelsToRemove },
+    },
+  });
+  
+  // 返回更新操作...
+};
+```
+
+### 2.3 自定义标签
+- 用户可创建自定义标签（如 `experiment-a`、`canary`、`staging`）
+- 标签格式限制：小写字母、数字、下划线、连字符、点号 (`/^[a-z0-9_\-.]+$/`)
+- 标签最大长度：36 字符
+
+### 2.4 受保护标签
+- 支持将特定标签标记为"受保护"，需要特殊权限才能修改
+- 存储在 `promptProtectedLabels` 表中
+- 防止意外修改生产环境关键标签
+
+---
+
+## 3. AB 实验与路由机制
+
+### 3.1 Prompt 获取路由
+在 `web/src/pages/api/public/prompts.ts` 中实现：
+
+**获取逻辑优先级**：
+
+```typescript
+// web/src/features/prompts/server/actions/getPromptByName.ts
+export const getPromptByName = async (params) => {
+  const { promptName, projectId, version, label, resolve = true } = params;
+
+  // 1. 若指定 version，按版本号获取
+  if (version)
+    return promptService.getPrompt({ projectId, promptName, version, label: undefined, resolve });
+
+  // 2. 若指定 label，按标签获取
+  if (label)
+    return promptService.getPrompt({ projectId, promptName, label, version: undefined, resolve });
+
+  // 3. 默认返回 production 标签版本
+  return promptService.getPrompt({
+    projectId,
+    promptName,
+    label: PRODUCTION_LABEL,
+    version: undefined,
+    resolve,
+  });
+};
+```
+
+### 3.2 API 使用方式
+
+```bash
+# 获取 production 版本（默认）
+GET /api/public/prompts?name=my-prompt
+
+# 获取指定版本
+GET /api/public/prompts?name=my-prompt&version=3
+
+# 获取指定标签版本（用于实验）
+GET /api/public/prompts?name=my-prompt&label=experiment-a
+```
+
+### 3.3 AB 实验架构
+
+#### 3.3.1 实验配置方式
+实验配置存储在 `datasetRuns.metadata` 中：
+
+```typescript
+// worker/src/features/experiments/utils.ts
+const ExperimentMetadataSchema = z.object({
+  prompt_id: z.string(),          // 使用的 prompt ID
+  provider: z.string(),           // LLM 提供商
+  model: z.string(),              // 模型名称
+  model_params: z.object(),       // 模型参数
+  experiment_name: z.string(),    // 实验名称
+  experiment_run_name: z.string(),// 实验运行名称
+  dataset_version: z.date().optional(),
+  structured_output_schema: z.object().optional(),
+});
+```
+
+#### 3.3.2 实验执行流程
+在 `worker/src/features/experiments/experimentServiceClickhouse.ts` 中实现：
+
+1. **验证实验配置**：检查 prompt、API 密钥、数据集配置
+2. **获取数据集项**：批量获取用于实验的测试数据
+3. **变量替换**：将数据集中的变量值注入到 prompt 模板
+4. **并行执行 LLM 调用**：为每个数据集项执行 prompt
+5. **结果存储**：将实验结果存储到 ClickHouse 进行分析
+
+#### 3.3.3 流量切分策略
+
+**基于标签的路由**是 Langfuse 实现 AB 实验的核心机制：
+
+| 策略 | 实现方式 | 适用场景 |
+|------|----------|----------|
+| **标签路由** | 为不同 prompt 版本分配不同标签（如 `variant-a`、`variant-b`），应用代码根据用户分群或流量比例选择调用哪个标签 | 简单 AB 测试、灰度发布 |
+| **版本固定** | 直接指定版本号调用，确保实验期间 prompt 内容不变 | 对照实验、基准测试 |
+| **生产标签切换** | 将 `production` 标签从旧版本切换到新版本实现全量发布 | 正式发布 |
+
+---
+
+## 4. PromptService 核心服务
+
+### 4.1 缓存机制
+在 `packages/shared/src/server/services/PromptService/index.ts` 中实现：
+
+```typescript
+// 使用 Redis 缓存 prompt，按项目维度设置 epoch 版本
+// 缓存键格式：prompt:{projectId}:{epoch}:{promptName}:{version|label}
+
+private async getCacheKey(params: PromptParams): Promise<string | null> {
+  const epoch = await this.getOrCreateEpoch(params);
+  const prefix = this.getCacheKeyPrefix(params, epoch);
+  return `${prefix}:${params.version ?? params.label}`;
+}
+
+// 缓存失效：轮换 epoch token，旧缓存自然过期
+public async invalidateCache(params: { projectId: string }): Promise<void> {
+  await this.redis?.set(
+    this.getEpochKey(params),
+    this.newEpochToken(),
+    "EX",
+    this.epochTtlSeconds,
+  );
+}
+```
+
+### 4.2 依赖图构建与解析
+```typescript
+public async buildAndResolvePromptGraph(params: {
+  projectId: string;
+  parentPrompt: PartialPrompt;
+  dependencies?: ParsedPromptDependencyTag[];
+}) {
+  // 1. 递归检测循环依赖
+  // 2. 按依赖关系顺序解析
+  // 3. 替换占位符标签为实际 prompt 内容
+  // 4. 返回完全解析后的 prompt + 依赖图
+}
+```
+
+---
+
+## 5. 典型 AB 实验工作流
+
+### 5.1 准备阶段
+1. 创建 prompt 版本 A（当前 production）
+2. 创建 prompt 版本 B（实验变体）
+3. 为版本 B 添加标签 `experiment-b`
+
+### 5.2 实验执行
+1. **服务端分流**：在应用代码中根据用户 ID 哈希、流量比例等条件决定调用标签
+   ```typescript
+   // 应用侧示例代码
+   const label = userId.hashCode() % 100 < 20 ? "experiment-b" : "production";
+   const prompt = await langfuse.getPrompt("my-prompt", { label });
+   ```
+
+2. **数据集实验**：使用 Langfuse 内置实验功能
+   - 创建数据集包含测试用例
+   - 创建 dataset run，分别配置 prompt 版本 A 和 B
+   - 执行实验并对比结果指标
+
+### 5.3 结果分析
+1. 通过 Langfuse UI 查看不同 prompt 版本的使用统计
+2. 关联观察指标（延迟、成本、质量评分）
+3. 根据实验数据决定是否全量发布
+
+### 5.4 全量发布
+1. 将 `production` 标签从版本 A 移动到版本 B
+2. 无需修改应用代码，所有流量自动切换
+3. 保留版本 A 以便必要时回滚
+
+---
+
+## 6. 事件溯源与自动化
+
+### 6.1 Prompt 变更事件
+在 `web/src/features/prompts/server/promptChangeEventSourcing.ts` 中：
+- 创建、更新、删除 prompt 时触发事件
+- 事件包含完整 prompt 数据和操作类型
+- 通过 entity change queue 异步处理
+
+### 6.2 自动化集成
+在 `worker/src/features/entityChange/promptVersionProcessor.ts` 中：
+- 监听 prompt 版本变更事件
+- 触发配置的自动化规则（如 webhook 通知）
+- 支持基于标签和操作类型的过滤条件
+
+---
+
+## 7. 关键设计决策
+
+### 7.1 标签 vs 分支
+- **选择标签机制**而非传统分支模型
+- **优点**：实现简单、查询高效、易于回滚
+- **约束**：每个标签在同一 prompt 名称下只能指向一个版本
+
+### 7.2 版本号单调递增
+- 不支持语义化版本或自定义版本号
+- 版本号仅用于标识先后顺序，避免版本命名冲突
+
+### 7.3 生产环境默认约定
+- 默认获取 `production` 标签版本，而非 `latest`
+- 确保开发迭代不会意外影响生产流量
+- 显式的标签提升操作确保发布可控
+
+---
+
+## 8. 核心文件索引
+
+| 功能 | 文件路径 |
+|------|----------|
+| Prompt 创建逻辑 | `web/src/features/prompts/server/actions/createPrompt.ts` |
+| Prompt 获取逻辑 | `web/src/features/prompts/server/actions/getPromptByName.ts` |
+| Prompt 核心服务 | `packages/shared/src/server/services/PromptService/index.ts` |
+| 公共 API 端点 | `web/src/pages/api/public/prompts.ts` |
+| 标签常量定义 | `packages/shared/src/features/prompts/constants.ts` |
+| 实验服务 | `worker/src/features/experiments/experimentServiceClickhouse.ts` |
+| 实验工具函数 | `worker/src/features/experiments/utils.ts` |
+| Prompt 变更处理器 | `worker/src/features/entityChange/promptVersionProcessor.ts` |
