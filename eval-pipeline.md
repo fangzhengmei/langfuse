@@ -494,41 +494,51 @@ async function createExperimentJobClickhouse({ event }) {
 
 定义于 `worker/src/features/evaluation/evalScoreEvent.ts`：
 
+> **重要修正**：自动评测不直接设置 `datasetRunId`，仅通过 `traceId`/`observationId` 关联。Dataset Run 查询时通过 `dataset_run_items` 表关联 Trace ID 实现聚合。
+
 ```typescript
-function buildEvalScoreWritePayloads({ outputResult, primaryScoreId, ... }) {
+// 真实代码函数签名（无 datasetRunId 参数）
+export function buildEvalScoreWritePayloads(params: {
+  outputResult: EvalOutputResult;
+  primaryScoreId: string;
+  traceId: string | null;
+  observationId: string | null;
+  scoreName: string;
+  environment: string;
+  executionTraceId: string;
+  metadata: Record<string, string>;
+}): EvalScoreWritePayload[] {
   const commonParams = {
-    traceId,
-    observationId,
-    datasetRunId,              // 数据集运行ID
-    scoreName,
-    reasoning: outputResult.reasoning,
+    traceId: params.traceId,
+    observationId: params.observationId,
+    scoreName: params.scoreName,
+    reasoning: params.outputResult.reasoning,
+    environment: params.environment,
+    executionTraceId: params.executionTraceId,
+    metadata: params.metadata,  // 含 jobExecutionId, jobConfigurationId, targetDatasetItemId 等
     source: ScoreSourceEnum.EVAL,
-    executionTraceId,
-    metadata: {
-      jobExecutionId,
-      jobConfigurationId,
-      targetTraceId,
-      targetObservationId,
-      targetDatasetItemId,
-    },
   };
 
   // NUMERIC/BOOLEAN类型：单Score
-  if (outputResult.dataType === ScoreDataTypeEnum.NUMERIC) {
-    return [buildScoreWritePayload({ ...commonParams, value: outputResult.score })];
+  if (params.outputResult.dataType === ScoreDataTypeEnum.NUMERIC) {
+    return [buildScoreWritePayload({ ...commonParams, scoreId: params.primaryScoreId, scoreValue: params.outputResult.score })];
   }
 
   // CATEGORICAL类型：可能多Score（多标签）
-  return outputResult.matches.map((match, index) =>
+  return params.outputResult.matches.map((scoreValue, index) =>
     buildScoreWritePayload({
       ...commonParams,
-      scoreId: index === 0 ? primaryScoreId : randomUUID(),
-      stringValue: match,
+      scoreId: index === 0 ? params.primaryScoreId : randomUUID(),
+      scoreValue,
       dataType: ScoreDataTypeEnum.CATEGORICAL,
     })
   );
 }
 ```
+
+**关联关系说明**：
+- Score → Trace ID → Dataset Run Item → Dataset Run
+- 查询Dataset Run评分列表时，通过 `dataset_run_items` 表JOIN关联查询获得
 
 #### 3.2.2 人工打分Payload构建
 
@@ -720,7 +730,7 @@ Score最终写入 `scores` 表，支持：
 7. 后续流程同 Trace 级别自动评测（步骤 5-8）
     │
     ▼
-8. Score 关联 datasetRunId 持久化
+8. Score 通过 Trace ID 关联 Dataset Run（查询时通过 Dataset Run Item 关联）
 ```
 
 #### 5.2.3 Observation 级别自动评测触发链
