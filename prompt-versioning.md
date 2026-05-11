@@ -79,24 +79,55 @@ const removeLabelsFromPreviousPromptVersions = async ({
 
 ## 3. Prompt 获取完整链路
 
-### 3.1 请求参数接收与解析
+### 3.1 公共 GET API 参数限制
 API 端点位于 `web/src/pages/api/public/prompts.ts`：
 
 ```typescript
-// GET 请求参数 schema 定义在 packages/shared/src/server/api/prompts.ts
-const GetPromptSchema = z.object({
-  name: z.string(),
-  version: z.coerce.number().optional(),
-  label: z.string().optional(),
+// 公共 GET 接口仅支持 name 和 version 参数
+const searchParams = GetPromptSchema.parse(req.query);
+const promptName = searchParams.name;
+const version = searchParams.version ?? undefined;
+
+const prompt = await getPromptByName({
+  promptName,
+  projectId,
+  version,  // ⚠️ 公共接口不支持 label 参数
 });
 ```
 
-### 3.2 请求路由与优先级
+### 3.2 Schema 定义
+位于 `packages/shared/src/features/prompts/types.ts`：
+
+```typescript
+// 公共 GET API 使用此 Schema，仅支持 name/version
+export const GetPromptSchema = z.object({
+  name: z.string().transform((v) => decodeURIComponent(v)),
+  version: z.coerce.number().int().nullish(),
+});
+
+// 内部函数支持 label 参数（通过 TRPC/SDK 调用）
+export const GetPromptByNameSchema = z.object({
+  promptName: z.string(),
+  version: z.coerce.number().int().nullish(),
+  label: z.string().optional(),        // label 仅内部可用
+  resolve: z.enum(["true", "false"])
+    .nullish()
+    .default("true")
+    .transform((v) => v === "true"),
+});
+```
+
+### 3.3 请求路由与优先级
 请求转发到 `web/src/features/prompts/server/actions/getPromptByName.ts`：
 
 ```typescript
 export const getPromptByName = async (params) => {
   const { promptName, projectId, version, label, resolve = true } = params;
+
+  if (version && label)
+    throw new InvalidRequestError("Cannot specify both version and label");
+
+  const promptService = new PromptService(prisma, redis, recordIncrement);
 
   // 优先级 1: 若指定 version，按版本号精确获取
   if (version)
@@ -105,7 +136,7 @@ export const getPromptByName = async (params) => {
       label: undefined, resolve 
     });
 
-  // 优先级 2: 若指定 label，按标签路由获取（用于 AB 实验）
+  // 优先级 2: 若指定 label，按标签路由获取（⚠️ 仅内部调用可用）
   if (label)
     return promptService.getPrompt({ 
       projectId, promptName, label, 
@@ -122,7 +153,7 @@ export const getPromptByName = async (params) => {
 };
 ```
 
-### 3.3 PromptService 缓存与数据库查询
+### 3.4 PromptService 缓存与数据库查询
 在 `packages/shared/src/server/services/PromptService/index.ts` 中：
 
 ```typescript
@@ -171,7 +202,7 @@ private async findPrompt(params: PromptParams): Promise<Prompt | null> {
 }
 ```
 
-### 3.4 依赖图递归解析
+### 3.5 依赖图递归解析
 ```typescript
 public async buildAndResolvePromptGraph(params: {
   projectId: string;
@@ -185,7 +216,7 @@ public async buildAndResolvePromptGraph(params: {
 }
 ```
 
-### 3.5 API 响应返回
+### 3.6 API 响应返回
 在 `prompts.ts` 中最终返回：
 
 ```typescript
@@ -243,18 +274,22 @@ export const ExperimentCreateEventSchema = z.object({
 
 | 责任方 | 职责 | 实现机制 |
 |--------|------|----------|
-| **业务应用侧** | 流量分流决策 | 基于用户 ID 哈希、白名单、灰度比例等选择版本标签 |
-| **Langfuse 平台** | 标签路由与版本解析 | 根据传入的 `version` 或 `label` 参数精确命中 prompt 版本 |
+| **业务应用侧** | 流量分流决策 | 基于用户 ID 哈希、白名单、灰度比例等选择版本号 |
+| **业务应用侧** | 多版本 Prompt 获取 | 通过 SDK/TRPC 调用带 label 参数的内部接口 |
+| **Langfuse 平台** | 版本号路由 | 根据 `version` 参数精确命中 prompt 版本 |
+| **Langfuse 平台** | 标签路由 | 仅内部调用支持按 `label` 路由 |
 | **Langfuse 平台** | 缓存管理 | 项目级 epoch 缓存版本控制，确保切换时一致性 |
 | **Langfuse 平台** | 指标收集 | 自动关联 trace、observation、评分到 prompt 版本 |
 | **业务应用侧** | 实验观测分析 | 通过 Langfuse UI 对比不同版本的质量、延迟、成本指标 |
 
-**基于标签的路由**是 Langfuse 实现 AB 实验的核心机制：
+> ⚠️ **重要更正**：公共 GET API (`/api/public/prompts`) **不支持 label 参数**。AB 实验需通过 SDK 或内部 TRPC 接口调用带 label 参数的 getPrompt 方法。
+
+**基于版本号与标签的路由**是 Langfuse 实现 AB 实验的核心机制：
 
 | 策略 | 实现方式 | 适用场景 |
 |------|----------|----------|
-| **标签路由** | 为不同 prompt 版本分配不同标签（如 `variant-a`、`variant-b`），应用代码根据用户分群或流量比例选择调用哪个标签 | 简单 AB 测试、灰度发布 |
-| **版本固定** | 直接指定版本号调用，确保实验期间 prompt 内容不变 | 对照实验、基准测试 |
+| **版本号固定** | 直接指定版本号调用，确保实验期间 prompt 内容不变 | 对照实验、基准测试 |
+| **标签路由（内部）** | 为不同版本分配标签（如 `variant-a`、`variant-b`），通过 SDK 按标签获取 | AB 测试、灰度发布 |
 | **生产标签切换** | 将 `production` 标签从旧版本移动到新版本实现全量发布 | 正式发布、回滚 |
 
 ### 4.4 线上 AB 切流完整流程
@@ -267,7 +302,8 @@ export const ExperimentCreateEventSchema = z.object({
     |-- 2. 分流逻辑 ------------------>  |
     |   (基于 userId 哈希/白名单)         |
     |                                     |
-    |-- 3. 调用 getPrompt(name, label) -> |
+    |-- 3. SDK 调用 getPrompt(name, label) |
+    |   (⚠️ 仅 SDK/TRPC 支持 label 参数)   |
     |                                     |
     |                                     |-- 4. Redis 缓存查询
     |                                     |-- 5. 数据库按标签查找版本
@@ -339,9 +375,9 @@ public async buildAndResolvePromptGraph(params: {
 3. 为版本 B 添加标签 `experiment-b`
 
 ### 6.2 实验执行
-1. **服务端分流**：在应用代码中根据用户 ID 哈希、流量比例等条件决定调用标签
+1. **服务端分流**：在应用代码中根据用户 ID 哈希、流量比例等条件，通过 SDK 调用带 label 参数的接口
    ```typescript
-   // 应用侧示例代码
+   // SDK 调用示例（支持 label 参数）
    const label = userId.hashCode() % 100 < 20 ? "experiment-b" : "production";
    const prompt = await langfuse.getPrompt("my-prompt", { label });
    ```
@@ -400,6 +436,11 @@ public async buildAndResolvePromptGraph(params: {
 - **平台保证一致性**：相同标签始终返回相同 prompt 版本，直到标签被移动
 - **平台负责可观测**：自动关联所有调用到对应版本，提供实验分析能力
 
+### 8.5 API 分层设计
+- **公共 API**：仅支持 `name` + `version`，保证简单稳定
+- **SDK/TRPC**：支持 `label` 参数，满足 AB 实验等高级场景需求
+- **默认 fallback**：无 version/label 时，自动路由到 production 标签版本
+
 ---
 
 ## 9. 核心文件索引
@@ -410,6 +451,7 @@ public async buildAndResolvePromptGraph(params: {
 | Prompt 获取逻辑 | `web/src/features/prompts/server/actions/getPromptByName.ts` |
 | Prompt 核心服务 | `packages/shared/src/server/services/PromptService/index.ts` |
 | 公共 API 端点 | `web/src/pages/api/public/prompts.ts` |
+| Prompt Schema 定义 | `packages/shared/src/features/prompts/types.ts` |
 | 标签常量定义 | `packages/shared/src/features/prompts/constants.ts` |
 | 实验元数据 Schema | `packages/shared/src/server/llm/types.ts` |
 | 实验事件队列 | `packages/shared/src/server/queues.ts` |
