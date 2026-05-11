@@ -1,14 +1,18 @@
 # Langfuse 评估管线分析报告
 
-本报告详细分析了 Langfuse 平台中三种评估手段的完整管线：**人工打分（ANNOTATION）**、**自动评测（EVAL）** 和 **数据集回放（Dataset Run）**。
+本报告详细分析了 Langfuse 平台中三种评估手段的完整管线：**人工打分（ANNOTATION）**、**自动评测（EVAL）** 和 **数据集回放（Dataset Run）**，并补充了 **Session 维度评分**的完整实现。
 
 ---
 
 ## 一、评分对象（Score Object）
 
-### 1.1 统一的数据模型
+### 1.1 完整的评分对象体系
 
-所有三种评估手段共享同一个 `Score` 数据模型，定义于 `packages/shared/src/domain/scores.ts`：
+Langfuse 评估系统采用**统一 Score 数据模型 + 多维度关联对象**的设计，支持四种评分对象维度：**Trace**、**Observation**、**Session** 和 **Dataset Run**。
+
+#### 1.1.1 Score 核心数据模型
+
+所有评估手段共享同一个 `Score` 数据模型，定义于 `packages/shared/src/domain/scores.ts`：
 
 ```typescript
 {
@@ -16,7 +20,7 @@
   projectId: string;             // 项目ID
   environment: string;           // 环境标识
   name: string;                  // 评分名称
-  value: number;                 // 评分值
+  value: number;                 // 评分值（数值评分使用）
   source: ScoreSourceType;       // 来源：API | EVAL | ANNOTATION
   authorUserId: string | null;   // 作者用户ID（人工打分必填）
   comment: string | null;        // 评语/推理过程
@@ -24,25 +28,96 @@
   configId: string | null;       // 评分配置ID
   queueId: string | null;        // 评分队列ID（人工打分）
   executionTraceId: string | null; // 执行追踪ID（自动评测）
+  createdAt: Date;               // 创建时间
+  updatedAt: Date;               // 更新时间
+  timestamp: Date;               // 评分时间戳
   
-  // 关联对象 - 三者必居其一
-  traceId: string | null;        // 关联Trace
-  observationId: string | null;  // 关联Observation
-  datasetRunId: string | null;   // 关联数据集运行
+  // ========== 关联对象 - 四者必居其一 ==========
+  traceId: string | null;        // 关联Trace（单次调用链路）
+  observationId: string | null;  // 关联Observation（单个LLM调用/步骤）
+  sessionId: string | null;      // 关联Session（会话维度，多Trace聚合）
+  datasetRunId: string | null;   // 关联数据集运行（评测回放）
   
-  // 数据类型
+  // ========== 数据类型 ==========
   dataType: ScoreDataTypeType;   // NUMERIC | CATEGORICAL | BOOLEAN | CORRECTION | TEXT
   stringValue: string | null;    // 分类/布尔/文本类型的值
+  longStringValue: string;       // 长文本值
 }
 ```
 
-### 1.2 评分来源区分
+#### 1.1.2 四种评分对象维度对比
+
+| 评分对象 | 关联字段 | 适用评估手段 | 粒度 | 典型场景 |
+|---------|---------|-------------|------|---------|
+| **Trace** | `traceId` | 人工打分/自动评测/API | 单次调用链路 | 单次用户请求的完整评估 |
+| **Observation** | `observationId` | 人工打分/自动评测/API | 单个步骤/LLM调用 | 特定生成步骤的质量评估 |
+| **Session** | `sessionId` | 人工打分/API | 多轮会话（含多Trace） | 完整对话会话质量评估 |
+| **Dataset Run** | `datasetRunId` | 自动评测/API | 数据集批量运行 | 数据集回放评测结果聚合 |
+
+#### 1.1.3 评分来源区分
 
 | 来源类型 | source值 | 特点 | 典型应用场景 |
 |---------|---------|------|-------------|
 | API 打分 | `API` | 通过SDK或API直接提交 | 业务系统集成、自定义评估逻辑 |
 | 自动评测 | `EVAL` | 系统自动执行，带执行追踪 | LLM-as-Judge、规则评估器 |
 | 人工打分 | `ANNOTATION` | 人工审核提交，关联队列 | 人工审核、标注任务、质量检查 |
+
+#### 1.1.4 自动评测目标对象（EvalTargetObject）
+
+自动评测配置通过 `EvalTargetObject` 区分评估目标类型，定义于 `packages/shared/src/features/evals/types.ts`：
+
+```typescript
+export const EvalTargetObject = {
+  TRACE: "trace",        // Trace级别评估
+  DATASET: "dataset",    // 数据集级别评估
+  EVENT: "event",        // Observation级别评估（events表）
+  EXPERIMENT: "experiment", // 实验项级别评估
+} as const;
+```
+
+### 1.2 会话维度评分（Session-level Scoring）
+
+会话维度评分支持对包含多轮对话的完整会话进行质量评估，是人工打分的重要应用场景。
+
+#### 1.2.1 会话评分特点
+
+- **聚合粒度**：一个 Session 包含多个 Trace，评分针对整个会话
+- **上下文感知**：标注人员可查看完整对话历史
+- **适用场景**：对话系统质量评估、多轮任务完成度评估
+
+#### 1.2.2 会话标注处理器
+
+定义于 `web/src/features/annotation-queues/components/processors/SessionAnnotationProcessor.tsx`：
+
+```typescript
+// 会话标注左侧面板展示
+- 分页加载会话内的所有Traces（默认PAGE_SIZE=10）
+- 展示每个Trace的输入输出、时间戳
+- 支持查看完整对话上下文
+- 显示会话ID、环境、Trace总数等元信息
+
+// 会话标注右侧面板（AnnotationDrawerSection）
+- 评分目标类型: { type: "session", sessionId: item.objectId }
+- 支持多维度评分（基于队列关联的ScoreConfig）
+- 支持添加评语和标签
+```
+
+#### 1.2.3 会话评分提交Payload
+
+```typescript
+{
+  source: ScoreSourceEnum.ANNOTATION,
+  authorUserId: ctx.session.user.id,
+  sessionId: item.objectId,        // 会话ID（Trace/Observation留空）
+  queueId: queueId,                // 关联队列
+  configId: scoreConfigId,         // 评分配置
+  name: scoreConfigName,
+  value: scoreValue,
+  dataType: scoreDataType,
+  comment: annotationComment,
+  environment: sessionEnvironment,
+}
+```
 
 ### 1.3 数据集运行项（Dataset Run Item）
 
@@ -109,6 +184,15 @@ await prisma.annotationQueueItem.update({
 });
 ```
 
+**AnnotationQueueObjectType 枚举：**
+```typescript
+export const AnnotationQueueObjectType = {
+  TRACE: "trace",
+  OBSERVATION: "observation",
+  SESSION: "session",  // 会话维度
+} as const;
+```
+
 #### 2.1.2 人工评分提交
 
 通过分数API提交，定义于 `web/src/server/api/routers/scores.ts`：
@@ -124,6 +208,7 @@ const scoreEvent = {
     id: scoreId,
     traceId: input.traceId,
     observationId: input.observationId,
+    sessionId: input.sessionId,        // 会话ID（新增）
     name: input.name,
     value: input.value,
     dataType: input.dataType,
@@ -144,10 +229,19 @@ await enqueueScoreIngestion({ projectId, scoreId, eventId: v4() });
 
 #### 2.1.3 触发时机
 
-1. **UI直接打分**：用户在Trace详情页或Observation详情页点击"评分"
-2. **评分队列任务**：用户从队列领取待评分任务后提交
+1. **UI直接打分**：
+   - Trace详情页：针对单次调用链路评分
+   - Observation详情页：针对单个LLM调用/步骤评分
+   - Session详情页：针对完整多轮会话评分
+
+2. **评分队列任务**：
+   - Trace队列：从队列领取Trace标注任务
+   - Observation队列：从队列领取Observation标注任务
+   - Session队列：从队列领取会话标注任务（`objectType: "SESSION"`）
+
 3. **数据集标注面板**：在Dataset Run详情页的Annotation Panel中评分
-4. **API/SDK提交**：通过公共API手动提交ANNOTATION类型分数
+
+4. **API/SDK提交**：通过公共API手动提交ANNOTATION类型分数（支持四种评分对象维度）
 
 ---
 
@@ -212,7 +306,7 @@ async function createEvalJobs({ event, sourceEventType, jobTimestamp, enforcedJo
       }
     }
 
-    // 4.  deduplication：跳过已存在的Job
+    // 4. deduplication：跳过已存在的Job
     const existingJob = await findMatchingJob(config.id, datasetItemId, observationId);
     
     // 5. 采样过滤
@@ -362,7 +456,7 @@ async function createExperimentJobClickhouse({ event }) {
 │     ├── id: score UUID                                      │
 │     ├── timestamp: 创建时间                                  │
 │     ├── type: SCORE_CREATE                                  │
-│     └── body: 完整Score数据（含source标记）                  │
+│     └── body: 完整Score数据（含source标记和sessionId）       │
 │                                                             │
 │  2. 上传到 S3 (MinIO)                                       │
 │     └── 路径: scores/{projectId}/{scoreId}.json             │
@@ -384,6 +478,7 @@ function buildEvalScoreWritePayloads({ outputResult, primaryScoreId, ... }) {
   const commonParams = {
     traceId,
     observationId,
+    datasetRunId,              // 数据集运行ID
     scoreName,
     reasoning: outputResult.reasoning,
     source: ScoreSourceEnum.EVAL,
@@ -423,6 +518,7 @@ function buildEvalScoreWritePayloads({ outputResult, primaryScoreId, ... }) {
   source: ScoreSourceEnum.ANNOTATION,
   authorUserId: ctx.session.user.id,  // 必须：标注者身份
   queueId: input.queueId,             // 可选：关联的评分队列
+  sessionId: input.sessionId,         // 可选：关联会话
   comment: input.comment,             // 评语
   configId: input.configId,           // 关联评分配置
 }
@@ -434,7 +530,7 @@ function buildEvalScoreWritePayloads({ outputResult, primaryScoreId, ... }) {
 
 Score最终写入 `scores` 表，支持：
 - 按 `source` 字段筛选（EVAL/ANNOTATION/API）
-- 按 `traceId/observationId/datasetRunId` 关联查询
+- 按 `traceId/observationId/sessionId/datasetRunId` 关联查询
 - 按 `configId` 聚合统计
 - 按 `authorUserId` 统计人工标注工作量
 
@@ -443,7 +539,7 @@ Score最终写入 `scores` 表，支持：
 | 表名 | 用途 | 关联字段 |
 |-----|------|---------|
 | `job_executions` | 自动评测执行记录 | `jobOutputScoreId` → `scores.id` |
-| `annotation_queue_items` | 人工评分任务 | `objectId` → `traceId/observationId` |
+| `annotation_queue_items` | 人工评分任务 | `objectId` → `traceId/observationId/sessionId` |
 | `dataset_run_items` | 数据集运行项 | `traceId` → `scores.traceId` |
 | `score_configs` | 评分配置 | `configId` → `scores.configId` |
 
@@ -455,13 +551,18 @@ Score最终写入 `scores` 表，支持：
 - 显示评分人头像和名称（人工打分）
 - 显示评估器名称（自动评测）
 
-#### 3.4.2 数据集运行结果页
+#### 3.4.2 Session详情页
+- 展示会话内所有Trace及其评分
+- 聚合显示整个会话的平均得分
+- 支持会话级别的人工标注评分
+
+#### 3.4.3 数据集运行结果页
 - 展示每个Dataset Item的执行结果
 - 并排展示Expected Output vs Actual Output
 - 聚合显示所有评估分数（自动+人工）
 - 支持按Score过滤、排序、对比
 
-#### 3.4.3 评分分析面板
+#### 3.4.4 评分分析面板
 - 按来源分布统计（EVAL vs ANNOTATION vs API）
 - 评分名称、数值分布
 - 时间趋势分析
@@ -475,21 +576,292 @@ Score最终写入 `scores` 表，支持：
 |-----|-----------------------|-----------------|--------------------------|
 | **触发源** | 用户主动操作 / 队列领取 | 实时事件 / 回溯任务 | 数据集运行执行 |
 | **触发时机** | 按需、手动 | 实时/近实时、自动 | 批量、执行后自动触发 |
-| **评分对象** | Trace / Observation | Trace / Observation | Dataset Item（关联Trace） |
+| **评分对象** | **Trace / Observation / Session** | **Trace / Observation / Dataset Item** | Dataset Item（关联Trace/Observation） |
 | **执行者** | 真实用户 | LLM / 规则引擎 | 目标应用 + 自动评测 |
 | **Source标记** | `ANNOTATION` | `EVAL` | `EVAL`（评测结果） |
 | **必填字段** | `authorUserId` | `executionTraceId`, `metadata.jobExecutionId` | `datasetRunId` |
 | **执行状态** | 即时完成 | PENDING → IN_PROGRESS → COMPLETED/ERROR | RUNNING → COMPLETED |
-| **队列** | Annotation Queue | TraceUpsert / CreateEvalQueue / EvaluationExecution | ExperimentCreate / DatasetRunItemUpsert |
+| **队列** | Annotation Queue（TRACE/OBSERVATION/SESSION） | TraceUpsert / CreateEvalQueue / EvaluationExecution / ObservationEval | ExperimentCreate / DatasetRunItemUpsert |
 | **结果写入** | 直接S3+IngestionQueue | 评测完成后S3+IngestionQueue | 执行完成后触发评测写入 |
 | **幂等性** | 用户多次提交创建多个Score | 同一Job配置+目标仅创建一次Job | 同Dataset Run可重跑 |
 | **防循环** | 无需 | 跳过`langfuse-*`环境的内部Trace | 依赖自动评测防循环 |
 
 ---
 
-## 五、关键设计要点
+## 五、评估管线完整串联关系
 
-### 5.1 防止无限评估循环
+### 5.1 三大评估手段的依赖与联动
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     Langfuse 评估管线全景图                                  │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐  │
+│  │   人工打分       │     │   自动评测       │     │  数据集回放       │  │
+│  │  (ANNOTATION)    │     │    (EVAL)       │     │ (Dataset Run)    │  │
+│  └────────┬─────────┘     └────────┬─────────┘     └────────┬─────────┘  │
+│           │                         │                         │            │
+│           │                         │                         │            │
+│           ▼                         ▼                         ▼            │
+│  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐  │
+│  │ Annotation Queue  │     │ Evaluation Config  │     │  Dataset Items   │  │
+│  │  - TRACE          │     │  - TRACE目标      │     │  - Input          │  │
+│  │  - OBSERVATION    │────▶│  - DATASET目标    │◀────│  - Expected Output│  │
+│  │  - SESSION         │     │  - EVENT目标       │     │  - Metadata       │  │
+│  └──────────────────┘     └──────────────────┘     └──────────────────┘  │
+│                                    │                                    │
+│                                    ▼                                    │
+│                              ┌──────────────────┐                           │
+│                              │  Unified Score  │◀──────────────────────────┘  │
+│                              │     Model      │                              │
+│                              │  - traceId     │                              │
+│                              │  - observationId│                              │
+│                              │  - sessionId  │                              │
+│                              │  - datasetRunId│                             │
+│                              └──────────────────┘                              │
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 自动评测与其他流程串联
+
+#### 5.2.1 Trace 级别自动评测触发链
+
+```
+1. 数据接入
+    │
+    ▼
+2. TraceUpsert 事件入队
+    │
+    ▼
+3. evalJobTraceCreatorQueueProcessor 执行
+    ├─ 拉取 ACTIVE 状态的 EVAL 配置（targetObject=TRACE）
+    ├─ 检查 Trace 环境（跳过 langfuse-* 内部 Trace
+    ├─ 应用 filter 条件匹配
+    ├─ 应用 sampling 采样
+    └─ 去重检查（避免重复创建Job）
+    │
+    ▼
+4. 创建 JobExecution (PENDING 状态)
+    │
+    ▼
+5. 加入 EvaluationExecution 队列（支持 delay 延迟执行）
+    │
+    ▼
+6. evalJobExecutorQueueProcessor 执行
+    ├─ 提取变量（通过 variableMapping 从 Trace/Observation 提取）
+    ├─ 编译评估 Prompt
+    ├─ 调用 LLM 执行评估（生成内部 Trace，环境=langfuse-llm-judge）
+    ├─ 解析 LLM 输出（结构化输出校验）
+    ├─ 构建 Score Event
+    │  ├─ source = EVAL
+    │  ├─ executionTraceId = 内部 Trace ID
+    │  └─ metadata = { jobExecutionId, jobConfigurationId 等
+    │
+    └─ 写入 S3 + 加入 IngestionQueue
+    │
+    ▼
+7. 更新 JobExecution 状态（COMPLETED/ERROR）
+    │
+    ▼
+8. Score 持久化到 ClickHouse scores 表
+```
+
+#### 5.2.2 数据集回放自动评测触发链
+
+```
+1. 用户点击"运行数据集"
+    │
+    ▼
+2. 创建 Experiment（Dataset Run）
+    │
+    ▼
+3. 加入 ExperimentCreate 队列
+    │
+    ▼
+4. 遍历所有 Dataset Item
+    ├─ 调用配置的模型端点
+    ├─ 生成 Trace 和 Observation
+    └─ 创建 DatasetRunItem 记录
+    │
+    ▼
+5. 触发 DatasetRunItemUpsert 事件入队
+    │
+    ▼
+6. evalJobDatasetCreatorQueueProcessor 执行
+    ├─ 拉取 ACTIVE 状态的 EVAL 配置（targetObject=DATASET）
+    ├─ 匹配数据集 filter 条件
+    └─ 创建 JobExecution
+    │
+    ▼
+7. 后续流程同 Trace 级别自动评测（步骤 5-8）
+    │
+    ▼
+8. Score 关联 datasetRunId 持久化
+```
+
+#### 5.2.3 Observation 级别自动评测触发链
+
+```
+1. Observation 数据写入（events 表
+    │
+    ▼
+2. scheduleObservationEvals 调度
+    ├─ 拉取 ACTIVE 状态的 EVAL 配置（targetObject=EVENT/EXPERIMENT）
+    ├─ 匹配 observationType 匹配（generation/span等
+    └─ 创建 JobExecution
+    │
+    ▼
+3. 加入 ObservationEval 队列
+    │
+    ▼
+4. 后续变量映射（无需 objectName，直接从 Observation 提取）
+    │
+    ▼
+5. 执行 LLM 评估并写入 Score
+```
+
+### 5.3 人工打分完整流程
+
+#### 5.3.1 基于队列的人工打分流程
+
+```
+1. 创建 Annotation Queue
+    ├─ 关联多个 ScoreConfig（评分维度配置）
+    └─ 配置队列元数据（名称、描述等）
+    │
+    ▼
+2. 批量添加待标注任务
+    ├─ 按 Trace 查询筛选
+    ├─ 按 Session 批量添加到队列
+    ├─ 按 Observation 批量添加到队列
+    └─ 按筛选结果批量添加到队列
+    │
+    ▼
+3. 标注人员领取任务（fetchAndLockNext）
+    ├─ 查询 PENDING 状态的队列项
+    ├─ 锁定（lockedAt, lockedByUserId
+    └─ 5分钟超时自动释放
+    │
+    ▼
+4. 标注界面展示
+    ├─ Trace/Observation/Session 详情
+    ├─ 关联的输入输出上下文
+    └─ 多维度评分表单（基于 ScoreConfig）
+    │
+    ▼
+5. 提交评分
+    ├─ source = ANNOTATION
+    ├─ authorUserId = 当前用户ID
+    ├─ queueId = 队列ID
+    └─ configId = 评分配置ID
+    │
+    ▼
+6. 写入 S3 + 加入 IngestionQueue
+    │
+    ▼
+7. 更新 AnnotationQueueItem 状态为 COMPLETED
+```
+
+### 5.4 数据流动与关联关系
+
+#### 5.4.1 核心数据表关联关系
+
+```
+scores 表
+  │
+  ├─ traceId ──────┐
+  ├─ observationId ───┤
+  ├─ sessionId ─────┤
+  └─ datasetRunId ────┘
+                     │
+  traces 表 ◄──────────┘
+    │
+    ├─ sessionId ────────┐
+    └─ userId
+                     │
+  observations 表 ◄────────┘
+    │
+    └─ traceId
+                     │
+  sessions 表 ◄──────────┘
+    │
+    └─ 包含多个 traces（通过 traces.sessionId 关联）
+                     │
+  dataset_run_items 表 ◄───┘
+    │
+    ├─ datasetRunId
+    ├─ datasetItemId
+    ├─ traceId
+    └─ observationId
+                     │
+  job_executions 表 ◄─────────────────────────┘
+    │
+    ├─ jobConfigurationId
+    ├─ jobInputTraceId
+    ├─ jobInputObservationId
+    ├─ jobInputDatasetItemId
+    └─ jobOutputScoreId ───────────────────────────────────────────────► scores.id
+```
+
+#### 5.4.2 annotation_queue_items 表关联
+
+```
+annotation_queue_items
+  │
+  ├─ queueId ──────────► annotation_queues.id
+  ├─ objectType ───────► TRACE / OBSERVATION / SESSION
+  ├─ objectId ────────► traces.id / observations.id / sessions.id
+  ├─ status ───────────► PENDING / LOCKED / COMPLETED / CANCELLED
+  ├─ lockedAt
+  └─ lockedByUserId
+```
+
+### 5.5 三种评估手段的协同场景组合使用
+
+#### 5.5.1 典型组合模式
+
+| 组合模式 | 适用场景 | 实现方式 |
+|---------|---------|
+| **自动评测为主，人工抽检为辅 | 评测效率与自动评测质量 | 1. 自动评测全量运行，2. 按 Score 筛选低分自动加入人工标注队列抽检 |
+| **数据集冷启动 | 新功能上线前基准测试 | 1. 准备标注数据集构建 golden set，2. 人工标注基准，3. 运行数据集回放，4. 迭代 Prompt |
+| **多模型对比实验 | 新旧模型版本迭代验证 | 1. 同一数据集跑多个模型版本，2. 自动评测多维度评分，3. 人工对比排序 |
+| **持续学习闭环 | 生产环境质量监控 | 1. 生产Trace自动评测，2. 低分自动加入人工标注队列，3. 人工标注结果反馈优化 Prompt |
+
+#### 5.5.2 统一评分的联动示例
+
+```
+生产环境
+     │
+     ▼
+Trace 实时上报
+     │
+     ▼
+自动评测（EVAL）
+     │
+     ├─ Score >= 4分 ──► 正常通过
+     │
+     └─ Score < 3分 ──► 自动加入 Annotation Queue
+                             │
+                             ▼
+                        人工标注审核（ANNOTATION）
+                             │
+                             ▼
+                        标注结果分析
+                             │
+                             ▼
+                        优化评估 Prompt / 模型微调
+                             │
+                             ▼
+                        更新 Evaluation Config
+```
+
+---
+
+## 六、关键设计要点
+
+### 6.1 防止无限评估循环
 
 **问题**：自动评测本身也会产生Trace，如果不加限制会导致：
 ```
@@ -509,21 +881,21 @@ if (sourceEventType === "trace-upsert" &&
 内部执行Trace使用特殊环境前缀：
 - `LangfuseInternalTraceEnvironment.LLMJudge` = "langfuse-llm-judge"
 
-### 5.2 延迟执行与状态管理
+### 6.2 延迟执行与状态管理
 
 自动评测支持 `delay` 配置（毫秒），目的：
 1. 等待Trace完整上报（LLM流式输出可能耗时）
 2. 避免Ingestion和Evaluation资源竞争
 3. 削峰填谷，平滑系统负载
 
-### 5.3 观察级别（Observation-level）评估
+### 6.3 观察级别（Observation-level）评估
 
 支持针对特定Observation（如单个LLM调用）评估：
 - 通过 `variableMapping.objectName` 指定要提取的Observation名称
 - 支持按Observation类型筛选
 - Dataset Run Item可直接关联到Observation级别
 
-### 5.4 采样机制
+### 6.4 采样机制
 
 通过 `config.sampling` 字段控制评估覆盖率：
 - 1 = 100% 评估（默认）
@@ -538,18 +910,23 @@ if (random > Number(config.sampling)) continue;
 
 ---
 
-## 六、代码入口索引
+## 七、代码入口索引
 
-| 功能模块 | 文件路径 | 核心函数 |
-|---------|---------|---------|
+| 功能模块 | 文件路径 | 核心函数/组件 |
+|---------|---------|-------------|
 | 评分域模型 | `packages/shared/src/domain/scores.ts` | `ScoreSchema`, `ScoreSourceEnum` |
+| 评估目标对象类型 | `packages/shared/src/features/evals/types.ts` | `EvalTargetObject`, `variableMapping` |
 | 评估服务 | `worker/src/features/evaluation/evalService.ts` | `createEvalJobs()`, `evaluate()`, `executeLLMAsJudgeEvaluation()` |
+| Observation级别评估 | `worker/src/features/evaluation/observationEval/` | `scheduleObservationEvals()`, `processObservationEval()` |
 | 评分事件构建 | `worker/src/features/evaluation/evalScoreEvent.ts` | `buildEvalScoreWritePayloads()` |
-| 评估队列处理器 | `worker/src/queues/evalQueue.ts` | `evalJobTraceCreatorQueueProcessor()`, `evalJobExecutorQueueProcessorBuilder()` |
-| 人工评分队列API | `web/src/features/annotation-queues/server/annotationQueuesRouter.ts` | `fetchAndLockNext`, `create`, `update` |
-| 分数API | `web/src/server/api/routers/scores.ts` | `createAnnotation`, `delete`, `all` |
+| 评估队列处理器 | `worker/src/queues/evalQueue.ts` | `evalJobTraceCreatorQueueProcessor()`, `evalJobDatasetCreatorQueueProcessor()`, `evalJobExecutorQueueProcessorBuilder()` |
+| 人工评分队列API | `web/src/features/annotation-queues/server/annotationQueuesRouter.ts` | `create()`, `fetchAndLockNext`, `update` |
+| 人工评分队列项API | `web/src/features/annotation-queues/server/annotationQueueItemsRouter.ts` | `all()`, `add()`, `byId()` |
+| 分数API | `web/src/server/api/routers/scores.ts` | `createAnnotation`, `delete`, `all()` |
+| 会话标注处理器 | `web/src/features/annotation-queues/components/processors/SessionAnnotationProcessor.tsx` | `SessionAnnotationProcessor` |
 | 数据集运行项模型 | `packages/shared/src/domain/dataset-run-items.ts` | `DatasetRunItemSchema` |
 | 实验队列处理器 | `worker/src/queues/experimentQueue.ts` | `experimentCreateQueueProcessor()` |
+| 会话API | `web/src/server/api/routers/sessions.ts` | `all()`, `byId()`, `allFromEvents()` |
 
 ---
 
