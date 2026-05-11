@@ -262,7 +262,7 @@ await enqueueScoreIngestion({ projectId, scoreId, eventId: v4() });
 
 3. **数据集标注面板**：在Dataset Run详情页的Annotation Panel中评分
 
-4. **API/SDK提交**：通过公共API手动提交ANNOTATION类型分数（支持四种评分对象维度）
+4. **API/SDK提交**：通过公共API手动提交ANNOTATION类型分数（支持Trace/Observation/Session三种维度，不支持Dataset Run）
 
 ---
 
@@ -597,10 +597,11 @@ Score最终写入 `scores` 表，支持：
 |-----|-----------------------|-----------------|--------------------------|
 | **触发源** | 用户主动操作 / 队列领取 | 实时事件 / 回溯任务 | 数据集运行执行 |
 | **触发时机** | 按需、手动 | 实时/近实时、自动 | 批量、执行后自动触发 |
-| **评分对象** | **Trace / Observation / Session** | **Trace / Observation / Dataset Item** | Dataset Item（关联Trace/Observation） |
+| **支持的评分对象** | **Trace / Observation / Session**<br>（不支持Dataset Run） | **Trace / Observation**<br>（不支持Session、不支持Dataset Run直接关联） | 生成Trace/Observation后通过自动评测间接评分 |
+| **关键约束** | `datasetRunId`硬编码为`null` | 仅通过`traceId`/`observationId`关联 | 通过Dataset Run Item关联Trace/Observation |
 | **执行者** | 真实用户 | LLM / 规则引擎 | 目标应用 + 自动评测 |
 | **Source标记** | `ANNOTATION` | `EVAL` | `EVAL`（评测结果） |
-| **必填字段** | `authorUserId` | `executionTraceId`, `metadata.jobExecutionId` | `datasetRunId` |
+| **必填字段** | `authorUserId` | `executionTraceId`, `metadata.jobExecutionId` | `datasetRunId`仅用于聚合查询 |
 | **执行状态** | 即时完成 | PENDING → IN_PROGRESS → COMPLETED/ERROR | RUNNING → COMPLETED |
 | **队列** | Annotation Queue（TRACE/OBSERVATION/SESSION） | TraceUpsert / CreateEvalQueue / EvaluationExecution / ObservationEval | ExperimentCreate / DatasetRunItemUpsert |
 | **结果写入** | 直接S3+IngestionQueue | 评测完成后S3+IngestionQueue | 执行完成后触发评测写入 |
