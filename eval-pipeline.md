@@ -8,7 +8,7 @@
 
 ### 1.1 完整的评分对象体系
 
-Langfuse 评估系统采用**统一 Score 数据模型 + 多维度关联对象**的设计，支持四种评分对象维度：**Trace**、**Observation**、**Session** 和 **Dataset Run**。
+Langfuse 评估系统采用**统一 Score 数据模型 + 多维度关联对象**的设计。Score 模型定义了四个关联字段，但每种评估手段支持的评分对象有明确边界，并非所有评估手段都支持四类对象。
 
 #### 1.1.1 Score 核心数据模型
 
@@ -32,7 +32,8 @@ Langfuse 评估系统采用**统一 Score 数据模型 + 多维度关联对象**
   updatedAt: Date;               // 更新时间
   timestamp: Date;               // 评分时间戳
   
-  // ========== 关联对象 - 四者必居其一 ==========
+  // ========== 关联对象字段 - 数据模型层支持四种关联
+  // ========== 注意：每种评估手段支持的评分对象有明确边界，详见1.1.3
   traceId: string | null;        // 关联Trace（单次调用链路）
   observationId: string | null;  // 关联Observation（单个LLM调用/步骤）
   sessionId: string | null;      // 关联Session（会话维度，多Trace聚合）
@@ -45,14 +46,34 @@ Langfuse 评估系统采用**统一 Score 数据模型 + 多维度关联对象**
 }
 ```
 
-#### 1.1.2 四种评分对象维度对比
+#### 1.1.2 评分对象字段定义说明
 
-| 评分对象 | 关联字段 | 适用评估手段 | 粒度 | 典型场景 |
-|---------|---------|-------------|------|---------|
-| **Trace** | `traceId` | 人工打分/自动评测/API | 单次调用链路 | 单次用户请求的完整评估 |
-| **Observation** | `observationId` | 人工打分/自动评测/API | 单个步骤/LLM调用 | 特定生成步骤的质量评估 |
-| **Session** | `sessionId` | 人工打分/API | 多轮会话（含多Trace） | 完整对话会话质量评估 |
-| **Dataset Run** | `datasetRunId` | 自动评测/API | 数据集批量运行 | 数据集回放评测结果聚合 |
+> **重要修正**：四个关联字段是数据模型层的定义，不代表"四者必居其一"的强制约束关系，实际使用时不同评估手段有明确的边界。
+
+| 评分对象 | 关联字段 | 说明 |
+|---------|---------|------|
+| **Trace** | `traceId` | 单次调用链路级别评分 |
+| **Observation** | `observationId` | 单个LLM调用/步骤级别评分（必须同时设置traceId） |
+| **Session** | `sessionId` | 会话维度评分，多Trace聚合评分 |
+| **Dataset Run** | `datasetRunId` | 数据集运行维度评分标识 |
+
+#### 1.1.3 三套评估手段支持的评分对象边界
+
+基于真实代码实现（见 `web/src/server/api/routers/scores.ts:568-569`）：
+
+| 评分对象 | 人工打分（ANNOTATION） | 自动评测（EVAL） | 数据集回放（Dataset Run） |
+|---------|-----------------------|-----------------|--------------------------|
+| **Trace** | ✅ 支持 | ✅ 支持 | ✅ 支持（通过traceId关联） |
+| **Observation** | ✅ 支持（必须同时设置traceId） | ✅ 支持（必须同时设置traceId） | ✅ 支持（通过observationId关联） |
+| **Session** | ✅ 支持 | ❌ 不支持 | ❌ 不支持 |
+| **Dataset Run** | ❌ 不支持（代码中硬编码`datasetRunId: null`） | ❌ 不支持（通过traceId间接关联） | ✅ 仅用于结果聚合标识，不直接评分 |
+
+**关键代码证据**：
+```typescript
+// web/src/server/api/routers/scores.ts:568-569
+// only trace and session scores are supported for annotation
+datasetRunId: null,  // 人工打分硬编码不支持datasetRunId
+```
 
 #### 1.1.3 评分来源区分
 
