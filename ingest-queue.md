@@ -271,10 +271,15 @@ OtelIngestionQueue 消费
 #### 触发条件
 **支持两种分流方式**：静态配置 + 动态 S3 SlowDown 检测。
 
+**代码执行位置与顺序**：
 ```typescript
 // 位置: worker/src/queues/ingestionQueue.ts:108-133
+// 时机: 消费开始时，S3 下载之前
+
+// 【第一步】检查是否需要分流
+const projectId = job.data.payload.authCheck.scope.projectId;
 const shouldRedirectEnv = projectIdsToRedirectToSecondaryQueue.includes(projectId);
-const shouldRedirectSlowdown = await hasS3SlowdownFlag(projectId);
+const shouldRedirectSlowdown = await hasS3SlowdownFlag(projectId);  // ← 读 Redis 标记
 
 if (enableRedirectToSecondaryQueue && (shouldRedirectEnv || shouldRedirectSlowdown)) {
   // 重定向到二级队列
@@ -282,23 +287,26 @@ if (enableRedirectToSecondaryQueue && (shouldRedirectEnv || shouldRedirectSlowdo
   const secondaryQueue = SecondaryIngestionQueue.getInstance({ shardingKey });
   if (secondaryQueue) {
     await secondaryQueue.add(QueueName.IngestionSecondaryQueue, job.data);
-    return;  // 终止当前处理
+    return;  // 终止当前处理，不再往下执行
   }
 }
+
+// 【后续】如果不分流，继续执行 S3 下载和处理逻辑
 ```
 
 #### S3 SlowDown 标记机制
 
-当消费过程中检测到 S3 限流错误，会自动标记项目：
+**标记发生位置**：catch 块中，处理失败时
 
 ```typescript
 // 位置: worker/src/queues/ingestionQueue.ts:286-295
 catch (e) {
+  // 【第二步】遇到 S3 限流时设置标记（写 Redis）
   if (isS3SlowDownError(e)) {
-    // 设置 Redis flag，TTL 由环境变量控制
-    await markProjectS3Slowdown(projectId);
+    const projectId = job.data.payload.authCheck.scope.projectId;
+    await markProjectS3Slowdown(projectId);  // ← 设置 Redis flag
   }
-  // ...
+  throw e;  // 继续抛出，触发 BullMQ 重试
 }
 ```
 
@@ -327,32 +335,65 @@ LANGFUSE_S3_RATE_ERROR_SLOWDOWN_ENABLED=true
 LANGFUSE_S3_RATE_ERROR_SLOWDOWN_TTL_SECONDS=3600  # 默认为 1 小时
 ```
 
+#### 主队列 vs 二级队列的行为差异
+
+| 行为 | 主队列消费者<br>(`enableRedirectToSecondaryQueue=true`) | 二级队列消费者<br>(`enableRedirectToSecondaryQueue=false`) |
+|-----|--------------------------------------------------------|----------------------------------------------------------|
+| **调用 `hasS3SlowdownFlag`** | ✅ 在处理前调用<br>如返回 true 则重定向到二级队列 | ❌ 不调用<br>因为 `enableRedirectToSecondaryQueue=false` 时整个 if 判断不成立 |
+| **调用 `markProjectS3Slowdown`** | ✅ 在 catch 块中调用<br>遇到 S3 SlowDown 时设置 flag | ✅ 在 catch 块中同样调用<br>**无论主/二级队列，只要遇到 S3 SlowDown 都会刷新 flag TTL** |
+| **对后续分流的影响** | ✅ flag 存在时，后续新 job 会被分流 | ✅ flag 存在时，不影响当前二级队列的 job<br>但会影响**该项目新入队的主队列 job** |
+
 #### 处理路径
 ```
-IngestionQueue 消费
+IngestionQueue 消费 (主队列)
        │
        ▼
-  检查分流条件？
-       │
-       ├─ 环境配置命中？→ 是 → 重新入队 SecondaryIngestionQueue → 返回
-       │
-       ├─ S3 SlowDown Flag？→ 是 → 重新入队 SecondaryIngestionQueue → 返回
-       │
-       └─ 否 → 继续正常处理
+  hasS3SlowdownFlag? ──┐
+       │               │
+       ├─ 是 → 重定向到 SecondaryIngestionQueue → 返回
+       │               │
+       └─ 否 → 继续处理
               → 下载 S3 文件
               → 合并事件
-              → IngestionService 写入 ClickHouse
-              → 如遇 S3 SlowDown 错误
-                  └─ markProjectS3Slowdown(projectId)
-                     └─ 影响该项目后续的所有新 job
+              → 写入 ClickHouse
+              │
+              └─ 如遇 S3 SlowDown 错误
+                  └─ markProjectS3Slowdown(projectId)  ← 设置 Redis flag
+                     └─ 影响该项目后续所有新的主队列 job
 ```
+
+```
+SecondaryIngestionQueue 消费 (二级队列)
+       │
+       ▼
+  【跳过】hasS3SlowdownFlag 检查  ← 因为 enableRedirectToSecondaryQueue=false
+       │
+       ▼
+  继续处理
+       │
+       ▼
+  下载 S3 文件
+       │
+       ▼
+  合并事件
+       │
+       ▼
+  写入 ClickHouse
+       │
+       └─ 如遇 S3 SlowDown 错误
+           └─ markProjectS3Slowdown(projectId)  ← 仍然会设置/刷新 Redis flag
+              └─ 不影响当前二级队列的 job
+              └─ 但会影响该项目后续新入队的主队列 job
+```
+
+> **代码事实**：`markProjectS3Slowdown` 在 catch 块中无条件执行，与 `enableRedirectToSecondaryQueue` 无关。二级队列中发生的 S3 SlowDown 错误，仍然会刷新 Redis flag 的 TTL，延长该项目的降级时间。
 
 ### 4.4 二级队列的处理路径
 
 **所有二级队列共享以下特性**：
 1. `enableRedirectToSecondaryQueue = false` - 不会再次重定向
-2. 跳过所有分流检查，直接处理 payload
-3. 不会执行 `markProjectS3Slowdown` 标记（IngestionQueue 例外，catch 块中仍会标记但不影响后续）
+2. 跳过所有分流检查（包括 `hasS3SlowdownFlag` 调用），直接处理 payload
+3. `markProjectS3Slowdown` 仍然在 catch 块中执行，用于刷新 flag TTL
 
 **处理流程**:
 ```
@@ -365,10 +406,13 @@ Secondary*Queue 消费
   正常处理 payload
        │
        ▼
+  如遇 S3 SlowDown → markProjectS3Slowdown(projectId)  ← 刷新 TTL
+       │
+       ▼
   完成（不会再次重定向）
 ```
 
-> **设计意图**：防止无限循环重定向，二级队列作为最终的"安全网"处理层。
+> **设计意图**：防止无限循环重定向，二级队列作为最终的"安全网"处理层；但仍然持续监控 S3 限流状态，必要时延长降级时间。
 
 ---
 
@@ -573,6 +617,16 @@ LANGFUSE_S3_CONCURRENT_READS
 | **S3 限流感知** | ❌ 不感知 | ✅ 自动标记 + 重定向后续任务 |
 | **分片键** | `projectId-fileKey` (每次请求 UUID) | `projectId-eventBodyId` (每个实体 ID) |
 | **重试次数** | 6次（主）/ 5次（二级） | 6次（主）/ 5次（二级） |
+
+### IngestionQueue S3 SlowDown 行为总结
+
+| 操作 | 主队列 | 二级队列 |
+|-----|-------|---------|
+| **hasS3SlowdownFlag** | ✅ 处理前调用，命中则分流 | ❌ 不调用，整个分流判断跳过 |
+| **markProjectS3Slowdown** | ✅ catch 块中调用，设置 flag | ✅ catch 块中同样调用，刷新 TTL |
+| **对后续 job 影响** | 新入队的主队列 job 会被分流 | 新入队的主队列 job 同样会被分流（flag 是全局的） |
+
+> **关键结论**：S3 SlowDown flag 是项目级的全局标记，与队列无关。二级队列中的 S3 错误仍然会延长 flag TTL，持续影响该项目的主队列新 job。
 
 ### 分片与顺序性关键结论
 
