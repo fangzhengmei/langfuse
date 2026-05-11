@@ -58,52 +58,89 @@ Langfuse 存在**两组独立的两级队列**，每组都有主队列和二级�
 **位置**: `packages/shared/src/server/redis/sharding.ts`
 
 ```typescript
+// 分片核心逻辑
 export function getShardIndex(key: string, shardCount: number): number {
   if (shardCount <= 1) return 0;
 
-  // 使用 SHA-256 哈希
+  // 使用 SHA-256 哈希计算分片索引
   const hash = createHash("sha256").update(key).digest("hex");
-
-  // 取前 8 个十六进制字符转为整数
   const hashInt = parseInt(hash.substring(0, 8), 16);
-
-  // 映射到分片索引
   return hashInt % shardCount;
 }
 ```
 
-### 2.2 分片键对顺序性的实际影响
+**代码证据**：
+- 分片计算基于完整的 `key` 字符串的 SHA-256 哈希值
+- 取前 8 个十六进制字符转为整数再取模
+- 只要 key 的任何一位变化，分片索引就可能变化
+
+### 2.2 分片键构成与本质
 
 #### 分片键构成
 
-| 队列 | 分片键构成 | 说明 |
-|-----|-----------|------|
-| **OtelIngestionQueue** | `{projectId}-{fileKey}` | fileKey 是 S3 上的单个批文件标识 |
-| **SecondaryOtelIngestionQueue** | `{projectId}-{fileKey}` | 同上 |
-| **IngestionQueue** | `{projectId}-{eventBodyId}` | eventBodyId 是 trace/observation ID |
-| **SecondaryIngestionQueue** | `{projectId}-{eventBodyId}` | 同上 |
+| 队列 | 分片键格式 | 各字段的含义与来源 |
+|-----|-----------|-------------------|
+| **OtelIngestionQueue** | `{projectId}-{fileKey}` | **projectId**: 项目ID（认证获得，固定）<br>**fileKey**: `OtelIngestionProcessor.ts:184` 中用 `randomUUID()` 生成，每次 API 请求生成一个新的唯一值 |
+| **IngestionQueue** | `{projectId}-{eventBodyId}` | **projectId**: 项目ID（认证获得，固定）<br>**eventBodyId**: traceId 或 observationId，每个事件实体天然不同 |
 
-#### 对顺序性的实际影响
+**代码证据**：
+```typescript
+// OtelIngestionProcessor.ts:183-194 - fileKey 生成
+async publishToOtelIngestionQueue(resourceSpans: ResourceSpan[]) {
+  // 每次请求都用 randomUUID() 生成新 fileKey
+  const fileKey = `${env.LANGFUSE_S3_EVENT_UPLOAD_PREFIX}otel/${this.projectId}/${this.getCurrentTimePath()}/${randomUUID()}.json`;
 
-**分片键不能保证严格的事件处理顺序**，原因如下：
+  // 用 projectId + fileKey 作为分片键
+  const queue = OtelIngestionQueue.getInstance({
+    shardingKey: `${this.projectId}-${fileKey}`,  // 每次都不同
+  });
+}
+```
 
-1. **BullMQ 并发消费机制**
-   - 即使在同一个分片内，多个 Worker 也会并发拉取任务
-   - BullMQ 不保证 FIFO 顺序，仅保证任务至少被执行一次
-   - 同一分片内先入队的 job 可能后被处理（网络延迟、执行时间差异等）
+### 2.3 分片键对顺序性的实际影响
 
-2. **每个 job 是独立的批处理单元**
-   - Otel 的每个 job 对应一个完整的 batch 文件
-   - Ingestion 的每个 job 对应一个 eventBody 的合并操作
-   - job 之间没有显式的依赖关系
+#### 误解一：「同项目固定单分片」
 
-3. **分片键的真实作用**
-   - ✅ **负载均衡**：通过 SHA-256 哈希将不同项目均匀分布到多个分片
-   - ✅ **避免热点**：高流量项目不会集中在单一分片
-   - ✅ **同项目同分片**：同一项目的事件会路由到相同分片，减少跨分片资源竞争
-   - ❌ **不保证顺序**：不提供任何事件级别的顺序保证
+**结论**：不能推出
 
-> **设计结论**：分片是为了水平扩展和负载均衡，不是为了顺序性。Langfuse ingestion 架构本身就是无序设计，依赖幂等性保证最终一致性。
+**原因**：
+1. **分片键包含高可变因子**：
+   - `projectId` 固定，但 `fileKey` 是每个请求一个 UUID
+   - `eventBodyId` 是每个 trace/observation 独立的 ID
+   - 只要第二个字段变化，SHA-256 哈希就会完全不同
+
+2. **数学证明**：
+   ```
+   分片索引 = SHA256("proj1-uuid1") % shardCount  → 可能为分片3
+   分片索引 = SHA256("proj1-uuid2") % shardCount  → 可能为分片7
+   分片索引 = SHA256("proj1-uuid3") % shardCount  → 可能为分片0
+   ```
+   同一项目的不同请求，会均匀分布到所有分片上。
+
+3. **代码行为验证**：
+   - 同一项目 1000 个请求，会有接近 1000 个不同的分片键
+   - 每个键的哈希结果独立，因此分片索引也几乎均匀分布
+
+#### 误解二：「严格顺序保证」
+
+**结论**：不能推出
+
+**原因**：
+1. **BullMQ 并发消费机制**（`worker/src/queues/workerManager.ts`）：
+   - 每个分片可以被多个 Worker 实例同时拉取
+   - Worker 之间没有任何协调机制保证先入先出
+   - 即使在同一分片内，`job1` 被 Worker A 拉取，`job2` 被 Worker B 拉取，它们的完成顺序与入队顺序无关
+
+2. **作业执行时间不确定**：
+   - 不同 job 的 S3 文件大小差异巨大（几 KB → 几 MB）
+   - 不同 job 的 spans 数量差异巨大（几个 → 几千个）
+   - 网络波动、GC 暂停都会造成执行时间的随机扰动
+
+3. **重入队机制**：
+   - job 失败后会指数退避重试
+   - 重试的 job 会排在队尾，打破原始顺序
+
+> **架构设计事实**：Langfuse 的 ingestion 队列从设计之初就是**无序、幂等、最终一致**的系统。分片的唯一目的是水平扩展吞吐量，而非提供顺序保证。
 
 ---
 
@@ -180,9 +217,9 @@ if (secondaryQueueEnabled) {
 
 | 队列 | 是否支持分流 | 分流触发条件 | 分流检测时机 |
 |-----|------------|------------|------------|
-| **OtelIngestionQueue** | ✅ | 仅环境配置 | 消费开始时（S3下载前） |
+| **OtelIngestionQueue** | ✅ | 仅静态环境配置 | 消费开始时（S3下载前） |
 | **SecondaryOtelIngestionQueue** | ❌ | 无 | - |
-| **IngestionQueue** | ✅ | 环境配置 + S3 SlowDown | 消费开始时（S3下载前） |
+| **IngestionQueue** | ✅ | 环境配置 + S3 SlowDown 动态标记 | 消费开始时（S3下载前） |
 | **SecondaryIngestionQueue** | ❌ | 无 | - |
 
 ### 4.2 OtelIngestionQueue 分流机制
@@ -201,7 +238,7 @@ if (
   const secondaryQueue = SecondaryOtelIngestionQueue.getInstance({ shardingKey });
   if (secondaryQueue) {
     await secondaryQueue.add(QueueName.OtelIngestionSecondaryQueue, job.data);
-    return;  // 终止当前处理
+    return;  // 终止当前处理，重入队到二级队列
   }
 }
 ```
@@ -268,12 +305,12 @@ catch (e) {
 **S3 SlowDown 检测逻辑** (`packages/shared/src/server/redis/s3SlowdownTracking.ts`):
 ```typescript
 function isS3SlowDownError(err: unknown): boolean {
-  // 检查 AWS SDK 错误格式
+  // 检查多种 AWS SDK 错误格式
   if (err.name === "SlowDown") return true;
   if (err.Code === "SlowDown") return true;
   if (err.code === "SlowDown") return true;
   
-  // 消息回退检查
+  // 消息内容回退检查
   if (err.message?.includes("SlowDown") || 
       err.message?.includes("reduce your request rate")) return true;
   
@@ -439,6 +476,7 @@ if (env.LANGFUSE_ENABLE_REDIS_SEEN_EVENT_CACHE === "true" && redis) {
 | 功能模块 | 文件路径 |
 |---------|---------|
 | **OTel API 入口** | `web/src/pages/api/public/otel/v1/traces/index.ts` |
+| **OTel 处理器** | `packages/shared/src/server/otel/OtelIngestionProcessor.ts` |
 | **OTel 队列定义** | `packages/shared/src/server/redis/otelIngestionQueue.ts` |
 | **Ingestion 队列定义** | `packages/shared/src/server/redis/ingestionQueue.ts` |
 | **OTel 消费者逻辑** | `worker/src/queues/otelIngestionQueue.ts` |
@@ -447,6 +485,7 @@ if (env.LANGFUSE_ENABLE_REDIS_SEEN_EVENT_CACHE === "true" && redis) {
 | **分片算法** | `packages/shared/src/server/redis/sharding.ts` |
 | **Worker 注册** | `worker/src/app.ts` |
 | **队列类型定义** | `packages/shared/src/server/queues.ts` |
+| **Worker Manager** | `worker/src/queues/workerManager.ts` |
 
 ---
 
@@ -532,26 +571,29 @@ LANGFUSE_S3_CONCURRENT_READS
 |-----|-------------------|---------------|
 | **分流触发** | 仅静态环境配置 | 静态配置 + 动态 S3 SlowDown |
 | **S3 限流感知** | ❌ 不感知 | ✅ 自动标记 + 重定向后续任务 |
-| **分片键** | `projectId-fileKey` | `projectId-eventBodyId` |
+| **分片键** | `projectId-fileKey` (每次请求 UUID) | `projectId-eventBodyId` (每个实体 ID) |
 | **重试次数** | 6次（主）/ 5次（二级） | 6次（主）/ 5次（二级） |
 
-### 关键设计结论
+### 分片与顺序性关键结论
 
-1. **分片是为了水平扩展，不是为了顺序性**
-   - SHA-256 哈希保证负载均衡
-   - BullMQ 并发消费天然无序
-   - 依赖幂等性保证最终一致性
+1. **不能推出「同项目固定单分片」**
+   - `fileKey` 是 UUID，`eventBodyId` 是实体 ID，每个 job 都不同
+   - SHA-256 哈希对输入变化敏感 → 同一项目的不同 job 均匀分布到全部分片
 
-2. **两级队列是断路器模式**
-   - 主队列：正常流量，快速失败
-   - 二级队列：隔离高负载/故障项目
-   - Otel 仅支持静态隔离，Ingestion 支持动态降级
+2. **不能推出「严格顺序保证」**
+   - BullMQ 多 Worker 并发拉取，无协调
+   - job 执行时间差异巨大（大小、数量、网络）
+   - 重试机制会把失败 job 移到队尾
 
-3. **两种 Ingestion 路径不可混用**
-   - Otel Ingestion：专门处理 OTLP 协议，有写路径选择
-   - Ingestion：处理通用事件合并，有 S3 限流保护
+3. **分片唯一目的：水平扩展吞吐量**
+   - 每个分片可以独立增加消费者
+   - 避免单 Redis 队列成为瓶颈
+   - 设计上就是无序 + 幂等 + 最终一致
 
-4. **S3 SlowDown 是单向降级**
-   - 标记后 TTL 内该项目所有新 job 都走二级队列
-   - TTL 过期后自动恢复主队列
-   - 没有自动 "恢复健康" 的检测机制
+### 两级队列设计目标
+
+1. **主队列**: 正常流量，高优先级，快速失败
+2. **二级队列**: 隔离高负载/故障项目，作为系统的「安全气囊」
+   - Otel 队列：仅静态配置的项目
+   - Ingestion 队列：静态配置 + 动态 S3 限流降级
+3. **单向降级**: 一旦标记为 SlowDown，TTL 内该项目的所有新 job 都会走二级队列；TTL 过期后自动恢复
