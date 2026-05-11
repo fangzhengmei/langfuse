@@ -276,11 +276,12 @@ OtelIngestionQueue 消费
 // 位置: worker/src/queues/ingestionQueue.ts:108-133
 // 时机: 消费开始时，S3 下载之前
 
-// 【第一步】检查是否需要分流
+// 【第一步】无条件调用：无论主/二级队列，都会执行
 const projectId = job.data.payload.authCheck.scope.projectId;
 const shouldRedirectEnv = projectIdsToRedirectToSecondaryQueue.includes(projectId);
-const shouldRedirectSlowdown = await hasS3SlowdownFlag(projectId);  // ← 读 Redis 标记
+const shouldRedirectSlowdown = await hasS3SlowdownFlag(projectId);  // ← 总是调用
 
+// 【第二步】条件判断：仅受 enableRedirectToSecondaryQueue 影响
 if (enableRedirectToSecondaryQueue && (shouldRedirectEnv || shouldRedirectSlowdown)) {
   // 重定向到二级队列
   const shardingKey = `${projectId}-${eventBodyId}`;
@@ -291,8 +292,13 @@ if (enableRedirectToSecondaryQueue && (shouldRedirectEnv || shouldRedirectSlowdo
   }
 }
 
-// 【后续】如果不分流，继续执行 S3 下载和处理逻辑
+// 【后续】继续执行 S3 下载和处理逻辑
 ```
+
+**代码证据说明**：
+- `hasS3SlowdownFlag(projectId)` 在第 112 行，位于 `if` 语句**外部**
+- 无论 `enableRedirectToSecondaryQueue` 是 `true` 还是 `false`，都会调用
+- `enableRedirectToSecondaryQueue` 只影响「是否执行重定向」，不影响「是否调用检测函数」
 
 #### S3 SlowDown 标记机制
 
@@ -339,19 +345,25 @@ LANGFUSE_S3_RATE_ERROR_SLOWDOWN_TTL_SECONDS=3600  # 默认为 1 小时
 
 | 行为 | 主队列消费者<br>(`enableRedirectToSecondaryQueue=true`) | 二级队列消费者<br>(`enableRedirectToSecondaryQueue=false`) |
 |-----|--------------------------------------------------------|----------------------------------------------------------|
-| **调用 `hasS3SlowdownFlag`** | ✅ 在处理前调用<br>如返回 true 则重定向到二级队列 | ❌ 不调用<br>因为 `enableRedirectToSecondaryQueue=false` 时整个 if 判断不成立 |
-| **调用 `markProjectS3Slowdown`** | ✅ 在 catch 块中调用<br>遇到 S3 SlowDown 时设置 flag | ✅ 在 catch 块中同样调用<br>**无论主/二级队列，只要遇到 S3 SlowDown 都会刷新 flag TTL** |
-| **对后续分流的影响** | ✅ flag 存在时，后续新 job 会被分流 | ✅ flag 存在时，不影响当前二级队列的 job<br>但会影响**该项目新入队的主队列 job** |
+| **调用 `hasS3SlowdownFlag`** | ✅ 无条件调用（if 外部）<br>返回值用于重定向判断 | ✅ 同样无条件调用（if 外部）<br>返回值获取后不用于重定向 |
+| **调用 `markProjectS3Slowdown`** | ✅ catch 块中调用<br>遇到 S3 SlowDown 时设置/刷新 flag | ✅ catch 块中同样调用<br>**无论主/二级队列，只要遇到 S3 SlowDown 都会刷新 flag TTL** |
+| **执行重定向** | ✅ flag 存在时，重定向到二级队列 | ❌ flag 存在时，**不执行**重定向逻辑<br>因为 `enableRedirectToSecondaryQueue=false` 使 if 条件不成立 |
 
 #### 处理路径
 ```
 IngestionQueue 消费 (主队列)
        │
        ▼
-  hasS3SlowdownFlag? ──┐
-       │               │
+  【总是调用】hasS3SlowdownFlag()  ← 第112行，if 外部
+       │
+       ▼
+  enableRedirectToSecondaryQueue=true
+       │
+       ▼
+  flag 存在？
+       │
        ├─ 是 → 重定向到 SecondaryIngestionQueue → 返回
-       │               │
+       │
        └─ 否 → 继续处理
               → 下载 S3 文件
               → 合并事件
@@ -366,10 +378,16 @@ IngestionQueue 消费 (主队列)
 SecondaryIngestionQueue 消费 (二级队列)
        │
        ▼
-  【跳过】hasS3SlowdownFlag 检查  ← 因为 enableRedirectToSecondaryQueue=false
+  【总是调用】hasS3SlowdownFlag()  ← 第112行，if 外部，同样调用
        │
        ▼
-  继续处理
+  enableRedirectToSecondaryQueue=false  ← 消费者构建时传入
+       │
+       ▼
+  if 条件：false && (...) = false
+       │
+       ▼
+  跳过重定向，继续处理
        │
        ▼
   下载 S3 文件
@@ -386,13 +404,13 @@ SecondaryIngestionQueue 消费 (二级队列)
               └─ 但会影响该项目后续新入队的主队列 job
 ```
 
-> **代码事实**：`markProjectS3Slowdown` 在 catch 块中无条件执行，与 `enableRedirectToSecondaryQueue` 无关。二级队列中发生的 S3 SlowDown 错误，仍然会刷新 Redis flag 的 TTL，延长该项目的降级时间。
+> **代码事实**：`hasS3SlowdownFlag` 在第 112 行无条件调用，与队列级别无关；`enableRedirectToSecondaryQueue` 只控制第 114 行 `if` 条件的判断结果，决定「是否执行重定向」，不影响「是否调用检测函数」。
 
 ### 4.4 二级队列的处理路径
 
 **所有二级队列共享以下特性**：
 1. `enableRedirectToSecondaryQueue = false` - 不会再次重定向
-2. 跳过所有分流检查（包括 `hasS3SlowdownFlag` 调用），直接处理 payload
+2. `hasS3SlowdownFlag` 仍然会调用（在 if 外部），但结果不用于重定向
 3. `markProjectS3Slowdown` 仍然在 catch 块中执行，用于刷新 flag TTL
 
 **处理流程**:
@@ -400,7 +418,10 @@ SecondaryIngestionQueue 消费 (二级队列)
 Secondary*Queue 消费
        │
        ▼
-  跳过分流检查
+  【仍然调用】hasS3SlowdownFlag()
+       │
+       ▼
+  if 条件不满足 → 跳过重定向
        │
        ▼
   正常处理 payload
@@ -620,13 +641,14 @@ LANGFUSE_S3_CONCURRENT_READS
 
 ### IngestionQueue S3 SlowDown 行为总结
 
-| 操作 | 主队列 | 二级队列 |
-|-----|-------|---------|
-| **hasS3SlowdownFlag** | ✅ 处理前调用，命中则分流 | ❌ 不调用，整个分流判断跳过 |
-| **markProjectS3Slowdown** | ✅ catch 块中调用，设置 flag | ✅ catch 块中同样调用，刷新 TTL |
+| 操作 | 主队列<br>(`enableRedirectToSecondaryQueue=true`) | 二级队列<br>(`enableRedirectToSecondaryQueue=false`) |
+|-----|--------------------------------------------------|-----------------------------------------------------|
+| **调用 `hasS3SlowdownFlag`** | ✅ 无条件调用（第 112 行，if 外部）<br>结果用于重定向判断 | ✅ 同样无条件调用<br>结果获取后不用于重定向 |
+| **执行重定向** | ✅ flag 存在时，重定向到二级队列 | ❌ flag 存在时，**不执行**重定向<br>因为 if 条件不成立 |
+| **调用 `markProjectS3Slowdown`** | ✅ catch 块中调用，设置/刷新 flag | ✅ catch 块中同样调用，刷新 TTL |
 | **对后续 job 影响** | 新入队的主队列 job 会被分流 | 新入队的主队列 job 同样会被分流（flag 是全局的） |
 
-> **关键结论**：S3 SlowDown flag 是项目级的全局标记，与队列无关。二级队列中的 S3 错误仍然会延长 flag TTL，持续影响该项目的主队列新 job。
+> **关键结论**：`hasS3SlowdownFlag` 总是调用，与队列级别无关；`enableRedirectToSecondaryQueue` 只影响「是否重定向」，不影响「是否调用」。S3 SlowDown flag 是项目级的全局标记，二级队列中的 S3 错误仍然会延长 flag TTL，持续影响该项目的主队列新 job。
 
 ### 分片与顺序性关键结论
 
