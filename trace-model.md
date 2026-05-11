@@ -311,7 +311,10 @@ Langfuse 支持 **两条独立写入路径**：
 │     - LANGFUSE_SKIP_S3_LIST_FOR_OBSERVATIONS_PROJECT_IDS 包含: true              │
 │     - dataset_run_item 类型: true                                               │
 │  5. 提交到 IngestionQueue                                                        │
-│     - delay: getDelay() - API 默认 15s，日期边界额外延迟                          │
+│     - delay: getDelay() - 分段逻辑:                                               │
+│       * 跨日窗口 (UTC 23:45-00:15): LANGFUSE_INGESTION_QUEUE_DELAY_MS (默认 15s)  │
+│       * API 常态 (其他时间): min(5000, LANGFUSE_INGESTION_QUEUE_DELAY_MS) = 5s    │
+│       * OTEL 来源: 0s                                                             │
 │     - shardingKey: projectId-eventBodyId                                         │
 └───────────────────────────────┬─────────────────────────────────────────────────┘
                                 │
