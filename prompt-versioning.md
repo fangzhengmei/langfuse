@@ -401,10 +401,15 @@ public async buildAndResolvePromptGraph(params: {
 1. **V2 API 直接调用**：在应用代码中根据用户 ID 哈希、流量比例等条件，直接调用带 label 参数的 V2 API
    ```typescript
    // 直接使用 V2 API（支持 label 参数）
+   // Basic 认证格式: Basic base64(publicKey:secretKey)
+   const publicKey = "pk-lf-xxxxxxxxxxxxxx";
+   const secretKey = "sk-lf-xxxxxxxxxxxxxx";
+   const credentials = Buffer.from(`${publicKey}:${secretKey}`).toString("base64");
+   
    const label = userId.hashCode() % 100 < 20 ? "experiment-b" : "production";
    const response = await fetch(
      `/api/public/v2/prompts/my-prompt?label=${encodeURIComponent(label)}`,
-     { headers: { Authorization: "Basic <api-key>" } }
+     { headers: { Authorization: `Basic ${credentials}` } }
    );
    ```
 
