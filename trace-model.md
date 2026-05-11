@@ -686,9 +686,11 @@ const isOtelOrSkipS3Project =
 |------|--------|--------|--------|------|
 | L1 | API 响应 | 立即 | 否 | 快速响应 SDK，不阻塞调用方 |
 | L2 | S3 上传 | 同步 | 否 | 持久化原始事件，防止丢失 |
-| L3 | 队列延迟 | 15s (API) / 0s (OTEL) | `LANGFUSE_INGESTION_QUEUE_DELAY_MS` | 避免短时间内重复处理同一实体 |
+| L3 | 队列延迟 (getDelay) | 分段 | `LANGFUSE_INGESTION_QUEUE_DELAY_MS` | 避免短时间内重复处理同一实体 |
+|    | ├─ 跨日窗口 (UTC 23:45-00:15) | 15s | `LANGFUSE_INGESTION_QUEUE_DELAY_MS` (默认 15000) | 避免跨天分区的乱序处理 |
+|    | ├─ API 常态 (其他时间) | 5s | `min(5000, delay_ms)` | 避免 worker 端重复处理 |
+|    | └─ OTEL 来源 | 0s | 固定值 | 无额外延迟 |
 | L4 | ClickHouse 批量 | 1s / 1000条 | `WRITE_BATCH_SIZE`, `WRITE_INTERVAL_MS` | 优化 ClickHouse 写入性能 |
-| L5 | 日期边界 | 额外延迟 (23:45-00:15) | 否 | 避免跨天分区的重复处理 |
 
 ---
 
@@ -790,7 +792,7 @@ Langfuse 的追踪数据模型采用 **"两级物理表 + 类型字段区分 + �
 1. **双路径架构**: Ingestion 主路径 (Langfuse SDK) + OTEL 独立路径 (OpenTelemetry)
 2. **主队列 + 降级队列**: 每条路径都有主队列和降级队列，支持 S3 SlowDown 自动降级和静态配置路由
 3. **skipS3List 优化**: 高吞吐量项目可跳过 S3 List 操作，直接下载单个文件
-4. **多级延迟**: S3 同步上传 → 队列延迟 (15s) → ClickHouse 批量 (1s/1000条)
+4. **多级延迟**: S3 同步上传 → 队列延迟 (常态 5s, 跨日窗口 15s, OTEL 0s) → ClickHouse 批量 (1s/1000条)
 
 ### 核心设计考量
 - **ClickHouse 写入友好**: 批量写入、ReplacingMergeTree 幂等更新
