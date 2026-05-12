@@ -213,15 +213,73 @@ apply(): ClickhouseFilter {
 [前端] TanStack Table 渲染
 ```
 
-#### 关键代码片段 (traces-ui-table-service.ts:443-455)
+#### 3.1.1 返回字段映射表
+
+| 字段名 | 来源表/CTE | 是否可选 | 受影响的开关/过滤器 | 代码位置 |
+|-------|----------|---------|--------------------|---------|
+| **核心字段** | | | | |
+| `id` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:361` |
+| `project_id` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:362` |
+| `timestamp` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:363` |
+| `tags` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:364` |
+| `bookmarked` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:365` |
+| `name` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:366` |
+| `release` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:367` |
+| `version` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:368` |
+| `user_id` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:369` |
+| `environment` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:370` |
+| `session_id` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:371` |
+| `public` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:377` |
+| **Metrics 字段** | | | | |
+| `latency` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
+| `calculatedTotalCost` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:374` |
+| `usage_details` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:372` |
+| `cost_details` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:373` |
+| `aggregated_level` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:372` |
+| `observation_count` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
+| `error_count` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
+| `warning_count` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
+| **Scores 字段** | | | | |
+| `scores_avg` | `scores_avg` (s) | ✅ 可选 | `requiresScoresJoin=true` | `traces-ui-table-service.ts:375` |
+| `score_categories` | `scores_avg` (s) | ✅ 可选 | `requiresScoresJoin=true` | `traces-ui-table-service.ts:376` |
+
+#### 3.1.2 CTE 触发条件
+
+| CTE 名称 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| `observations_stats` | 过滤器引用 observations 表 OR 选择 metrics 字段 | `traces-ui-table-service.ts:286-310` |
+| `scores_avg` | 过滤器引用 scores 表 (numberObject/categoryOptions) OR 选择 scores 字段 | `traces-ui-table-service.ts:312-326` |
+
+#### 3.1.3 关键代码片段
+
+**SELECT 分支逻辑** (`traces-ui-table-service.ts:357-400`):
 
 ```typescript
-// scores_avg CTE 定义 + JOIN 条件
-${requiresScoresJoin ? `LEFT JOIN scores_avg s on s.project_id = t.project_id and s.trace_id = t.id` : ""}
-WHERE t.project_id = {projectId: String}
-${tracesFilterRes ? `AND ${tracesFilterRes.query}` : ""}
-${observationsFilter ? `AND ${observationFilterRes.query}` : ""}
-${scoresFilter ? `AND ${scoresFilterRes.query}` : ""}
+switch (select) {
+  case "count":
+    sqlSelect = "uniqExact(t.id) as count";
+    break;
+  case "metrics":
+    sqlSelect = `t.id, t.project_id, t.timestamp, o.latency_milliseconds / 1000 as latency,
+      o.cost_details, o.usage_details, o.aggregated_level,
+      o.error_count, o.warning_count, o.default_count, o.debug_count,
+      o.observation_count, s.scores_avg, s.score_categories, t.public`;
+    break;
+  case "rows":
+    sqlSelect = `t.id, t.project_id, t.timestamp, t.tags, t.bookmarked,
+      t.name, t.release, t.version, t.user_id, t.environment, t.session_id, t.public`;
+    break;
+}
+```
+
+**JOIN 条件** (`traces-ui-table-service.ts:450-455`):
+
+```typescript
+FROM traces t ${defaultOrder || select === "count" ? "" : "FINAL"}
+${select === "metrics" || requiresObservationsJoin ?
+  `LEFT JOIN observations_stats o on o.project_id = t.project_id and o.trace_id = t.id` : ""}
+${select === "metrics" || requiresScoresJoin ?
+  `LEFT JOIN scores_avg s on s.project_id = t.project_id and s.trace_id = t.id` : ""}
 ```
 
 ---
@@ -253,10 +311,51 @@ ${scoresFilter ? `AND ${scoresFilterRes.query}` : ""}
 [HTTP] JSON Response 200 OK
 ```
 
-#### 关键代码片段 (public-api/server/traces.ts:112-132)
+#### 3.2.1 返回字段映射表
+
+| 字段名 | 来源表/CTE | 是否可选 | 受影响的开关/过滤器 | 代码位置 |
+|-------|----------|---------|--------------------|---------|
+| **核心字段 (coreSelect)** | | | | |
+| `id` | `traces` (t) / `base` (b) | ❌ 必选 | 始终返回 | `public-api/server/traces.ts:260-274` |
+| `project_id` | `traces` (t) / `base` (b) | ❌ 必选 | 始终返回 | `public-api/server/traces.ts:262` |
+| `timestamp` | `traces` (t) / `base` (b) | ❌ 必选 | 始终返回 | `public-api/server/traces.ts:263` |
+| `name` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:264` |
+| `environment` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:265` |
+| `session_id` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:266` |
+| `user_id` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:267` |
+| `release` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:268` |
+| `version` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:269` |
+| `bookmarked` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:270` |
+| `public` | `traces` (t) / `base` (b) | ❌ 必选 | 始终返回 | `public-api/server/traces.ts:271` |
+| `tags` | `traces` (t) / `base` (b) | ✅ 可选 | 始终返回 | `public-api/server/traces.ts:272` |
+| `created_at` | `traces` (t) / `base` (b) | ❌ 必选 | 始终返回 | `public-api/server/traces.ts:273` |
+| `updated_at` | `traces` (t) / `base` (b) | ❌ 必选 | 始终返回 | `public-api/server/traces.ts:274` |
+| `htmlPath` | 动态拼接 | ❌ 必选 | 始终返回 | `public-api/server/traces.ts:331` |
+| **IO 字段 (双层查询)** | | | | |
+| `input` | `io` CTE (i) | ✅ 可选 | `includeIO=true` | `public-api/server/traces.ts:345` |
+| `output` | `io` CTE (i) | ✅ 可选 | `includeIO=true` | `public-api/server/traces.ts:346` |
+| `metadata` | `io` CTE (i) | ✅ 可选 | `includeIO=true` | `public-api/server/traces.ts:347` |
+| **Metrics 字段** | | | | |
+| `latency` | `observation_stats` (o) | ✅ 可选 | `includeMetrics=true` | `public-api/server/traces.ts:281, 350` |
+| `totalCost` | `observation_stats` (o) | ✅ 可选 | `includeMetrics=true` | `public-api/server/traces.ts:281, 350` |
+| **关联 ID 字段** | | | | |
+| `scores` | `score_stats` (s) | ✅ 可选 | `includeScores=true` → `score_ids` | `public-api/server/traces.ts:276, 348` |
+| `observations` | `observation_stats` (o) | ✅ 可选 | `includeObservations=true` → `observation_ids` | `public-api/server/traces.ts:277-278, 349` |
+
+#### 3.2.2 CTE 触发条件
+
+| CTE 名称 | 触发条件 | 代码位置 |
+|---------|---------|---------|
+| `observation_stats` | `includeObservations=true` OR `includeMetrics=true` OR 过滤器引用 observations 表 | `public-api/server/traces.ts:134-170` |
+| `score_stats` | `includeScores=true` OR 过滤器引用 scores 表 | `public-api/server/traces.ts:172-230` |
+| `base` | `includeIO=true` (分页在轻量列上执行) | `public-api/server/traces.ts:300-312` |
+| `io` | `includeIO=true` (只对结果集取大字段) | `public-api/server/traces.ts:314-326` |
+
+#### 3.2.3 关键代码片段
+
+**FINAL vs LIMIT 1 BY 决策逻辑** (`public-api/server/traces.ts:112-127`):
 
 ```typescript
-// FINAL vs LIMIT 1 BY 决策逻辑
 const shouldUseSkipIndexes = filter.some(f =>
   f.clickhouseTable === "traces" &&
   ["user_id", "session_id", "metadata"].some(
@@ -264,7 +363,7 @@ const shouldUseSkipIndexes = filter.some(f =>
   )
 );
 
-// 方案 A: 默认使用 FINAL (CollapsingMergeTree 语义)
+// 方案 A: 不涉及 Skip Index，使用 FINAL (CollapsingMergeTree 语义)
 FROM traces FINAL
 
 // 方案 B: 涉及 Skip Index 列时，使用 LIMIT 1 BY 去重
@@ -272,6 +371,56 @@ FROM traces
 LIMIT 1 BY id, project_id
 ORDER BY event_ts DESC
 ```
+
+**Base + IO 双层查询** (`public-api/server/traces.ts:300-354`):
+
+```typescript
+if (select.includeIO) {
+  // base: 排序/分页只在轻量列上执行，性能优化
+  ctes.push(`base AS (
+    SELECT ${coreSelect} ${scoresSelect} ${observationsSelect} ${metricsSelect}
+    ${queryMiddle} ${chOrderBy} ${limitByClause} ${paginationClause}
+  )`);
+
+  // io: 只对结果集取大字段 (input/output/metadata)
+  ctes.push(`io AS (
+    SELECT id as _io_id, project_id as _io_project_id, input, output, metadata
+    FROM traces ${ioFinal}
+    WHERE project_id = {projectId: String}
+    AND (id, project_id) IN (SELECT id, project_id FROM base)
+    ${ioDedup}
+  )`);
+
+  // 最终 JOIN base 和 io
+  query = `WITH ${ctes.join(", ")}
+    SELECT b.*, i.input, i.output, i.metadata
+    FROM base b LEFT JOIN io i ON b.id = i._io_id AND b.project_id = i._io_project_id
+    ${finalOrderBy}
+  `;
+}
+```
+
+---
+
+### 3.3 两条入口对比说明
+
+| 维度 | UI traces.all.query (tRPC) | Public API /api/public/traces | 原因说明 |
+|-----|---------------------------|-------------------------------|---------|
+| **核心字段集** | 13 个字段 | 15 个字段 | Public API 额外包含 `created_at`、`updated_at`、`htmlPath` |
+| **Metrics 字段** | `usage_details`, `cost_details`, `aggregated_level`, `observation_count`, `error_count` 等完整字段 | 仅 `latency`、`totalCost` | UI 表格需要更丰富的指标展示；Public API 精简返回内容 |
+| **Scores 返回** | `scores_avg` (tuple 数组)、`score_categories` (name:value 数组) | `scores` (score_id 数组) | UI 直接展示分数详情；Public API 返回 ID 供客户端按需加载 |
+| **Input/Output/Metadata** | ❌ 不返回（需单 trace 详情接口） | ✅ 通过 `includeIO=true` 触发 `base+io` 双层查询 | Public API 设计为支持批量导出完整 trace 数据 |
+| **Observations 返回** | ❌ 不直接返回（JOIN 仅用于聚合） | ✅ `observation_ids` 数组 | Public API 支持关联数据按需加载 |
+| **去重策略** | `FINAL` (默认) / `LIMIT 1 BY` (非默认排序) | `FINAL` / `LIMIT 1 BY` (Skip Index 列) | 相同的 CollapsingMergeTree 去重逻辑 |
+| **排序字段** | 支持所有 table 列 | 支持更多列 + `event_ts` tiebreaker | Public API 使用更灵活的 orderBy 映射 |
+| **字段选择开关** | 通过 `select` 参数 (`count`/`metrics`/`rows`/`identifiers`) | 通过 `includeIO/includeMetrics/includeScores/includeObservations` 布尔开关 | UI 使用预设字段组；Public API 提供细粒度控制 |
+| **CTE 名称** | `observations_stats`, `scores_avg` | `observation_stats`, `score_stats`, `base`, `io` | Public API 多了 `base+io` 双层查询优化 |
+| **时间边界传播** | ✅ 支持 (`trace->observations` ±5min) | ✅ 支持 + 额外 `io` CTE 时间过滤 | Public API 传播范围更广 |
+
+**设计意图总结**:
+
+1. **UI traces.all.query**: 面向表格渲染优化，返回聚合后的 metrics 和 scores 数据，字段组预设合理，前端直接可用
+2. **Public API /api/public/traces**: 面向批量导出和 API 集成优化，支持细粒度字段开关，通过 `base+io` 双层查询优化大字段性能，返回 ID 数组供按需关联查询
 
 ---
 
