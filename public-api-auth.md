@@ -196,7 +196,7 @@ projectRoleAccessRights: Record<Role, ProjectScope[]> = {
 | **/api/public/scores** | PROJECT only | project / scores | ✅ | ❌ | ❌ | `scores/index.ts`，使用 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/observations** | PROJECT only | project | ✅ | ❌ | ❌ | `observations/index.ts`，使用 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/datasets** | PROJECT only | project | ✅ | ❌ | ❌ | `datasets.ts`，使用 createAuthedProjectAPIRoute，无 Session |
-| **/api/public/prompts** | PROJECT only | project | ✅ | ❌ | ❌ | `prompts.ts`，使用 createAuthedProjectAPIRoute，无 Session |
+| **/api/public/prompts** | PROJECT only | project（不允许 Bearer / scores） | ✅ | ❌ | ❌ | `prompts.ts:31-44`，直接调用 ApiAuthService，显式拒绝 Bearer auth 和 org key，无 Session |
 | **/api/public/sessions** | PROJECT only | project | ✅ | ❌ | ❌ | `sessions/index.ts:10`，使用 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/events** | PROJECT only | project | ✅ | ❌ | ❌ | `events.ts`，使用 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/models** | PROJECT only | project | ✅ | ❌ | ❌ | `models/index.ts`，使用 createAuthedProjectAPIRoute，无 Session |
@@ -209,7 +209,7 @@ projectRoleAccessRights: Record<Role, ProjectScope[]> = {
 | **/api/public/organizations/apiKeys** | ORGANIZATION only | organization | ❌ | admin-api | ❌ | `organizations/apiKeys/index.ts`，使用 ApiAuthService + hasEntitlement，无 Session |
 | **/api/public/organizations/memberships** | ORGANIZATION only | organization | ❌ | admin-api | ❌ | `organizations/memberships/index.ts`，使用 ApiAuthService + hasEntitlement，无 Session |
 | **/api/public/scim/*** | ORGANIZATION only | organization | ❌ | ❌ | ❌ | `scim/*`，使用 ApiAuthService，无 Session |
-| **/api/public/integrations/blob-storage** | PROJECT only | project | ✅ | ❌ | ❌ | `integrations/blob-storage/index.ts`，使用 ApiAuthService，无 Session |
+| **/api/public/integrations/blob-storage** | ORGANIZATION only | organization | ❌ | scheduled-blob-exports | ❌ | `integrations/blob-storage/index.ts:38-57, 118-137`，直接调用 ApiAuthService，要求 org scope，无 Session |
 | **/api/public/mcp/*** | PROJECT only | project | ✅ | ❌ | ❌ | `mcp/index.ts`，使用 ApiAuthService，无 Session |
 | **/api/public/annotation-queues/*** | PROJECT only | project | ✅ | ❌ | ❌ | `annotation-queues/*`，使用 ApiAuthService 或 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/v2/*** | PROJECT only | project | ✅ | ❌ | ❌ | `v2/*`，使用 createAuthedProjectAPIRoute，无 Session |
@@ -225,7 +225,7 @@ projectRoleAccessRights: Record<Role, ProjectScope[]> = {
 
 ### 5.1 复用模式一：直接调用 ApiAuthService
 
-**适用场景**: 需自定义校验逻辑（如 ingestion 的 isIngestionSuspended 检查）
+**适用场景**: 需自定义校验逻辑（如 ingestion 的 isIngestionSuspended 检查、prompts 的 Bearer auth 显式拒绝）
 
 **调用模板**:
 ```typescript
@@ -237,24 +237,30 @@ if (!authCheck.validKey) {
   return res.status(401).json({ error: authCheck.error });
 }
 
-// Step 2: 入口特定校验
+// Step 2: 入口特定校验（可高度自定义）
 if (!authCheck.scope.projectId) { /* 403 */ }
 if (authCheck.scope.isIngestionSuspended) { /* 403 */ }
+if (authCheck.scope.accessLevel !== "project") { /* 403 */ }
 
-// Step 3: 限流检查（可选）
+// Step 3: Entitlement 检查（可选）
+if (!hasEntitlementBasedOnPlan({ plan: authCheck.scope.plan, entitlement: "..." })) { /* 403 */ }
+
+// Step 4: 限流检查（可选）
 await RateLimitService.getInstance().rateLimitRequest(
-  authCheck.scope, "ingestion"
+  authCheck.scope, "resource-name"
 );
 
-// Step 4: 业务处理
+// Step 5: 业务处理
 ```
 
 **使用此模式的入口**:
 - `/api/public/ingestion` - `ingestion.ts:75-138`
+- `/api/public/prompts` - `prompts.ts:31-103`
+- `/api/public/integrations/blob-storage` - `integrations/blob-storage/index.ts:28-137`
 - 所有 `/api/public/scim/*` 端点
 - 所有 organization-level API 端点
 
-**代码证据**: `ingestion.ts:75-94`, `apiAuth.ts:86-261`
+**代码证据**: `ingestion.ts:75-94`, `apiAuth.ts:86-261`, `prompts.ts:31-44`, `integrations/blob-storage/index.ts:38-57`
 
 ### 5.2 复用模式二：createAuthedProjectAPIRoute 工厂封装
 
@@ -297,7 +303,7 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 ```
 
 **使用此模式的入口**:
-- 所有 v1/v2 Project CRUD 接口（traces, scores, observations, datasets, prompts 等）
+- 所有 v1/v2 Project CRUD 接口（traces, scores, observations, datasets, sessions 等）
 - 所有 unstable eval API 接口
 
 **代码证据**:
@@ -317,6 +323,8 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 | Basic Auth 下，ORGANIZATION scope → accessLevel = "organization" | `apiAuth.ts:181-182` |
 | Bearer Auth 下，accessLevel 固定为 "scores"，且仅允许 PROJECT scope | `apiAuth.ts:200-234` |
 | ORGANIZATION scope key 的 scope.projectId 始终为 null | `types.ts:22-30` |
+| `/api/public/prompts` 显式拒绝 Bearer auth（accessLevel = "scores"）和 ORG scope key | `prompts.ts:37-44` |
+| `/api/public/integrations/blob-storage` 要求 accessLevel 必须为 "organization" | `integrations/blob-storage/index.ts:38-44, 118-124` |
 
 ### 6.2 Scope 解析链结论
 
@@ -335,6 +343,8 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 | Admin API Key 认证需同时匹配 Authorization 和 x-langfuse-admin-api-key Header | `createAuthedProjectAPIRoute.ts:178-193` |
 | Admin API Key 认证仅在非 CLOUD 环境可用 | `createAuthedProjectAPIRoute.ts:156-161` |
 | withMiddlewares 提供统一的异常处理和 CORS 支持 | `withMiddlewares.ts:65-186` |
+| `/api/public/prompts` 不使用工厂模式，直接调用 ApiAuthService 以实现自定义 Bearer auth 拒绝逻辑 | `prompts.ts:31-44` |
+| `/api/public/integrations/blob-storage` 不使用工厂模式，直接调用 ApiAuthService 以实现自定义 entitlement 检查 | `integrations/blob-storage/index.ts:28-137` |
 
 ### 6.4 成员角色链路结论
 
@@ -364,4 +374,6 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 | `web/src/features/rbac/constants/organizationAccessRights.ts` | 组织角色权限矩阵 |
 | `web/src/features/rbac/constants/projectAccessRights.ts` | 项目角色权限矩阵 |
 | `web/src/pages/api/public/ingestion.ts` | 数据摄入 API（模式一范例） |
+| `web/src/pages/api/public/prompts.ts` | Prompts API（模式一范例，自定义 Bearer auth 拒绝） |
+| `web/src/pages/api/public/integrations/blob-storage/index.ts` | Blob Storage 集成 API（模式一范例，自定义 Entitlement 检查） |
 | `web/src/pages/api/public/sessions/index.ts` | 标准 CRUD API（模式二范例） |
