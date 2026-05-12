@@ -3,21 +3,22 @@
 ## 文档变更记录
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
+| v2.2 | 2026-05-12 | 补充 3 条 Procedure 分支；修正"所有 Procedure 都从 withOtelTracingProcedure 开始"的错误表述 |
 | v2.1 | 2026-05-12 | 修正 tRPC 权限中间件多分支结构；补充公共 API 多种入口模式；更新分叉图与流程说明 |
 | v2.0 | 2026-05-12 | 重写架构分析，明确两条链路分叉关系；修正自托管限流表述；按请求流转顺序重构 |
 
 ---
 
 ## 目录
-1. [整体架构：两条 API 链路的分叉关系](#整体架构两条-api-链路的分叉关系)
-2. [tRPC 调用链详解：多分支权限中间件](#trpc-调用链详解多分支权限中间件)
-3. [公共 REST API 限流链路详解：多种入口模式](#公共-rest-api-限流链路详解多种入口模式)
-4. [核心设计原则总结](#核心设计原则总结)
-5. [文件索引](#文件索引)
+1. [整体架构：两条 API 链路的分叉关系](#1-整体架构两条-api-链路的分叉关系)
+2. [tRPC 调用链详解：9 条 Procedure 分支](#2-trpc-调用链详解9-条-procedure-分支)
+3. [公共 REST API 限流链路详解：多种入口模式](#3-公共-rest-api-限流链路详解多种入口模式)
+4. [核心设计原则总结](#4-核心设计原则总结)
+5. [文件索引](#5-文件索引)
 
 ---
 
-## 整体架构：两条 API 链路的分叉关系
+## 1. 整体架构：两条 API 链路的分叉关系
 
 ### 1.1 架构总览图
 
@@ -39,31 +40,31 @@ Langfuse 存在两条独立的 API 处理链路，它们在 Next.js 的 API 路�
     └──────┬──────┘           └────────┬─────────┘
            │                           │
            ▼                           ▼
-┌──────────────────────┐    ┌──────────────────────────────────┐
-│   tRPC 框架管道      │    │   公共 API 多入口分支            │
-│                      │    │                                  │
-│  ┌──────────────────┐│    │  ┌────────────────────────────┐│
-│  │ 6种 Procedure 分支││    │  │ withMiddlewares 包装器     ││
-│  │  - public        ││    │  │  (统一错误处理 + CORS)      ││
-│  │  - authenticated ││    │  └─────────────┬──────────────┘│
-│  │  - protectedProj ││    │                │               │
-│  │  - protectedOrg  ││    │                ▼               │
-│  │  - protectedTrace││    │  ┌────────────────────────────┐│
-│  │  - admin         ││    │  │ createAuthedProjectAPIRoute││
-│  └────────┬─────────┘│    │  │ (认证 + 限流 + Zod校验)    ││
-│           │          │    │  └────────────────────────────┘│
-└───────────┼──────────┘    │                                  │
-            │               │  ┌────────────────────────────┐│
-            │               │  │   自定义入口（特殊场景）    ││
-            │               │  │   - ingestion.ts          ││
-            │               │  │   - mcp/index.ts          ││
-            │               │  │   - health.ts / ready.ts  ││
-            │               │  └────────────────────────────┘│
-            │               └──────────────────────────────────┘
-            │
-            ▼
-      前端 UI 交互
-    (用户登录态保护)
+┌──────────────────────────┐  ┌──────────────────────────────────┐
+│   tRPC 框架管道          │  │   公共 API 多入口分支            │
+│                          │  │                                  │
+│  ┌─────────────────────┐│  │  ┌────────────────────────────┐│
+│  │ 9 条 Procedure 分支 ││  │  │ withMiddlewares 包装器     ││
+│  │ ┌──────────────────┐││  │  │  (统一错误处理 + CORS)     ││
+│  │ │ 有追踪:         │││  │  └─────────────┬──────────────┘│
+│  │ │  withOtel* × 6  │││  │                │               │
+│  │ │                  │││  │                ▼               │
+│  │ │ 无追踪:         │││  │  ┌────────────────────────────┐│
+│  │ │  t.procedure ×3 │││  │  │ createAuthedProjectAPIRoute││
+│  │ └──────────────────┘││  │  │ (认证 + 限流 + Zod校验)    ││
+│  └──────────┬──────────┘│  │  └────────────────────────────┘│
+│             │           │  │                                  │
+│             │           │  │  ┌────────────────────────────┐│
+│             │           │  │  │   自定义入口（特殊场景）    ││
+│             │           │  │  │   - ingestion.ts           ││
+│             │           │  │  │   - mcp/index.ts           ││
+│             │           │  │  │   - health.ts / ready.ts   ││
+│             │           │  │  └────────────────────────────┘│
+└─────────────┼───────────┘  └──────────────────────────────────┘
+              │
+              ▼
+        前端 UI 交互
+      (用户登录态保护)
 ```
 
 ### 1.2 两条链路的核心差异对比
@@ -74,43 +75,38 @@ Langfuse 存在两条独立的 API 处理链路，它们在 Next.js 的 API 路�
 | **使用方** | 前端 UI (浏览器) | 服务端集成、SDK、MCP 客户端、第三方系统 |
 | **认证方式** | Next.js Session (Cookie) | API Key (Basic Auth / Bearer Auth) |
 | **限流策略** | 无显式限流 | 云环境启用，按组织/计划/资源限流 |
-| **中间件模式** | tRPC 中间件链式组合 | 多模式：withMiddlewares + 自定义入口 |
+| **中间件模式** | 9 条 Procedure 分支：6 条有追踪 + 3 条无追踪 | 多模式：withMiddlewares + 自定义入口 |
 | **上下文注入** | 渐进式类型收紧 | 各端点手动处理 |
 | **错误处理** | tRPC 格式 + 中间件转换 | REST JSON + 统一错误包装 |
 | **自托管行为** | 无差异 | 完全不启用限流 |
 
 ---
 
-## tRPC 调用链详解：多分支权限中间件
+## 2. tRPC 调用链详解：9 条 Procedure 分支
 
 ### 2.1 请求流转总览
 
-tRPC 采用**中间件组合模式**，不是单一路径，而是通过不同 Procedure 类型形成 6 条独立的处理分支。每条分支都从 `withOtelTracingProcedure` 开始，然后叠加不同的中间件组合：
+tRPC 采用**中间件组合模式**，不是单一路径，而是通过不同 Procedure 类型形成 **9 条独立的处理分支**。重要修正：**不是所有 Procedure 都从 withOtelTracingProcedure 开始**，实际上分为两类：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                 基础层：OpenTelemetry 追踪                        │
-│              withOtelTracingProcedure (全局共用)                   │
-│              (withOtelInstrumentation middleware)                 │
-└───────────────────────┬───────────────────────────────────────────┘
-                        │
-        ┌───────────────┼───────────────────┐
-        ▼               ▼                   ▼
-┌────────────────┐ ┌────────────────┐ ┌─────────────────┐
-│ withErrorHandling│ │ withErrorHandling│ │ withErrorHandling │
-└────────┬───────┘ └────────┬───────┘ └─────────┬───────┘
-         │                   │                   │
-         ▼                   ▼                   ▼
-┌────────────────┐ ┌────────────────┐ ┌─────────────────┐
-│ publicProcedure│ │enforceUserIsA…│ │ enforceAdmi…   │
-└────────────────┘ └────────┬───────┘ └─────────────────┘
-                            │
-                ┌───────────┼────────────┐
-                ▼           ▼            ▼
-        ┌─────────────┐ ┌───────────┐ ┌──────────────┐
-        │ protected… │ │ protected…│ │ protected…   │
-        │ (Project)   │ │ (Org)     │ │ (Trace)      │
-        └─────────────┘ └───────────┘ └──────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                     两类 Procedure 起点                               │
+│                                                                      │
+│  ┌─────────────────────────────┐   ┌─────────────────────────────┐  │
+│  │  withOtelTracingProcedure   │   │      t.procedure            │  │
+│  │  (OpenTelemetry 追踪)       │   │  (原生 tRPC 基础)           │  │
+│  └──────────────┬──────────────┘   └──────────────┬──────────────┘  │
+│                 │                                  │                 │
+│                 ▼                                  ▼                 │
+│         withErrorHandling                   withErrorHandling        │
+│                 │                                  │                 │
+│     ┌───────────┼───────────┐          ┌───────────┼───────────┐     │
+│     ▼           ▼           ▼          ▼           ▼           ▼     │
+│  项目权限    单资源访问   用户认证    项目权限                  用户认证│
+│  (×3)        (×2)        (×1)       (×1)                        (×1)│
+│                                                                      │
+│  总计：6 条有追踪分支             总计：3 条无追踪分支                │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 步骤 1：入口与初始上下文创建
@@ -157,32 +153,32 @@ export const createTRPCContext = async (opts: CreateNextContextOptions) => {
 // - prisma: PrismaClient 单例
 ```
 
-> **关键点**: 上下文创建发生在所有中间件执行之前，是所有 6 条 Procedure 分支的共同起点。
+> **关键点**: 上下文创建发生在所有中间件执行之前，是所有 9 条 Procedure 分支的共同起点。
 
 ### 2.3 步骤 2：路由分层结构
 
 **文件**: `web/src/server/api/root.ts`
 
-根路由器按业务领域组织成 50+ 子路由，每个子路由根据权限需求选择合适的 Procedure 类型：
+根路由器按业务领域组织成 50+ 子路由，每个子路由根据权限需求和追踪需求选择合适的 Procedure 类型：
 
 ```typescript
 export const appRouter = createTRPCRouter({
   // ========== 公开数据模块 ==========
-  public: publicRouter,                    // publicProcedure
+  public: publicRouter,                    // publicProcedure（有追踪）
   
   // ========== 用户相关模块（需登录）==========
-  users: userRouter,                        // authenticatedProcedure
-  userAccount: userAccountRouter,           // authenticatedProcedure
+  users: userRouter,                        // authenticatedProcedure / 
+                                          // protectedProcedureWithoutTracing
+  userAccount: userAccountRouter,           // 按性能需求选择有追踪/无追踪
   
   // ========== 项目级权限模块 ==========
   traces: traceRouter,                      // protectedProjectProcedure
-  sessions: sessionRouter,                  // protectedProjectProcedure
+  sessions: sessionRouter,                  // protectedProjectProcedure +
+                                          // protectedGetSessionProcedure
   generations: generationsRouter,           // protectedProjectProcedure
   observations: observationsRouter,         // protectedProjectProcedure
   scores: scoresRouter,                     // protectedProjectProcedure
   scoreAnalytics: scoreAnalyticsRouter,     // protectedProjectProcedure
-  scoreConfigs: scoreConfigsRouter,         // protectedProjectProcedure
-  dashboard: dashboardRouter,               // protectedProjectProcedure
   datasets: datasetRouter,                  // protectedProjectProcedure
   experiments: experimentsRouter,           // protectedProjectProcedure
   media: mediaRouter,                       // protectedProjectProcedure
@@ -191,42 +187,37 @@ export const appRouter = createTRPCRouter({
   
   // ========== 组织级权限模块 ==========
   organizations: organizationsRouter,       // protectedOrganizationProcedure
-  organizationApiKeys: organizationApiKeysRouter, // protectedOrganizationProcedure
-  members: membersRouter,                   // protectedOrganizationProcedure
   
-  // ========== 管理员工具 ==========
+  // ========== 管理员模块 ==========
   // adminProcedure (内部管理员 API)
 });
 ```
 
 **Procedure 选择原则**:
 - 公开数据无需认证 → `publicProcedure`
-- 用户个人信息操作 → `authenticatedProcedure`
-- 项目内资源操作 → `protectedProjectProcedure`
-- 组织级配置操作 → `protectedOrganizationProcedure`
-- Trace 公开访问场景 → `protectedGetTraceProcedure`
+- 用户个人信息操作 → 根据性能需求选择 `authenticatedProcedure` 或无追踪版本
+- 项目内资源操作 → 根据性能需求选择 `protectedProjectProcedure` 或无追踪版本
+- Session 详情访问 → `protectedGetSessionProcedure`
+- 高频率、性能敏感接口 → **优先选择无追踪版本**
 
-### 2.4 步骤 3：中间件组合与 6 条分支详解
+### 2.4 步骤 3：中间件组合与 9 条分支详解
 
-#### 2.4.1 中间件执行顺序模型
+#### 2.4.1 两类起点对比
 
-每个 Procedure 类型都是通过 `.use()` 链式组合不同中间件，每个中间件可以：
-- 前置校验（失败则抛出错误终止）
-- 上下文增强（添加新字段或收紧类型）
-- 后置处理（响应返回时执行）
+| 起点类型 | 基础 Procedure | 包含中间件 | 适用场景 | 分支数量 |
+|---------|---------------|-----------|---------|---------|
+| **有追踪** | `withOtelTracingProcedure` | OpenTelemetry 上下文注入 | 大多数常规接口、需要可观测性 | 6 条 |
+| **无追踪** | `t.procedure` | 跳过 OpenTelemetry 追踪 | 高频率、性能敏感、批量操作 | 3 条 |
 
-```
-请求 → 中间件1 → 中间件2 → 中间件3 → Procedure 业务逻辑
-           ↓         ↓         ↓
-         校验+注入 校验+注入 校验+注入
-```
+---
 
-#### 2.4.2 分支 1/6：publicProcedure（无认证）
+#### 2.4.2 第一类：6 条有追踪分支（起点：withOtelTracingProcedure）
+
+##### 分支 1/9：publicProcedure（无认证、有追踪）
 
 **中间件链**: `withOtelTracingProcedure → withErrorHandling`
 
 ```typescript
-// web/src/server/api/trpc.ts
 export const publicProcedure = withOtelTracingProcedure
   .use(withErrorHandling);
 ```
@@ -240,10 +231,13 @@ export const publicProcedure = withOtelTracingProcedure
 ```
 
 **使用场景**:
-- 公开访问的数据（如公开 Share Link 中的 Trace）
-- 无需登录的功能
+- 公开分享的 Trace 详情
+- 无需登录的公共功能
+- 健康检查类接口
 
-#### 2.4.3 分支 2/6：authenticatedProcedure（用户认证）
+---
+
+##### 分支 2/9：authenticatedProcedure（用户认证、有追踪）
 
 **中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceUserIsAuthed`
 
@@ -287,7 +281,9 @@ const enforceUserIsAuthed = t.middleware(({ ctx, next }) => {
 - 个人偏好设置
 - 无需特定项目/组织权限的操作
 
-#### 2.4.4 分支 3/6：protectedProjectProcedure（项目级权限）
+---
+
+##### 分支 3/9：protectedProjectProcedure（项目级权限、有追踪）
 
 **中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceUserIsAuthedAndProjectMember`
 
@@ -398,7 +394,9 @@ const enforceUserIsAuthedAndProjectMember = t.middleware(async (opts) => {
 - 数据集、实验、Prompt 管理
 - 项目级配置操作
 
-#### 2.4.5 分支 4/6：protectedOrganizationProcedure（组织级权限）
+---
+
+##### 分支 4/9：protectedOrganizationProcedure（组织级权限、有追踪）
 
 **中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceIsAuthedAndOrgMember`
 
@@ -472,7 +470,9 @@ const enforceIsAuthedAndOrgMember = t.middleware(async (opts) => {
 - 组织级配置操作
 - 计费与计划管理
 
-#### 2.4.6 分支 5/6：protectedGetTraceProcedure（Trace 资源访问控制）
+---
+
+##### 分支 5/9：protectedGetTraceProcedure（Trace 资源访问控制、有追踪）
 
 **中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceTraceAccess`
 
@@ -554,7 +554,122 @@ const enforceTraceAccess = t.middleware(async (opts) => {
 - 支持未登录用户访问公开 Trace
 - 同时支持成员和管理员访问所有 Trace
 
-#### 2.4.7 分支 6/6：adminProcedure（管理员专属）
+---
+
+##### 分支 6/9：protectedGetSessionProcedure（Session 资源访问控制、有追踪）
+
+**中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceSessionAccess`
+
+```typescript
+export const protectedGetSessionProcedure = withOtelTracingProcedure
+  .use(withErrorHandling)
+  .use(enforceSessionAccess);
+```
+
+**核心中间件：enforceSessionAccess**
+```typescript
+const inputSessionSchema = z.object({
+  sessionId: z.string(),
+  projectId: z.string(),
+});
+
+const enforceSessionAccess = t.middleware(async (opts) => {
+  const { ctx, next } = opts;
+  const actualInput = await opts.getRawInput();
+  const result = inputSessionSchema.safeParse(actualInput);
+  if (!result.success)
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Invalid input, sessionId is required",
+    });
+
+  const { sessionId, projectId } = result.data;
+
+  // 从 Postgres 查询 Session（无需检查 ClickHouse 可用性）
+  const session = await ctx.prisma.traceSession.findFirst({
+    where: {
+      id: sessionId,
+      projectId,
+    },
+    select: {
+      public: true,
+    },
+  });
+
+  if (!session) {
+    logger.error(`Session with id ${sessionId} not found for project ${projectId}`);
+    throw new TRPCError({
+      code: "NOT_FOUND",
+      message: "Session not found",
+    });
+  }
+
+  // ========== 多条件权限判定 ==========
+  // 三个条件满足任一即可访问：
+  // 1. Session 设置为 public
+  // 2. 用户是项目成员
+  // 3. 用户是系统管理员
+  const userSessionProject = ctx.session?.user?.organizations
+    .flatMap((org) => org.projects)
+    .find(({ id }) => id === projectId);
+
+  if (
+    !session.public &&
+    !userSessionProject &&
+    ctx.session?.user?.admin !== true
+  ) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message:
+        "User is not a member of this project and this session is not public",
+    });
+  }
+
+  // 管理员访问 Webhook 通知
+  if (ctx.session?.user?.admin === true) {
+    await sendAdminAccessWebhook({
+      email: ctx.session.user.email,
+      projectId,
+    });
+  }
+
+  // 上下文增强：注入项目角色
+  return next({
+    ctx: {
+      session: {
+        ...ctx.session,
+        projectRole:
+          ctx.session?.user?.admin === true
+            ? Role.OWNER
+            : userSessionProject?.role,
+      },
+    },
+  });
+});
+```
+
+**上下文演进**:
+```
+初始上下文
+        ↓ (经过 enforceSessionAccess)
+├── session: {
+│     ...,
+│     projectRole?: Role  ← 新增：项目角色（如果有）
+│   }
+├── headers
+└── prisma
+```
+
+**使用场景**（见 `web/src/server/api/routers/sessions.ts`）:
+- Session 详情查询（`byIdWithScores`）
+- Session 详情查询（事件表版本）（`byIdWithScoresFromEvents`）
+- Session 关联 Traces 查询（`tracesFromEvents`）
+- Session 内 Trace 的 Observations 查询（`observationsForTraceFromEvents`）
+- 支持公开分享的 Session 访问
+
+---
+
+##### 分支 7/9：adminProcedure（管理员专属、有追踪）
 
 **中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceAdminAuth`
 
@@ -601,28 +716,92 @@ const enforceAdminAuth = t.middleware(async (opts) => {
 - 系统级配置变更
 - 仅云环境内部管理员使用
 
-### 2.5 6 条 Procedure 分支汇总对比表
+---
 
-| Procedure 类型 | 中间件链 | 核心校验 | 注入字段 | 典型使用场景 |
-|--------------|----------|---------|---------|------------|
-| **publicProcedure** | Otel + ErrorHandling | 无 | - | 公开分享 Trace、无需登录功能 |
-| **authenticatedProcedure** | Otel + ErrorHandling + enforceUserIsAuthed | 用户已登录 | session.user（非空） | 用户个人设置、账号管理 |
-| **protectedProjectProcedure** | Otel + ErrorHandling + enforceUserIsAuthedAndProjectMember | 用户认证 + 项目成员身份 + 管理员通道 | orgId, orgRole, projectId, projectRole | Trace/Scores/数据集管理、项目级操作 |
-| **protectedOrganizationProcedure** | Otel + ErrorHandling + enforceIsAuthedAndOrgMember | 用户认证 + 组织成员身份 + 管理员通道 | orgId, orgRole | 组织成员管理、API Key 管理 |
-| **protectedGetTraceProcedure** | Otel + ErrorHandling + enforceTraceAccess | Trace 公开 OR 项目成员 OR 管理员 | projectRole?, trace | Trace 详情查询（支持公开访问） |
-| **adminProcedure** | Otel + ErrorHandling + enforceAdminAuth | Admin API Key 验证 | - | 系统管理、跨组织操作 |
+#### 2.4.3 第二类：3 条无追踪分支（起点：t.procedure）
+
+##### 分支 8/9：protectedProcedureWithoutTracing（用户认证、无追踪）
+
+**中间件链**: `t.procedure → withErrorHandling → enforceUserIsAuthed`
+
+```typescript
+export const protectedProcedureWithoutTracing = t.procedure
+  .use(withErrorHandling)
+  .use(enforceUserIsAuthed);
+```
+
+**与 authenticatedProcedure 的区别**:
+- ✅ **跳过 OpenTelemetry 追踪中间件**，减少性能开销
+- ✅ 权限校验完全相同
+- ✅ 上下文演进完全相同
+- ⚠️ 失去该接口的调用链可观测性
+
+**存在原因**:
+1. **性能优化**：高频率调用的用户接口，追踪开销占比显著
+2. **成本控制**：减少 OpenTelemetry 数据采集量，降低存储和处理成本
+3. **场景适配**：某些简单操作无需完整追踪，日志监控已足够
+
+**适用场景**:
+- 高频轮询接口
+- 用户状态检查
+- 简单数据查询
 
 ---
 
-## 公共 REST API 限流链路详解：多种入口模式
+##### 分支 9/9：protectedProjectProcedureWithoutTracing（项目级权限、无追踪）
+
+**中间件链**: `t.procedure → withErrorHandling → enforceUserIsAuthedAndProjectMember`
+
+```typescript
+export const protectedProjectProcedureWithoutTracing = t.procedure
+  .use(withErrorHandling)
+  .use(enforceUserIsAuthedAndProjectMember);
+```
+
+**与 protectedProjectProcedure 的区别**:
+- ✅ **跳过 OpenTelemetry 追踪中间件**，减少性能开销
+- ✅ 权限校验完全相同（含管理员通道）
+- ✅ 上下文演进完全相同
+- ⚠️ 失去该接口的调用链可观测性
+
+**存在原因**:
+1. **高吞吐场景**：数据写入、批量操作等接口 QPS 较高，追踪开销显著
+2. **查询优化**：某些查询接口本身会触发大量 ClickHouse 查询，减少一层中间件开销
+3. **批量接口**：批量导出、批量处理等长耗时操作，追踪价值相对较低
+
+**适用场景**:
+- 批量数据导出
+- 高频数据写入
+- 简单状态查询
+- 列表分页接口
+
+---
+
+### 2.5 9 条 Procedure 分支汇总对比表
+
+| 序号 | Procedure 类型 | 起点 | 中间件链 | 核心校验 | 注入字段 | 典型使用场景 |
+|-----|---------------|------|---------|---------|---------|------------|
+| **1** | publicProcedure | withOtelTracingProcedure | Otel + ErrorHandling | 无 | - | 公开分享 Trace、无需登录功能 |
+| **2** | authenticatedProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceUserIsAuthed | 用户已登录 | session.user（非空） | 用户个人设置、账号管理 |
+| **3** | protectedProjectProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceUserIsAuthedAndProjectMember | 用户认证 + 项目成员身份 + 管理员通道 | orgId, orgRole, projectId, projectRole | Trace/Scores/数据集管理、项目级操作 |
+| **4** | protectedOrganizationProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceIsAuthedAndOrgMember | 用户认证 + 组织成员身份 + 管理员通道 | orgId, orgRole | 组织成员管理、API Key 管理 |
+| **5** | protectedGetTraceProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceTraceAccess | Trace 公开 OR 项目成员 OR 管理员 | projectRole?, trace | Trace 详情查询（支持公开访问） |
+| **6** | protectedGetSessionProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceSessionAccess | Session 公开 OR 项目成员 OR 管理员 | projectRole? | Session 详情查询（支持公开访问） |
+| **7** | adminProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceAdminAuth | Admin API Key 验证 | - | 系统管理、跨组织操作 |
+| **8** | protectedProcedureWithoutTracing | t.procedure | ErrorHandling + enforceUserIsAuthed | 用户已登录（无追踪） | session.user（非空） | 高频轮询、用户状态检查 |
+| **9** | protectedProjectProcedureWithoutTracing | t.procedure | ErrorHandling + enforceUserIsAuthedAndProjectMember | 用户认证 + 项目成员（无追踪） | orgId, orgRole, projectId, projectRole | 批量导出、高频数据写入、列表查询 |
+
+---
+
+## 3. 公共 REST API 限流链路详解：多种入口模式
 
 ### 3.1 与 tRPC 链路的核心区别
 
 公共 API 与 tRPC 的核心区别：
-1. **限流存在性**: 公共 API 有限流，tRPC 无显式限流
-2. **限流触发条件**: 仅**云环境**启用限流，自托管环境完全不触发
-3. **限流维度**: 按组织 ID + 计划级别 + 资源类型三维限流
-4. **入口模式多样性**: 公共 API 有 3 种不同的入口模式，不是所有端点都走 `withMiddlewares`
+1. **限流存在性**：公共 API 有限流，tRPC 无显式限流
+2. **限流触发条件**：仅**云环境**启用限流，自托管环境完全不触发
+3. **限流维度**：按组织 ID + 计划级别 + 资源类型三维限流
+4. **入口模式多样性**：公共 API 有 3 种不同的入口模式，不是所有端点都走 `withMiddlewares`
 
 ### 3.2 限流启用条件（修正说明）
 
@@ -737,7 +916,7 @@ POST /api/public/ingestion
   API Key 认证（Basic Auth）
      │
   ├─ 验证项目级访问权限
-  └─ 检查 ingestion 暂停状态
+     └─ 检查 ingestion 暂停状态
      │
      ▼
   限流检查（ingestion 资源类型）
@@ -777,7 +956,7 @@ ANY /api/public/mcp
   BasicAuth API Key 认证
      │
   ├─ 仅允许项目级 API Key
-  └─ 禁止 Bearer Auth
+     └─ 禁止 Bearer Auth
      │
      ▼
   ingestion 暂停状态检查
@@ -986,24 +1165,28 @@ export const sendRateLimitResponse = (res, rateLimitRes) => {
 
 ---
 
-## 核心设计原则总结
+## 4. 核心设计原则总结
 
 ### 4.1 tRPC 中间件设计原则
 
-1. **组合优于继承**: 通过 `.use()` 链式组合不同中间件，形成 6 条独立的权限分支
-2. **洋葱模型执行**: 中间件按顺序嵌套执行，请求从外到内，响应从内到外
-3. **上下文渐进增强**: 每个中间件只添加自己负责的那部分上下文，不跨层污染，类型逐步收紧
-4. **单一职责**: 每个中间件只做一件事（认证、授权、错误处理、追踪等）
-5. **管理员通道设计**: 每个权限中间件都内置管理员绕过逻辑，支持系统级运维操作
-6. **预加载优化**: 资源级中间件（如 `enforceTraceAccess`）预加载数据注入上下文，避免重复查询
+1. **组合优于继承**：通过 `.use()` 链式组合不同中间件，形成 9 条独立的权限分支
+2. **双起点设计**：
+   - `withOtelTracingProcedure`：6 条分支，需要可观测性的常规接口
+   - `t.procedure`：3 条分支，高频率/性能敏感接口，跳过追踪开销
+3. **洋葱模型执行**：中间件按顺序嵌套执行，请求从外到内，响应从内到外
+4. **上下文渐进增强**：每个中间件只添加自己负责的那部分上下文，不跨层污染，类型逐步收紧
+5. **单一职责**：每个中间件只做一件事（认证、授权、错误处理、追踪等）
+6. **管理员通道设计**：每个权限中间件都内置管理员绕过逻辑，支持系统级运维操作
+7. **预加载优化**：资源级中间件（如 `enforceTraceAccess`、`enforceSessionAccess`）预加载数据注入上下文，避免重复查询
+8. **性能按需取舍**：提供无追踪版本，允许在可观测性和性能之间做权衡
 
 ### 4.2 公共 API 入口设计原则
 
-1. **分层设计**: 3 种入口模式应对不同场景需求，不搞"一刀切"
-2. **场景适配**: 标准 REST API 用统一模式，高吞吐和流式传输走自定义入口
-3. **可用性优先**: 限流系统采用多级失败开放机制，确保 Redis 故障时业务不受影响
-4. **权限最小化**: 健康检查等运维端点完全开放，无认证无限流，避免监控系统故障
-5. **协议兼容**: MCP 等特殊协议端点放弃统一中间件，直接控制传输层以保证兼容性
+1. **分层设计**：3 种入口模式应对不同场景需求，不搞"一刀切"
+2. **场景适配**：标准 REST API 用统一模式，高吞吐和流式传输走自定义入口
+3. **可用性优先**：限流系统采用多级失败开放机制，确保 Redis 故障时业务不受影响
+4. **权限最小化**：健康检查等运维端点完全开放，无认证无限流，避免监控系统故障
+5. **协议兼容**：MCP 等特殊协议端点放弃统一中间件，直接控制传输层以保证兼容性
 
 ### 4.3 两条链路的设计取舍对比
 
@@ -1011,19 +1194,21 @@ export const sendRateLimitResponse = (res, rateLimitRes) => {
 |---------|-----------|--------------|------|
 | 限流机制 | 无 | 有（云环境） | tRPC 面向前端用户，受登录态保护；公共 API 面向服务端，需防滥用 |
 | 认证方式 | Cookie Session | API Key (Basic/Bearer) | 面向场景不同 |
-| 权限模型 | 6 条分支渐进式授权 | API Key scope + 组织计划 | tRPC 面向人机交互，权限维度复杂；公共 API 面向自动化集成 |
+| 权限模型 | 9 条分支渐进式授权 | API Key scope + 组织计划 | tRPC 面向人机交互，权限维度复杂；公共 API 面向自动化集成 |
 | 错误处理 | tRPC 格式 + 中间件转换 | REST JSON + 多模式包装 | 生态约定与传输需求 |
 | 上下文注入 | 中间件链式自动注入 | 各端点手动处理 | tRPC 框架能力 vs 原生 Next.js API 灵活性 |
+| 可观测性策略 | 双起点：有追踪/无追踪可选 | 统一有追踪，但限流可配置 | 前端交互与服务端集成的性能需求差异 |
 
 ---
 
-## 文件索引
+## 5. 文件索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
 | tRPC 入口 | `web/src/pages/api/trpc/[trpc].ts` |
-| tRPC 配置与 6 种 Procedure 定义 | `web/src/server/api/trpc.ts` |
+| tRPC 配置与 9 种 Procedure 定义 | `web/src/server/api/trpc.ts` |
 | tRPC 根路由器 | `web/src/server/api/root.ts` |
+| Session 路由器（protectedGetSessionProcedure 使用示例） | `web/src/server/api/routers/sessions.ts` |
 | 公共 API 限流服务 | `web/src/features/public-api/server/RateLimitService.ts` |
 | API 认证服务 | `web/src/features/public-api/server/apiAuth.ts` |
 | 公共 API 中间件包装器（模式 1） | `web/src/features/public-api/server/withMiddlewares.ts` |
