@@ -298,14 +298,54 @@ if (shouldRetryJob) {
 
 ### 5.3 熔断器机制（`webhooks.ts:283-318`）
 
-连续失败 4 次后，自动禁用触发器（Circuit Breaker）：
+**熔断触发时点的准确口径（代码+测试双验证）**：
+
+触发逻辑的执行顺序是关键：
+1. ✅ **先**：更新当前 execution 为 `ERROR` 状态（已落库）
+2. ✅ **再**：查询连续失败次数（包含当前这次）
+3. ✅ 判断：`consecutiveFailures >= 4` → 禁用触发器
+
+代码注释明确说明：
+```typescript
+// Check if trigger should be disabled (this is the 5th failure, looking for 4 in the past.)
+if (consecutiveFailures >= 4) {
+```
+
+**准确表述**：
+> 当前这次失败已经被计入统计。当判断条件成立时，意味着**包括当前这次在内，已连续失败至少 4 次**。这是第 5 次失败事件，历史上已有 4 次连续失败。
 
 ```typescript
-// 查询该 automation 的连续失败次数
-const consecutiveFailures = await getConsecutiveAutomationFailures({
-  automationId: automation.id,
-  projectId,
+// 在同一事务中先更新状态，再查询连续失败次数
+await prisma.$transaction(async (tx) => {
+  // 1. 先更新当前 execution 为 ERROR
+  await tx.automationExecution.update({
+    where: { id: executionId, ... },
+    data: { status: ActionExecutionStatus.ERROR, ... },
+  });
+
+  // 2. 再查询连续失败次数（已包含当前这次）
+  const consecutiveFailures = await getConsecutiveAutomationFailures({
+    automationId: automation.id,
+    projectId,
+  });
+
+  // 3. 判断条件：>= 4 触发熔断
+  if (consecutiveFailures >= 4) {
+    await tx.trigger.update({
+      where: { id: automation.trigger.id, projectId },
+      data: { status: JobConfigState.INACTIVE },  // 禁用触发器
+    });
+  }
 });
+```
+
+| 累计连续失败次数（含当前） | 是否触发熔断 |
+|---------------------------|------------|
+| 1 次 | ❌ |
+| 2 次 | ❌ |
+| 3 次 | ❌ |
+| 4 次 | ✅ 触发 |
+| 5 次及以上 | ✅ 已禁用 |
 
 if (consecutiveFailures >= 4) {
   // 禁用触发器，停止后续事件触发
@@ -338,20 +378,26 @@ PENDING ────────────────────────
                         │                                                         │
                         ↓                                                         ↓
                   COMPLETED                                        ┌───────────────────────┐
-                  finishedAt                                       │   判断错误类型         │
-                  output                                           └───────────┬───────────┘
+                  startedAt                                        │   判断错误类型         │
+                  finishedAt                                       └───────────┬───────────┘
+                  output                                                            │
                                                                                │
                                                       ┌────────────────────────┴───────────────────────┐
                                                       │                                                │
                                           可重试错误（NotFound/Internal）                        不可重试错误
                                                       │                                                │
                                                       ↓                                                ↓
-                                          throw error 触发队列重试                              落库 ERROR
+                                          throw error 触发队列重试                              落库 ERROR ←── startedAt 同样更新
                                                       │                                        finishedAt
                                                       │                                        error
                                             (重试 5 次后仍失败)                                output
-                                                      │
-                                                      └────────────→ 最终落库 ERROR
+                                                      │                                    ┌───────────────────┐
+                                                      └────────────→ 最终落库 ERROR           │ 连续失败 ≥ 4 次？│
+                                                                                           └─────────┬─────────┘
+                                                                                                     │
+                                                                                              是 ─────→ 禁用触发器
+                                                                                                     │
+                                                                                              否 ─────→ 保持启用
 ```
 
 ### 5.5 补偿与运维建议
