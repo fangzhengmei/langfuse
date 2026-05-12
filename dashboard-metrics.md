@@ -1,386 +1,67 @@
 # Dashboard Metrics 数据通路架构
 
-## 概述
+## 核心洞察：两条查询路径
 
-Langfuse 的看板指标系统采用声明式查询模型，用户通过前端选择维度和指标，系统自动拼装成高效的 ClickHouse SQL 查询。整个数据通路分为三层：**查询拼装层**、**缓存策略层**、**自定义指标定义层**，通过权限分发确保数据隔离。
+Langfuse 看板系统同时存在两条独立但共享底层的查询路径，最终都汇入同一套聚合层：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           数据通路总览                                        │
-├──────────────────┐    ┌──────────────────┐    ┌─────────────────────────────┐
-│  前端组件层      │    │  API 路由层      │    │  查询执行层                  │
-│                  │    │                  │    │                             │
-│  • Dashboard     │───▶│  • dashboard     │───▶│  • QueryBuilder             │
-│    Widgets       │    │    Router        │    │  • QueryExecutor            │
-│  • Filter Bar    │    │  • 权限校验      │    │  • ClickHouse 查询          │
-└──────────────────┘    └──────────────────┘    └─────────────────────────────┘
-                              │
-                              ▼
-                    ┌─────────────────────────┐
-                    │   视图声明层            │
-                    │   • viewDeclarations    │
-                    │   • dimensions/measures │
-                    └─────────────────────────┘
+│                           两条查询路径总览                                    │
+├───────────────────────────────────────────┬─────────────────────────────────┤
+│           🔵 默认图表路径                  │       🟢 自定义指标卡片路径       │
+│  (Built-in Dashboard Widgets)             │  (Custom Query Cards)           │
+├───────────────────────────────────────────┼─────────────────────────────────┤
+│ • Score Aggregate                         │ • 维度选择 + 指标选择           │
+│ • Cost by Type by Time                   │ • 可视化类型配置                 │
+│ • Usage by Type by Time                  │ • 过滤条件组合                  │
+│ • Traces Count                            │ • 时间范围设定                  │
+├───────────────────────────────────────────┴─────────────────────────────────┤
+│                              共享聚合层                                       │
+│  QueryBuilder → ViewDeclarations → ClickHouse SQL → ResultSet                │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 一、查询拼装层 (Query Builder)
+## 一、默认图表路径：硬编码查询流
 
-### 1.1 核心原理
+### 1.1 入口：DashboardRouter 内置查询
 
-查询拼装层将用户选择的维度、指标、过滤条件转换为高效的 ClickHouse SQL。核心入口是 `QueryBuilder` 类 (`web/src/features/query/server/queryBuilder.ts`)。
-
-### 1.2 查询构建流程
+**位置**：`web/src/features/dashboard/server/dashboard-router.ts`
 
 ```typescript
-// 简化的查询构建流程
-const builder = new QueryBuilder(chartConfig, version);
-const { query, parameters } = await builder.build(queryDefinition, projectId);
-```
-
-**构建步骤：**
-
-1. **视图解析**：根据 `view` 参数从 `viewDeclarations` 中获取对应的视图定义
-2. **维度映射**：将请求的字段映射到实际的 SQL 列表达式
-3. **指标聚合**：为每个指标应用指定的聚合函数
-4. **过滤转换**：将前端过滤器转换为 ClickHouse WHERE 条件
-5. **JOIN 处理**：根据关联的维度/指标自动添加必要的 JOIN
-6. **时间粒度**：自动处理时间系列的桶划分
-
-### 1.3 两级查询模式 (v1)
-
-默认采用两级嵌套查询模式，确保高基数维度下的正确性：
-
-```sql
--- 内层：按实体ID分组
-SELECT 
-  project_id,
-  trace_id,
-  any(dimension_1) as dimension_1,  -- 提取维度值
-  sum(metric_1) as metric_1         -- 预聚合指标
-FROM events_core e
-WHERE project_id = {projectId}
-  AND timestamp >= {fromTime}
-GROUP BY project_id, trace_id
-
--- 外层：按用户维度重新聚合
-SELECT 
-  dimension_1,
-  sum(metric_1) as sum_metric_1
-FROM (inner_query)
-GROUP BY dimension_1
-ORDER BY sum_metric_1 DESC
-```
-
-### 1.4 单级查询优化 (v2)
-
-当所有指标都支持单级聚合时，自动跳过内层查询以提升性能：
-
-```typescript
-// QueryBuilder 中的判断逻辑
-canUseSingleLevelQuery(appliedDimensions, appliedMetrics): boolean {
-  // 检查所有指标是否有 aggs 配置（支持模板替换）
-  // 或是否为 pairExpand 依赖的指标
-  // 同时检查维度是否有自定义聚合函数
-}
-```
-
-单级查询直接在 ClickHouse 层面完成所有聚合，减少数据传输和中间计算。
-
-### 1.5 PairExpand 模式
-
-针对 `Map` 类型字段（如 `cost_details`、`usage_details`），支持拆分解聚：
-
-```typescript
-// dataModel.ts 中的定义
-costType: {
-  sql: "mapKeys(events_observations.cost_details)",
-  alias: "costType",
-  pairExpand: {
-    valuesSql: "mapValues(events_observations.cost_details)",
-    valueAlias: "cost_value",
-  }
-}
-
-// 生成的 SQL 包含 ARRAY JOIN
-ARRAY JOIN
-  mapKeys(cost_details) AS cost_key, 
-  mapValues(cost_details) AS cost
-```
-
----
-
-## 二、缓存策略层
-
-系统采用多层次缓存架构，在不同粒度上减少重复查询。
-
-### 2.1 LocalCache - 应用层 LRU 缓存
-
-**位置**：`packages/shared/src/server/cache/localCache.ts`
-
-**核心特性：**
-
-```typescript
-class LocalCache<V extends {}> {
-  private readonly cache: LRUCache<string, V>;
-  
-  constructor(config: {
-    namespace: string;    // 缓存命名空间
-    enabled: boolean;     // 开关控制
-    ttlMs: number;        // 过期时间
-    max: number;          // 最大条目数
+// 内置命名查询，前端直接按名称调用
+chart: protectedProjectProcedure
+  .input(z.object({
+    queryName: z.enum([
+      "score-aggregate",
+      "observations-usage-by-type-timeseries",
+      "observations-cost-by-type-timeseries",
+    ]),
+    filter: FilterState,
+    version: z.enum(["v1", "v2"]).default("v1"),
+  }))
+  .query(async ({ input, ctx }) => {
+    switch (input.queryName) {
+      case "score-aggregate":
+        return input.version === "v2" 
+          ? getScoreAggregateV2(input)   // v2: 使用 QueryBuilder
+          : getScoreAggregate(input);    // v1: 硬编码 SQL
+      
+      case "observations-cost-by-type-timeseries":
+        return input.version === "v2"
+          ? getObservationsByTypeV2(input)
+          : getObservationCostByTypeByTime(input);
+    }
   });
-  
-  async getOrLoad(
-    key: string, 
-    loader: () => Promise<LocalCacheLoadResult<V>>
-  ): Promise<LocalCacheLoadResult<V>>;
-}
 ```
 
-**设计要点：**
-- 基于 `lru-cache` 实现，支持 TTL 自动过期
-- 可配置的命名空间，不同业务域隔离
-- 缓存命中/失停指标上报到 Prometheus
-- Loader 模式保证缓存穿透保护
-
-### 2.2 ClickHouse 查询条件缓存
-
-**位置**：`queryExecutor.ts` 中 `clickhouseSettings`
-
-```typescript
-const clickhouseSettings: Record<string, string> = {
-  date_time_output_format: "iso",
-  ...(env.CLICKHOUSE_USE_QUERY_CONDITION_CACHE === "true"
-    ? { use_query_condition_cache: "true" }
-    : {}),
-  max_bytes_before_external_group_by: String(
-    env.CLICKHOUSE_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY,
-  ),
-};
-```
-
-**作用：**
-- ClickHouse 服务端缓存相同 WHERE 条件的中间结果
-- 特别适用于高并发的看板查询场景
-- 通过环境变量控制开关
-
-### 2.3 缓存标签体系
-
-所有 ClickHouse 查询携带结构化标签：
-
-```typescript
-tags: {
-  feature: "custom-queries",  // "dashboard" for built-in widgets
-  type: query.view,           // traces / observations / scores-numeric
-  kind: "analytic",           // analytic type query
-  projectId,
-}
-```
-
----
-
-## 三、自定义指标定义层
-
-指标定义采用声明式配置，集中管理所有支持的维度和指标。
-
-### 3.1 视图定义结构
-
-**位置**：`web/src/features/query/dataModel.ts`
-
-```typescript
-export const viewDeclarations: VersionedViewDeclarations = {
-  v1: {
-    traces: traceView,                   // 基于 traces 表
-    observations: observationsView,      // 基于 observations 表
-    "scores-numeric": scoresNumericView,
-    "scores-categorical": scoresCategoricalView,
-  },
-  v2: {
-    traces: eventsTracesView,            // 基于 events_core 表聚合 trace
-    observations: eventsObservationsView,// 基于 events_core 表
-    "scores-numeric": scoresNumericViewV2,
-    "scores-categorical": scoresCategoricalViewV2,
-  },
-};
-```
-
-### 3.2 单个视图声明范例
-
-```typescript
-const eventsObservationsView: ViewDeclarationType = {
-  name: "events_observations",
-  description: "Observations 视图 v2 版本，基于 events_core 表",
-  baseCte: "events_core events_observations",  // 基础查询表达式
-  
-  // 维度定义
-  dimensions: {
-    name: {
-      sql: "events_observations.name",
-      alias: "name",
-      type: "string",
-      description: "观察名称",
-    },
-    providedModelName: {
-      sql: "nullIf(events_observations.provided_model_name, '')",
-      alias: "providedModelName",
-      type: "string",
-      description: "模型名称",
-    },
-    // PairExpand 维度示例
-    costType: {
-      sql: "mapKeys(events_observations.cost_details)",
-      alias: "costType",
-      type: "string",
-      description: "成本分类键",
-      pairExpand: {
-        valuesSql: "mapValues(events_observations.cost_details)",
-        valueAlias: "cost_value",
-      },
-    },
-  },
-  
-  // 指标定义
-  measures: {
-    count: {
-      sql: "@@AGG@@(1)",
-      aggs: { agg: "count" },  // 聚合模板
-      alias: "count",
-      type: "integer",
-      unit: "observations",
-      description: "总观察数",
-    },
-    totalCost: {
-      sql: "@@AGG1@@(toNullable(total_cost))",
-      aggs: { agg1: "sum" },
-      alias: "totalCost",
-      type: "decimal",
-      unit: "USD",
-      description: "总成本",
-    },
-    // 依赖 pairExpand 维度的指标示例
-    costByType: {
-      sql: "cost_value",
-      alias: "costByType",
-      type: "decimal",
-      unit: "USD",
-      requiresDimension: "costType",  // 自动依赖
-      description: "按分类汇总成本",
-    },
-  },
-  
-  // JOIN 关系定义
-  tableRelations: {
-    scores: {
-      name: "scores",
-      joinConditionSql: "ON events_observations.span_id = scores.observation_id",
-      timeDimension: "timestamp",
-    },
-  },
-  
-  segments: [],           // 常量过滤条件
-  timeDimension: "start_time",  // 时间维度列名
-};
-```
-
-### 3.3 v1 vs v2 视图差异
-
-| 特性 | v1 视图 | v2 视图 |
-|------|---------|---------|
-| **基础表** | traces / observations 独立表 | events_core 单表 |
-| **JOIN 方式** | 多表 JOIN 关联 | 自包含或轻量 JOIN |
-| **聚合模板** | 无 | `@@AGG@@` 模板替换 |
-| **PairExpand** | 不支持 | 支持 costType / usageType |
-| **根事件条件** | 无 | 支持 trace 根事件过滤 |
-| **性能** | 高基数下较慢 | 写入时预聚合，查询更快 |
-
-### 3.4 支持的聚合函数
-
-在 `types.ts` 中定义：
-
-```typescript
-export const metricAggregations = z.enum([
-  "sum",      // 求和
-  "avg",      // 平均
-  "count",    // 计数
-  "max",      // 最大值
-  "min",      // 最小值
-  "p50",      // 中位数
-  "p75",      // 75分位
-  "p90",      // 90分位
-  "p95",      // 95分位
-  "p99",      // 99分位
-  "histogram",// 直方图
-  "uniq",     // 去重计数
-]);
-```
-
----
-
-## 四、过滤器映射与兼容性
-
-### 4.1 过滤器兼容层
-
-**位置**：`web/src/features/query/dashboardUiTableToViewMapping.ts`
-
-处理三种 legacy 过滤器格式：
-1. 用户可见的显示标签（如 "Model"）
-2. UI Table ID 标识符（如 "model"）
-3. 显式别名（如 "Tool Names"）
-
-```typescript
-// 映射配置范例
-observations: [
-  defineField(
-    "providedModelName",
-    sourceSpec("Model", { uiTableId: "model" }),  // 视图字段 → UI 映射
-  ),
-  // ...
-],
-```
-
-### 4.2 过滤器转换流程
-
-```
-前端过滤器 (column="Model")
-        │
-        ▼
-  查找映射定义
-        │
-        ▼
-  替换为视图字段名 (providedModelName)
-        │
-        ▼
-  FilterList 应用 → ClickHouse WHERE 条件
-```
-
----
-
-## 五、默认指标图表实现
-
-### 5.1 分数聚合 (Score Aggregate)
+### 1.2 v1 版本：直接 SQL 拼装（遗留路径）
 
 **位置**：`packages/shared/src/server/repositories/dashboards.ts`
 
 ```sql
-SELECT 
-  s.name,
-  count(*) as count,
-  avg(s.value) as avg_value,
-  s.source,
-  s.data_type
-FROM scores s FINAL 
-[LEFT JOIN traces t FINAL ON t.id = s.trace_id]
-WHERE s.project_id = {projectId}
-  [AND t.timestamp >= {tracesTimestamp}]
-GROUP BY s.name, s.source, s.data_type
-ORDER BY count(*) DESC
-```
-
-### 5.2 成本时间序列 (Cost by Type by Time)
-
-```sql
+-- getObservationCostByTypeByTime: 手写 SQL，不经过 ViewDeclaration
 SELECT 
     start_time, 
     groupArray((cost_key, cost_sum)) AS costs
@@ -395,165 +76,617 @@ FROM (
         mapKeys(cost_details) AS cost_key, 
         mapValues(cost_details) AS cost
     WHERE project_id = {projectId}
+      [AND environment = {env}]
+      [AND t.timestamp >= {traceTimestamp}]
     GROUP BY start_time, cost_key
 ) 
 GROUP BY start_time
 ORDER BY start_time ASC WITH FILL
 ```
 
-### 5.3 时间桶自动选择
+**关键特征：**
+- ✅ 直接在代码中写死 SQL 模板
+- ✅ 绕过 QueryBuilder 和 ViewDeclaration 层
+- ✅ 手动处理 Filter 映射
+- ✅ 性能最优但扩展性差
+- ❌ 不支持自定义维度和指标组合
 
-`orderByTimeSeries` 函数根据时间范围自动选择合适的粒度：
+### 1.3 v2 版本：汇入 QueryBuilder 统一流
 
 ```typescript
-const potentialBucketSizesSeconds = [
-  5, 10, 30, 60, 300, 600, 1800, 3600, 
-  18000, 36000, 86400, 604800, 2592000,
-];
-
-// 目标约 50 个数据点
-const bucketSize = closestBucketSizeTo50Points;
+// getObservationsByTypeV2：使用 QueryExecutor
+async function getObservationsByTypeV2(params) {
+  const query = {
+    view: "observations",        // 固定视图
+    dimensions: [{ field: params.dimensionField }],  // 固定维度
+    metrics: [{ 
+      measure: params.metricMeasure, 
+      aggregation: "sum" 
+    }],
+    filters: mappedFilters,
+    timeDimension: { granularity: "auto" },
+    fromTimestamp: fromIso,
+    toTimestamp: toIso,
+    orderBy: null,
+  };
+  
+  // 汇入统一执行器
+  return executeQuery(params.projectId, query, "v2", true);
+}
 ```
 
 ---
 
-## 六、权限分发与项目隔离
+## 二、自定义指标卡片路径：声明式查询流
 
-### 6.1 路由层权限校验
-
-**位置**：`web/src/features/dashboard/server/dashboard-router.ts`
+### 2.1 入口：executeQuery 通用端点
 
 ```typescript
-// 所有 Dashboard 接口都经过受保护的 tRPC 过程
-protectedProjectProcedure
-  .input(...)
-  .query(async ({ input, ctx }) => {
-    // 第一步：RBAC 检查
-    throwIfNoProjectAccess({
-      session: ctx.session,
-      projectId: input.projectId,
-      scope: "dashboards:read", // 或 "dashboards:CUD"
-    });
+executeQuery: protectedProjectProcedure
+  .input(z.object({
+    projectId: z.string(),
+    query: QueryTypeSchema,    // 完整查询表达式
+    version: z.enum(["v1", "v2"]).default("v1"),
+  }))
+  .query(async ({ input }) => {
+    // 参数验证
+    const validation = validateQuery(input.query, input.version);
+    if (!validation.valid) throw new InvalidRequestError(validation.reason);
     
-    // 第二步：业务逻辑执行
-    return DashboardService.getDashboard(
-      input.dashboardId,
+    // 统一执行
+    return executeQuery(
       input.projectId,
+      input.query,
+      input.version,
+      input.version === "v2",  // enableSingleLevelOptimization
     );
   });
 ```
 
-### 6.2 查询层项目隔离
+### 2.2 查询表达式结构 (QueryType)
 
-每个查询在 WHERE 子句中强制添加 `project_id` 过滤：
-
-```typescript
-// QueryBuilder.build() 中自动添加
-const allWhereClauses = [
-  "e.project_id = {projectId: String}",  // 自动添加
-  ...userFilters,
-];
-```
-
-### 6.3 DashboardService 数据隔离
-
-PostgreSQL 层面的访问控制：
+**位置**：`web/src/features/query/types.ts`
 
 ```typescript
-// DashboardService.getDashboard
-where: {
-  id: dashboardId,
-  OR: [{ projectId }, { projectId: null }],  // 支持全局模板
+interface QueryType {
+  view: "traces" | "observations" | "scores-numeric" | "scores-categorical";
+  dimensions: Array<{ field: string }>;                   // 拆分维度
+  metrics: Array<{                                         // 聚合指标
+    measure: string;
+    aggregation: "sum" | "avg" | "count" | "p95" | "uniq" | "histogram";
+  }>;
+  filters: FilterState;                                    // 过滤条件
+  timeDimension: { granularity: "auto" | "minute" | "hour" | "day" } | null;
+  fromTimestamp: ISO8601String;
+  toTimestamp: ISO8601String;
+  orderBy: Array<{ field: string; direction: "asc" | "desc" }> | null;
+  chartConfig?: { type: string; bins?: number; row_limit?: number };
 }
 ```
 
-- `projectId = null`：Langfuse 全局默认看板
-- `projectId = 用户项目`：用户自定义看板
-- 两者通过 OR 联合查询，确保用户可见范围正确
+### 2.3 查询表达 → 聚合层：关键转换步骤
+
+#### 第一步：视图解析 (View Resolution)
+
+```typescript
+// QueryBuilder.build()
+const view = getViewDeclaration(query.view, version);
+// 返回：observationsView (v1) 或 eventsObservationsView (v2)
+```
+
+#### 第二步：维度映射 (Dimension Mapping)
+
+```typescript
+private mapDimensions(dimensions, view): AppliedDimension[] {
+  return dimensions.map(d => {
+    const dimDef = view.dimensions[d.field];
+    
+    // 普通维度
+    if (!dimDef.pairExpand) {
+      return { sql: dimDef.sql, alias: dimDef.alias };
+    }
+    
+    // PairExpand 维度（Map 解构）
+    if (dimDef.pairExpand) {
+      return {
+        sql: dimDef.sql,
+        alias: dimDef.alias,
+        pairExpand: dimDef.pairExpand,  // 标记需要 ARRAY JOIN
+      };
+    }
+    
+    // 自定义聚合维度（如 trace name 聚合）
+    if (dimDef.aggregationFunction) {
+      return {
+        sql: dimDef.sql,
+        alias: dimDef.alias,
+        aggregationFunction: dimDef.aggregationFunction,
+      };
+    }
+  });
+}
+```
+
+#### 第三步：指标映射 (Metric Mapping)
+
+```typescript
+private mapMetrics(metrics, view): AppliedMetric[] {
+  return metrics.map(m => {
+    const measureDef = view.measures[m.measure];
+    
+    // 自动注入依赖维度（PairExpand）
+    if (measureDef.requiresDimension && 
+        !currentDimensions.includes(measureDef.requiresDimension)) {
+      // 成本查询自动加入 costType 维度
+      // 用量查询自动加入 usageType 维度
+      this.applyAutoDimension(measureDef.requiresDimension);
+    }
+    
+    // 聚合模板替换
+    if (measureDef.aggs) {
+      // "@@AGG1@@(total_cost)" + agg1="sum" → "sum(total_cost)"
+      const substitutedSql = substituteAggTemplates(
+        measureDef.sql, 
+        measureDef.aggs,
+        m.aggregation  // 用户选择的聚合函数
+      );
+      return { sql: substitutedSql, aggregation: m.aggregation };
+    }
+    
+    // 普通聚合
+    return {
+      sql: measureDef.sql,
+      aggregation: m.aggregation,
+      alias: measureDef.alias,
+    };
+  });
+}
+```
+
+#### 第四步：关联表自动注入
+
+```typescript
+private collectRelationTables(appliedDims, appliedMetrics, filters) {
+  const relations = new Set<string>();
+  
+  // 维度引用的关联表
+  appliedDims.forEach(d => {
+    if (d.relationTable) relations.add(d.relationTable);
+  });
+  
+  // 指标引用的关联表
+  appliedMetrics.forEach(m => {
+    if (m.relationTable) relations.add(m.relationTable);
+  });
+  
+  // 过滤器引用的关联表
+  filters.forEach(f => {
+    if (filterMapping.requiresRelation) relations.add(f.relationTable);
+  });
+  
+  // 为每个关联表生成 JOIN 语句
+  return Array.from(relations).map(tableName => {
+    const rel = view.tableRelations[tableName];
+    return `LEFT JOIN ${rel.name} ${rel.joinConditionSql}`;
+  });
+}
+```
 
 ---
 
-## 七、端到端数据流示例
+## 三、聚合层：两条路径的交汇点
 
-### 7.1 "Total Cost by Model" 查询
+### 3.1 统一执行入口：queryExecutor
 
-**用户输入：**
-- 视图：observations (v2)
-- 维度：providedModelName
-- 指标：totalCost / sum
-- 时间范围：过去 7 天
+**位置**：`web/src/features/query/server/queryExecutor.ts`
 
-**执行路径：**
-
+```typescript
+export async function executeQuery(
+  projectId: string,
+  query: QueryType,
+  version: ViewVersion = "v1",
+  enableSingleLevelOptimization: boolean = false,
+) {
+  // ========== 准备阶段 ==========
+  const prepared = await prepareExecuteQuery({
+    projectId,
+    query,
+    version,
+    enableSingleLevelOptimization,
+  });
+  // prepared 包含: compiledQuery, parameters, clickhouseSettings, tags
+  
+  // ========== ClickHouse 路由 ==========
+  const chOpts = toClickhouseQueryOpts(prepared);
+  
+  // ========== 执行 ==========
+  if (!prepared.usesTraceTable) {
+    // 简单查询直接执行
+    return queryClickhouse(chOpts);
+  }
+  
+  // 含 trace 表的查询：带度量和超时保护
+  return measureAndReturn({
+    operationName: "executeQuery",
+    projectId,
+    input: {
+      query: prepared.compiledQuery,
+      params: prepared.parameters,
+      fromTimestamp: prepared.fromTimestamp,
+      tags: prepared.tags,
+    },
+    fn: async (input) => queryClickhouse({
+      ...chOpts,
+      query: input.query,
+      params: input.params,
+      tags: input.tags,
+    }),
+  });
+}
 ```
-1. 前端发送 executeQuery 请求
-     │
-     ▼
-2. dashboardRouter 权限校验
-     │
-     ▼
-3. QueryExecutor 准备
-   ├─ 确定版本 v1/v2
-   ├─ 选择 ClickHouse 服务端点
-   └─ 设置查询标签
-     │
-     ▼
-4. QueryBuilder.build()
-   ├─ 解析视图定义：eventsObservationsView
-   ├─ 映射维度：providedModelName → 对应 SQL 表达式
-   ├─ 映射指标：totalCost / sum → @@AGG1@@ 模板替换
-   ├─ 添加时间过滤：start_time >= {from}
-   ├─ 自动添加 project_id 过滤
-   ├─ 判断是否可用单级查询（此处可用）
-   └─ 生成最终 SQL
-     │
-     ▼
-5. ClickHouse 执行
-   ├─ 应用查询条件缓存
-   ├─ 按 model 分组聚合 cost
-   └─ 返回结果
-     │
-     ▼
-6. 前端渲染图表
-```
 
-**生成的 SQL (v2)：**
+### 3.2 QueryBuilder 核心：单级 vs 两级决策
 
-```sql
-SELECT 
-  nullIf(events_observations.provided_model_name, '') as providedModelName,
-  sum(toNullable(total_cost)) as sum_totalCost
-FROM events_core events_observations
-WHERE project_id = {projectId: String}
-  AND start_time >= {fromTime: DateTime64(3)}
-  AND start_time <= {toTime: DateTime64(3)}
-GROUP BY providedModelName
-ORDER BY sum_totalCost DESC
+```typescript
+// 是否可以跳过内层查询？
+private canUseSingleLevelQuery(appliedDimensions, appliedMetrics): boolean {
+  // 条件 A：所有指标都有聚合模板配置 @@AGG@@
+  const allMetricsHaveAggTemplates = 
+    appliedMetrics.every(m => m.aggs !== undefined);
+  
+  // 条件 B：所有指标都是 pairExpand 依赖型（requiresDimension）
+  const allMetricsArePairExpandDependent = 
+    appliedMetrics.every(m => m.requiresDimension !== undefined);
+  
+  // 条件 C：没有维度使用自定义聚合函数
+  const noCustomDimAggregation = 
+    appliedDimensions.every(d => !d.aggregationFunction);
+  
+  return (allMetricsHaveAggTemplates || allMetricsArePairExpandDependent)
+         && noCustomDimAggregation;
+}
 ```
 
 ---
 
-## 八、关键文件索引
+## 四、自定义指标定义层：声明式契约
 
-| 层级 | 文件路径 | 职责 |
-|------|---------|------|
-| **API 层** | `web/src/features/dashboard/server/dashboard-router.ts` | Dashboard tRPC 路由 |
-| | `web/src/features/query/server/queryExecutor.ts` | 查询执行入口 |
-| **查询构建** | `web/src/features/query/server/queryBuilder.ts` | SQL 拼装核心 |
-| **视图定义** | `web/src/features/query/dataModel.ts` | 维度/指标声明 |
-| **类型定义** | `web/src/features/query/types.ts` | QueryType, aggregations |
-| **过滤器映射** | `web/src/features/query/dashboardUiTableToViewMapping.ts` | Legacy 兼容层 |
-| **缓存** | `packages/shared/src/server/cache/localCache.ts` | LRU 缓存实现 |
-| **看板服务** | `packages/shared/src/server/services/DashboardService/` | Dashboard CRUD |
-| **默认查询** | `packages/shared/src/server/repositories/dashboards.ts` | Score/Cost 内置查询 |
+### 4.1 视图定义核心结构
+
+**位置**：`web/src/features/query/dataModel.ts`
+
+```typescript
+interface ViewDeclaration {
+  name: string;
+  description: string;
+  
+  // ========== 基础表 ==========
+  baseCte: string;  // "events_core events_observations" | "observations FINAL"
+  
+  // ========== 维度定义 ==========
+  dimensions: Record<string, {
+    sql: string;           // SQL 表达式
+    alias?: string;        // 别名
+    type?: string;         // "string" | "number" | "string[]"
+    description?: string;
+    unit?: string;         // 单位 "USD" | "millisecond"
+    relationTable?: string;  // 关联表名
+    highCardinality?: boolean;
+    explodeArray?: boolean;   // 是否需要 arrayJoin 展开
+    pairExpand?: {            // Map 拆分解聚
+      valuesSql: string;
+      valueAlias: string;
+    };
+    aggregationFunction?: string;  // 维度级聚合（如 argMax）
+  }>;
+  
+  // ========== 指标定义 ==========
+  measures: Record<string, {
+    sql: string;           // SQL 表达式，支持 @@AGG@@ 模板
+    alias?: string;
+    type?: string;         // "integer" | "decimal"
+    unit?: string;         // 单位
+    description?: string;
+    aggs?: Record<string, string>;  // 聚合模板映射
+    relationTable?: string;  // 指标来源表
+    requiresDimension?: string;    // 自动依赖的维度
+  }>;
+  
+  // ========== JOIN 关系 ==========
+  tableRelations: Record<string, {
+    name: string;
+    joinConditionSql: string;
+    timeDimension: string;
+    useFinal?: boolean;
+  }>;
+  
+  segments: Filter[];     // 内置常量过滤
+  timeDimension: string;  // 时间列名
+  rootEventCondition?: {  // trace 根事件优化
+    column: string;
+    condition: string;
+  };
+}
+```
+
+### 4.2 指标定义示例详解
+
+```typescript
+// v2 observations 视图中的指标
+measures: {
+  // ========== 简单计数指标 ==========
+  count: {
+    sql: "@@AGG@@(1)",
+    aggs: { agg: "count" },           // 两级模式下替换为 count(1)
+    alias: "count",
+    type: "integer",
+    unit: "observations",
+  },
+  
+  // ========== Map 聚合指标 ==========
+  totalTokens: {
+    sql: "@@AGG1@@(usage_details)['total']",
+    aggs: { agg1: "sumMap" },         // 两级模式：sumMap 预聚合后取 total
+    alias: "totalTokens",
+    type: "integer",
+    unit: "tokens",
+  },
+  
+  // ========== PairExpand 依赖指标 ==========
+  costByType: {
+    sql: "cost_value",                 // 直接引用 ARRAY JOIN 后的值
+    alias: "costByType",
+    type: "decimal",
+    unit: "USD",
+    requiresDimension: "costType",     // 自动注入 costType 维度
+    description: "必须配合 costType 维度使用",
+  },
+  
+  // ========== 关联表指标 ==========
+  scoresCount: {
+    sql: "uniq(scores.id)",            // 需要 JOIN scores 表
+    alias: "scoresCount",
+    type: "integer",
+    relationTable: "scores",           // 触发 JOIN
+  },
+  
+  // ========== 复杂计算指标 ==========
+  outputTokensPerSecond: {
+    sql: `arraySum(mapValues(
+           mapFilter(x -> positionCaseInsensitive(x.1, 'output') > 0, 
+                     @@AGG1@@(usage_details))
+         )) / nullIf(
+           date_diff('second', 
+             @@AGG1@@(events_observations.completion_start_time), 
+             @@AGG1@@(events_observations.end_time)
+           ), 0)`,
+    aggs: { agg1: "any" },
+    alias: "outputTokensPerSecond",
+    type: "decimal",
+    unit: "tokens/s",
+  },
+}
+```
 
 ---
 
-## 九、性能优化要点
+## 五、端到端时序流：权限 → 缓存 → 查询 → 结果
 
-1. **版本选择**：优先使用 v2 视图，基于 events_core 表性能更优
-2. **单级查询**：满足条件时自动启用，减少内层高基数分组
-3. **时间范围**：窄时间范围启用 rootEventCondition 子查询优化
-4. **ClickHouse 配置**：合理设置 `max_bytes_before_external_group_by`
-5. **查询缓存**：高并发看板开启 `use_query_condition_cache`
-6. **时间粒度**：自动桶大小选择保证约 50 个数据点，平衡精度和性能
+### 5.1 完整时序图
+
+```
+时间轴 →
+
+0ms    ┌─────────────────────────────────────────────────────────┐
+       │  1. HTTP Request 到达 tRPC 层                             │
+       │     POST /api/trpc/dashboard.executeQuery                │
+       │     Cookie: session=<JWT>                                 │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+5ms    ┌──────────────────▼───────────────────────────────────────┐
+       │  2. 权限分发层（RBAC）                                     │
+       │                                                             │
+       │  protectedProjectProcedure 中间件                          │
+       │    ├─ 解析 JWT → session.user.id                          │
+       │    ├─ 提取 input.projectId                                 │
+       │    └─ 调用 throwIfNoProjectAccess(scope)                   │
+       │         ├─ 查询项目成员关系                                 │
+       │         ├─ 验证角色权限: dashboards:read / dashboards:CUD │
+       │         └─ ❌ 权限不足 → TRPCError(code="UNAUTHORIZED")   │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+30ms   ┌──────────────────▼───────────────────────────────────────┐
+       │  3. 参数验证层                                              │
+       │                                                             │
+       │  validateQuery(input.query, input.version)                 │
+       │    ├─ 检查 view 是否有效                                    │
+       │    ├─ 检查 dimensions 是否在视图定义中存在                │
+       │    ├─ 检查 metrics.measure 是否在视图定义中存在            │
+       │    ├─ 检查 metrics.aggregation 是否兼容 measure.type       │
+       │    └─ 验证 filters 格式和字段合法性                        │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+50ms   ┌──────────────────▼───────────────────────────────────────┐
+       │  4. 缓存层：缓存键生成                                      │
+       │                                                             │
+       │  cacheKey = SHA256(                                        │
+       │    JSON.stringify({                                         │
+       │      projectId,                                            │
+       │      query: normalizedQuery,  // 字段排序、格式标准化      │
+       │      version,                                               │
+       │    })                                                       │
+       │  )                                                          │
+       │                                                             │
+       │  localCache.get(cacheKey)                                   │
+       │    ├─ 🔵 缓存 HIT → 直接返回缓存结果 → 跳到步骤 10         │
+       │    └─ 🟡 缓存 MISS → 继续执行                                │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+80ms   ┌──────────────────▼───────────────────────────────────────┐
+       │  5. QueryBuilder 构建阶段                                   │
+       │                                                             │
+       │  builder.build(query, projectId)                            │
+       │    ├─ 解析视图定义 view = viewDeclarations[v][view]       │
+       │    ├─ 映射维度 → appliedDimensions                         │
+       │    ├─ 映射指标 → appliedMetrics                            │
+       │    ├─ 自动注入依赖维度（requiresDimension）                │
+       │    ├─ 收集关联表 JOINs                                      │
+       │    ├─ 构建 ARRAY JOIN（pairExpand 维度）                  │
+       │    ├─ 处理过滤器 → WHERE 条件 + 参数绑定                    │
+       │    ├─ 自动添加 project_id 过滤 → 🔒 数据隔离               │
+       │    ├─ 决策: 单级 vs 两级聚合                               │
+       │    ├─ 构建时间维度 WITH FILL                               │
+       │    ├─ 生成 LIMIT/OFFSET                                    │
+       │    └─ 最终 SQL 字符串 + 参数对象                            │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+150ms  ┌──────────────────▼───────────────────────────────────────┐
+       │  6. ClickHouse 查询路由                                      │
+       │                                                             │
+       │  preferredClickhouseService =                                │
+       │    view.baseCte.includes("events_")                         │
+       │      ? "EventsReadOnly"  ← 读副本，分担主库压力           │
+       │      : "Default"                                             │
+       │                                                             │
+       │  clickhouseSettings: {                                       │
+       │    use_query_condition_cache: env.CLICKHOUSE_USE_CACHE      │
+       │    max_bytes_before_external_group_by: "20000000000"       │
+       │    date_time_output_format: "iso"                            │
+       │  }                                                           │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+200ms  ┌──────────────────▼───────────────────────────────────────┐
+       │  7. ClickHouse 执行 + 内部缓存                               │
+       │                                                             │
+       │  query: String + params: Record                             │
+       │    tags: { feature, type, kind, projectId } ← 可观测性     │
+       │                                                             │
+       │  ClickHouse 端:                                               │
+       │    ├─ 如果 use_query_condition_cache=true                   │
+       │    │   └─ 相同 WHERE 条件块的中间结果可复用                 │
+       │    ├─ 预聚合数据块（按 project_id, start_time 排序）       │
+       │    ├─ 合并聚合结果                                          │
+       │    └─ WITH FILL 填充时间间隙                                │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+350ms  ┌──────────────────▼───────────────────────────────────────┐
+       │  8. 结果处理 + 缓存写入                                      │
+       │                                                             │
+       │  resultSet = clickhouseResponse.json()                     │
+       │                                                             │
+       │  localCache.set(cacheKey, resultSet, { ttlMs: 30000 })    │
+       │              ↑ 默认 30 秒 TTL                               │
+       │                                                             │
+       │  记录度量指标:                                               │
+       │    prometheus.increment("langfuse.query.duration_ms")      │
+       │    prometheus.increment("langfuse.query.cache.hit/miss")   │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+380ms  ┌──────────────────▼───────────────────────────────────────┐
+       │  9. 结果转换（如需要）                                       │
+       │                                                             │
+       │  flatRows → timeseriesFormat(groupByTime)                 │
+       │                                                             │
+       │  直方图转换: histogram bins → chart data points           │
+       └──────────────────┬───────────────────────────────────────┘
+                          │
+400ms  ┌──────────────────▼───────────────────────────────────────┐
+       │  10. 返回响应                                               │
+       │                                                             │
+       │  HTTP 200 OK + JSON Array                                   │
+       └────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 缓存命中与失效触发条件
+
+| 触发条件 | 结果 | 说明 |
+|---------|------|------|
+| **命中条件** | | |
+| 相同 projectId + 相同 query 结构 + 相同 version | ✅ Cache HIT | 查询表达式必须完全匹配（字段顺序、参数值） |
+| 距离上次查询 < 30 秒 | ✅ Cache HIT | 默认 TTL 30000ms |
+| LocalCache 未达到 max 条目数 | ✅ Cache HIT | 默认 max = 1000 LRU |
+| | | |
+| **失效条件** | | |
+| 时间超过 TTL（默认 30 秒） | ❌ Cache MISS | 时间窗口滑动导致失效 |
+| 查询表达式任一字段变化 | ❌ Cache MISS | 维度、指标、过滤、时间范围 |
+| 查询版本 v1/v2 切换 | ❌ Cache MISS | 视图定义完全不同 |
+| LocalCache 内存压力驱逐条目 | ❌ Cache MISS | LRU 淘汰冷数据 |
+| 进程重启 / Pod 重建 | ❌ 全量失效 | LocalCache 是内存本地缓存 |
+| | | |
+| **ClickHouse 层缓存** | | |
+| 相同 WHERE 条件 + `use_query_condition_cache=true` | ✅ 部分命中 | ClickHouse 服务端查询条件缓存 |
+
+### 5.3 权限分发关键节点
+
+**位置**：`web/src/features/dashboard/server/dashboard-router.ts`
+
+```typescript
+// ========== 读取权限 ==========
+allDashboards: protectedProjectProcedure
+  .input(ListDashboardsInput)
+  .query(async ({ ctx, input }) => {
+    throwIfNoProjectAccess({
+      session: ctx.session,
+      projectId: input.projectId,
+      scope: "dashboards:read",  // 只读
+    });
+    return DashboardService.listDashboards(input);
+  });
+
+// ========== 写入权限 ==========
+createDashboard: protectedProjectProcedure
+  .mutation(async ({ ctx, input }) => {
+    throwIfNoProjectAccess({
+      session: ctx.session,
+      projectId: input.projectId,
+      scope: "dashboards:CUD",  // 创建/更新/删除
+    });
+    return DashboardService.createDashboard(input);
+  });
+
+// ========== 查询执行权限 ==========
+executeQuery: protectedProjectProcedure
+  .query(async ({ input }) => {
+    // executeQuery 本身不做额外 RBAC
+    // 依赖外层 protectedProjectProcedure 已经验证的项目访问权
+    // QueryBuilder 强制注入 project_id 作为数据最后防线
+  });
+```
+
+**多层安全防线：**
+1. **tRPC 中间件**：验证用户身份和项目成员资格
+2. **RBAC Scope**：区分读/写操作权限
+3. **QueryBuilder 强制注入**：所有 SQL 自动追加 `project_id = {ctx.projectId}`
+4. **ClickHouse 行级**（如启用）：可额外配置 RLS
+
+---
+
+## 六、两条路径的对比总结
+
+| 维度 | 🟦 默认图表 (v1) | 🟩 默认图表 (v2) | 🟢 自定义卡片 |
+|-----|------------------|------------------|---------------|
+| **查询表达** | 硬编码 queryName | 固定 QueryType | 完整 QueryType |
+| **维度组合** | 固定 1-2 个 | 固定 | 用户自由选择 |
+| **指标组合** | 固定 | 固定 | 用户自由选择 |
+| **经过 ViewDeclaration** | ❌ 否 | ✅ 是 | ✅ 是 |
+| **经过 QueryBuilder** | ❌ 否 | ✅ 是 | ✅ 是 |
+| **单级聚合优化** | ❌ 手动 | ✅ 自动判断 | ✅ 自动判断 |
+| **缓存策略** | ✅ 共用 LocalCache | ✅ 共用 | ✅ 共用 |
+| **权限校验** | ✅ RBAC | ✅ RBAC | ✅ RBAC |
+| **扩展性** | 差 | 中 | 好 |
+
+---
+
+## 七、关键文件索引
+
+| 模块 | 文件路径 | 核心职责 |
+|------|---------|---------|
+| **入口层** | `web/src/features/dashboard/server/dashboard-router.ts` | API 路由、权限分发、v1/v2 分流 |
+| **查询执行** | `web/src/features/query/server/queryExecutor.ts` | ClickHouse 路由、缓存接口、参数绑定 |
+| **SQL 构建** | `web/src/features/query/server/queryBuilder.ts` | 维度/指标映射、JOIN 生成、单级/两级决策 |
+| **指标定义** | `web/src/features/query/dataModel.ts` | 视图声明、维度/指标契约、聚合模板定义 |
+| **过滤器兼容** | `web/src/features/query/dashboardUiTableToViewMapping.ts` | Legacy 字段名映射、编辑器/存储双向转换 |
+| **类型契约** | `web/src/features/query/types.ts` | QueryType、aggregations、views 枚举 |
+| **v1 硬编码** | `packages/shared/src/server/repositories/dashboards.ts` | Score/Cost 等默认图表 SQL 实现 |
+| **缓存实现** | `packages/shared/src/server/cache/localCache.ts` | LRU 缓存、TTL、指标上报 |
+| **看板 CRUD** | `packages/shared/src/server/services/DashboardService/DashboardService.ts` | 元数据存储、全局模板支持 |
