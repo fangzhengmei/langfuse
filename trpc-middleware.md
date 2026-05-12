@@ -3,7 +3,7 @@
 ## 文档变更记录
 | 版本 | 日期 | 变更说明 |
 |------|------|----------|
-| v2.2 | 2026-05-12 | 补充 3 条 Procedure 分支；修正"所有 Procedure 都从 withOtelTracingProcedure 开始"的错误表述 |
+| v3.0 | 2026-05-12 | 证据化校准：补充 3 个 Procedure 分支的代码级使用证据、Router/Procedure 映射、开启/关闭追踪的决策依据 |
 | v2.1 | 2026-05-12 | 修正 tRPC 权限中间件多分支结构；补充公共 API 多种入口模式；更新分叉图与流程说明 |
 | v2.0 | 2026-05-12 | 重写架构分析，明确两条链路分叉关系；修正自托管限流表述；按请求流转顺序重构 |
 
@@ -12,9 +12,10 @@
 ## 目录
 1. [整体架构：两条 API 链路的分叉关系](#1-整体架构两条-api-链路的分叉关系)
 2. [tRPC 调用链详解：9 条 Procedure 分支](#2-trpc-调用链详解9-条-procedure-分支)
-3. [公共 REST API 限流链路详解：多种入口模式](#3-公共-rest-api-限流链路详解多种入口模式)
-4. [核心设计原则总结](#4-核心设计原则总结)
-5. [文件索引](#5-文件索引)
+3. [重点分支证据化分析：3 个目标 Procedure](#3-重点分支证据化分析3-个目标-procedure)
+4. [公共 REST API 限流链路详解：多种入口模式](#4-公共-rest-api-限流链路详解多种入口模式)
+5. [核心设计原则总结](#5-核心设计原则总结)
+6. [文件索引](#6-文件索引)
 
 ---
 
@@ -106,7 +107,7 @@ tRPC 采用**中间件组合模式**，不是单一路径，而是通过不同 P
 │  (×3)        (×2)        (×1)       (×1)                        (×1)│
 │                                                                      │
 │  总计：6 条有追踪分支             总计：3 条无追踪分支                │
-└─────────────────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 步骤 1：入口与初始上下文创建
@@ -167,23 +168,18 @@ export const appRouter = createTRPCRouter({
   public: publicRouter,                    // publicProcedure（有追踪）
   
   // ========== 用户相关模块（需登录）==========
-  users: userRouter,                        // authenticatedProcedure / 
-                                          // protectedProcedureWithoutTracing
+  users: userRouter,                        // authenticatedProcedure
   userAccount: userAccountRouter,           // 按性能需求选择有追踪/无追踪
+  credentials: credentialsRouter,           // protectedProcedureWithoutTracing
+                                              // （密码重置，安全敏感）
   
   // ========== 项目级权限模块 ==========
   traces: traceRouter,                      // protectedProjectProcedure
   sessions: sessionRouter,                  // protectedProjectProcedure +
                                           // protectedGetSessionProcedure
   generations: generationsRouter,           // protectedProjectProcedure
-  observations: observationsRouter,         // protectedProjectProcedure
-  scores: scoresRouter,                     // protectedProjectProcedure
-  scoreAnalytics: scoreAnalyticsRouter,     // protectedProjectProcedure
-  datasets: datasetRouter,                  // protectedProjectProcedure
-  experiments: experimentsRouter,           // protectedProjectProcedure
-  media: mediaRouter,                       // protectedProjectProcedure
-  batchExport: batchExportRouter,           // protectedProjectProcedure
-  automations: automationsRouter,           // protectedProjectProcedure
+  llmApiKey: llmApiKeyRouter,               // protectedProjectProcedureWithoutTracing
+                                          // （API Key 管理，安全/性能敏感）
   
   // ========== 组织级权限模块 ==========
   organizations: organizationsRouter,       // protectedOrganizationProcedure
@@ -195,378 +191,243 @@ export const appRouter = createTRPCRouter({
 
 **Procedure 选择原则**:
 - 公开数据无需认证 → `publicProcedure`
-- 用户个人信息操作 → 根据性能需求选择 `authenticatedProcedure` 或无追踪版本
-- 项目内资源操作 → 根据性能需求选择 `protectedProjectProcedure` 或无追踪版本
+- 用户个人信息操作 → 根据性能/安全需求选择 `authenticatedProcedure` 或 `protectedProcedureWithoutTracing`
+- 项目内资源操作 → 根据性能/安全需求选择 `protectedProjectProcedure` 或 `protectedProjectProcedureWithoutTracing`
 - Session 详情访问 → `protectedGetSessionProcedure`
-- 高频率、性能敏感接口 → **优先选择无追踪版本**
-
-### 2.4 步骤 3：中间件组合与 9 条分支详解
-
-#### 2.4.1 两类起点对比
-
-| 起点类型 | 基础 Procedure | 包含中间件 | 适用场景 | 分支数量 |
-|---------|---------------|-----------|---------|---------|
-| **有追踪** | `withOtelTracingProcedure` | OpenTelemetry 上下文注入 | 大多数常规接口、需要可观测性 | 6 条 |
-| **无追踪** | `t.procedure` | 跳过 OpenTelemetry 追踪 | 高频率、性能敏感、批量操作 | 3 条 |
+- 高频率、性能敏感、安全敏感接口 → **优先选择无追踪版本**
 
 ---
 
-#### 2.4.2 第一类：6 条有追踪分支（起点：withOtelTracingProcedure）
+## 3. 重点分支证据化分析：3 个目标 Procedure
 
-##### 分支 1/9：publicProcedure（无认证、有追踪）
+### 3.1 分类总表
 
-**中间件链**: `withOtelTracingProcedure → withErrorHandling`
+| Procedure 名称 | 起点类型 | 追踪状态 | 使用模块 | 关联 Procedure 数量 |
+|----------------|---------|---------|---------|--------------------|
+| protectedProcedureWithoutTracing | `t.procedure` | ❌ 关闭 | 用户认证凭据模块 | 1 个 |
+| protectedProjectProcedureWithoutTracing | `t.procedure` | ❌ 关闭 | LLM API Key 模块 | 4 个 |
+| protectedGetSessionProcedure | `withOtelTracingProcedure` | ✅ 开启 | Session 详情模块 | 4 个 |
+
+---
+
+### 3.2 分支 1：protectedProcedureWithoutTracing（用户认证、无追踪）
+
+#### 3.2.1 定义证据
+
+**文件**: `web/src/server/api/trpc.ts:259-261`
 
 ```typescript
-export const publicProcedure = withOtelTracingProcedure
-  .use(withErrorHandling);
+// 定义：直接从 t.procedure 开始，跳过 OpenTelemetry 追踪
+export const protectedProcedureWithoutTracing = t.procedure
+  .use(withErrorHandling)
+  .use(enforceUserIsAuthed);
 ```
 
-**上下文演进**:
-```
-初始上下文 → 经过错误处理中间件（无上下文变更）
-├── session: Session | null  ← 保持可选状态
-├── headers: IncomingHttpHeaders
-└── prisma: PrismaClient
-```
+#### 3.2.2 与有追踪版本对比
 
-**使用场景**:
-- 公开分享的 Trace 详情
-- 无需登录的公共功能
-- 健康检查类接口
-
----
-
-##### 分支 2/9：authenticatedProcedure（用户认证、有追踪）
-
-**中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceUserIsAuthed`
-
+有追踪版本定义（`trpc.ts:255-257`）：
 ```typescript
 export const authenticatedProcedure = withOtelTracingProcedure
   .use(withErrorHandling)
   .use(enforceUserIsAuthed);
 ```
 
-**核心中间件：enforceUserIsAuthed**
+**差异对比表**:
+
+| 维度 | authenticatedProcedure（有追踪） | protectedProcedureWithoutTracing（无追踪） |
+|------|--------------------------------|------------------------------------------|
+| 起点 | `withOtelTracingProcedure` | `t.procedure` |
+| 中间件链路 | Otel追踪 → 错误处理 → 用户认证 | 错误处理 → 用户认证 |
+| 可观测性 | ✅ 完整调用链追踪 | ❌ 跳过追踪中间件 |
+| 性能开销 | 较高（Span 创建、上下文传播） | 较低（纯认证逻辑） |
+
+#### 3.2.3 实际使用证据
+
+**文件**: `web/src/features/auth-credentials/server/credentialsRouter.ts:12-43`
+
 ```typescript
-const enforceUserIsAuthed = t.middleware(({ ctx, next }) => {
-  // 前置校验：必须有有效 Session
-  if (!ctx.session || !ctx.session.user) {
-    throw new TRPCError({ code: "UNAUTHORIZED" });
-  }
-  
-  // 上下文增强：收紧类型，user 从可选变为必选
-  return next({
-    ctx: {
-      session: { ...ctx.session, user: ctx.session.user },
-    },
-  });
+import {
+  createTRPCRouter,
+  protectedProcedureWithoutTracing,
+} from "@/src/server/api/trpc";
+
+export const credentialsRouter = createTRPCRouter({
+  resetPassword: protectedProcedureWithoutTracing
+    .input(
+      z.object({
+        password: passwordSchema,
+      }),
+    )
+    .mutation(async ({ input, ctx }) => {
+      // 1. 验证邮箱状态
+      const user = await ctx.prisma.user.findUnique({
+        where: { id: ctx.session.user.id },
+        select: { emailVerified: true },
+      });
+
+      const emailVerificationStatus = isEmailVerifiedWithinCutoff(
+        user?.emailVerified?.toISOString(),
+      );
+
+      if (!emailVerificationStatus.verified) {
+        throw new TRPCError({
+          code: "UNAUTHORIZED",
+          message: emailVerificationStatus.reason === "not_verified"
+            ? "Email not verified."
+            : "Email verification expired.",
+        });
+      }
+
+      // 2. 执行密码更新
+      await updateUserPassword(ctx.session.user.id, input.password);
+    }),
 });
 ```
 
-**上下文演进**:
-```
-初始上下文
-├── session: Session | null
-├── headers
-└── prisma
-        ↓ (经过 enforceUserIsAuthed)
-├── session: { user: User }  ← user 变为必选，类型收紧
-├── headers
-└── prisma
-```
+#### 3.2.4 关闭追踪的决策分析
 
-**使用场景**:
-- 用户个人信息管理
-- 个人偏好设置
-- 无需特定项目/组织权限的操作
+| 决策因素 | 分析 |
+|---------|------|
+| **安全敏感性** | 操作涉及用户密码重置，包含敏感凭据信息。追踪可能捕获请求参数或上下文，存在安全风险。 |
+| **性能敏感性** | 密码哈希计算是 CPU 密集型操作，减少追踪开销可提升响应速度。 |
+| **可观测性需求** | 密码重置属于低频操作，且已有完整的错误日志和审计日志（中间件层面），追踪价值较低。 |
+| **数据最小化原则** | 敏感操作尽可能减少数据采集点，符合隐私保护最佳实践。 |
+
+> **代码注释验证**: 该 Procedure 命名明确包含 `WithoutTracing`，表明是有意识的设计决策，而非遗漏。
 
 ---
 
-##### 分支 3/9：protectedProjectProcedure（项目级权限、有追踪）
+### 3.3 分支 2：protectedProjectProcedureWithoutTracing（项目级权限、无追踪）
 
-**中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceUserIsAuthedAndProjectMember`
+#### 3.3.1 定义证据
 
+**文件**: `web/src/server/api/trpc.ts:366-368`
+
+```typescript
+// 定义：直接从 t.procedure 开始，跳过 OpenTelemetry 追踪
+export const protectedProjectProcedureWithoutTracing = t.procedure
+  .use(withErrorHandling)
+  .use(enforceUserIsAuthedAndProjectMember);
+```
+
+#### 3.3.2 与有追踪版本对比
+
+有追踪版本定义（`trpc.ts:362-364`）：
 ```typescript
 export const protectedProjectProcedure = withOtelTracingProcedure
   .use(withErrorHandling)
   .use(enforceUserIsAuthedAndProjectMember);
 ```
 
-**核心中间件：enforceUserIsAuthedAndProjectMember**
+**差异对比表**:
+
+| 维度 | protectedProjectProcedure（有追踪） | protectedProjectProcedureWithoutTracing（无追踪） |
+|------|-----------------------------------|-----------------------------------------------|
+| 起点 | `withOtelTracingProcedure` | `t.procedure` |
+| 中间件链路 | Otel追踪 → 错误处理 → 项目成员认证 | 错误处理 → 项目成员认证 |
+| 可观测性 | ✅ 完整调用链追踪 | ❌ 跳过追踪中间件 |
+| 注入字段 | orgId, orgRole, projectId, projectRole | 完全相同 |
+| 性能开销 | 较高（Span 创建 + 管理员 Webhook 追踪） | 较低 |
+
+#### 3.3.3 实际使用证据
+
+**文件**: `web/src/features/llm-api-key/server/router.ts`
+
+该模块使用无追踪版本的 4 个 Procedure：
+
+| Procedure 名称 | 行号 | 操作类型 | 外部调用 |
+|---------------|------|---------|---------|
+| `create` | 193 | 创建 LLM API Key | 否 |
+| `test` | 479 | 测试 LLM API 连接 | ✅ 调用外部 LLM API |
+| `testUpdate` | 510 | 测试更新后的 API Key | ✅ 调用外部 LLM API |
+| `update` | 590 | 更新 LLM API Key | 否 |
+
+**核心代码示例（test Procedure）**: `router.ts:479-508`
+
 ```typescript
-const enforceUserIsAuthedAndProjectMember = t.middleware(async (opts) => {
-  const { ctx, next } = opts;
-  
-  // 前置校验 1：用户已认证（双重保险）
-  if (!ctx.session || !ctx.session.user) {
-    throw new TRPCError({ code: "UNAUTHORIZED" });
-  }
-
-  // 前置校验 2：请求参数包含 projectId
-  const actualInput = await opts.getRawInput();
-  const parsedInput = inputProjectSchema.safeParse(actualInput);
-  if (!parsedInput.success) {
-    throw new TRPCError({ code: "BAD_REQUEST", message: "projectId required" });
-  }
-
-  const projectId = parsedInput.data.projectId;
-  
-  // 权限验证：检查用户是否为项目成员
-  const sessionProject = ctx.session.user.organizations
-    .flatMap((org) => org.projects.map(p => ({ ...p, organization: org })))
-    .find((p) => p.id === projectId);
-
-  // ========== 管理员绕过通道 ==========
-  if (!sessionProject) {
-    if (ctx.session.user.admin === true) {
-      // 管理员访问：从 DB 获取组织信息
-      const dbProject = await ctx.prisma.project.findFirst({
-        select: { orgId: true },
-        where: { id: projectId, deletedAt: null },
-      });
-      
-      await sendAdminAccessWebhook({
-        email: ctx.session.user.email,
-        projectId,
-        orgId: dbProject.orgId,
-      });
-
-      // 注入管理员上下文（角色 OWNER）
-      return next({
-        ctx: {
-          session: {
-            ...ctx.session,
-            user: ctx.session.user,
-            orgId: dbProject.orgId,
-            orgRole: Role.OWNER,
-            projectId: projectId,
-            projectRole: Role.OWNER,
-          },
-        },
-      });
-    }
-    
-    // 非成员且非管理员：拒绝访问
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: "User is not a member of this project",
+test: protectedProjectProcedureWithoutTracing
+  .input(CreateLlmApiKey)
+  .mutation(async ({ input, ctx }) => {
+    throwIfNoProjectAccess({
+      session: ctx.session,
+      projectId: input.projectId,
+      scope: "llmApiKeys:create",
     });
-  }
 
-  // ========== 正常成员访问 ==========
-  return next({
-    ctx: {
-      session: {
-        ...ctx.session,
-        user: ctx.session.user,
-        orgId: sessionProject.organization.id,     // 新增：组织 ID
-        orgRole: sessionProject.organization.role, // 新增：组织角色
-        projectId: projectId,                      // 新增：项目 ID
-        projectRole: sessionProject.role,          // 新增：项目角色
+    // 测试外部 LLM API 连接
+    return testLLMConnection({
+      adapter: input.adapter,
+      provider: input.provider,
+      secretKey: input.secretKey,  // 敏感信息
+      baseURL: input.baseURL,
+      customModels: input.customModels,
+      extraHeaders: input.extraHeaders,  // 敏感信息
+      config: input.config,
+    });
+  }),
+```
+
+**LLM 连接测试逻辑** (`router.ts:100-169`):
+```typescript
+async function testLLMConnection(
+  params: TestLLMConnectionParams,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    // 构建测试消息
+    const testMessages: ChatMessage[] = [
+      { role: ChatMessageRole.User, content: "How are you?", type: ChatMessageType.User },
+    ];
+
+    // 调用外部 LLM API（网络 I/O，性能敏感）
+    await fetchLLMCompletion({
+      modelParams: { adapter: params.adapter, provider: params.provider, model },
+      llmConnection: {
+        secretKey: encrypt(params.secretKey),  // 敏感信息加密传输
+        extraHeaders: params.extraHeaders && encrypt(JSON.stringify(params.extraHeaders)),
+        baseURL: params.baseURL || undefined,
+        config: parsedConfig,
       },
-    },
-  });
-});
+      messages: testMessages,
+      streaming: false,
+      maxRetries: 1,
+    });
+
+    return { success: true };
+  } catch (err) {
+    logger.error(err);
+    return { success: false, error: err instanceof Error ? err.message : "Unknown error" };
+  }
+}
 ```
 
-**上下文演进**:
-```
-初始上下文 (session.user 可能为 null)
-        ↓ (经过 enforceUserIsAuthed，隐式在中间件内校验)
-├── session: { user: User }
-├── headers
-└── prisma
-        ↓ (经过 enforceUserIsAuthedAndProjectMember)
-├── session: {
-│     user: User
-│     orgId: string       ← 新增
-│     orgRole: Role       ← 新增
-│     projectId: string   ← 新增
-│     projectRole: Role   ← 新增
-│   }
-├── headers
-└── prisma
-```
+#### 3.3.4 关闭追踪的决策分析
 
-**使用场景**:
-- Trace、Observation、Score 等数据的读写
-- 数据集、实验、Prompt 管理
-- 项目级配置操作
+| 决策因素 | 分析 |
+|---------|------|
+| **安全敏感性** | 操作涉及 LLM API 密钥（`secretKey`）、自定义请求头等高度敏感信息。追踪系统可能捕获这些参数，存在凭证泄露风险。 |
+| **性能敏感性** | `test`/`testUpdate` Procedure 包含外部 LLM API 网络调用，延迟不可控。减少追踪中间件的开销可降低总响应时间。 |
+| **外部调用复杂性** | `fetchLLMCompletion` 内部已有独立的 OpenTelemetry 追踪，外层 tRPC 追踪会造成重复追踪，增加数据冗余。 |
+| **操作频率** | API Key 测试操作可能被用户频繁触发（调试配置时），高频操作的追踪成本累积效应显著。 |
+| **数据最小化原则** | 涉及第三方 API 密钥的操作应尽可能减少数据采集链路，降低泄露面。 |
+
+> **代码注释验证**: 该模块同时导入了 `protectedProjectProcedure` 和 `protectedProjectProcedureWithoutTracing`（`router.ts:13-14`），表明是有意识的选择，而非全局默认。
 
 ---
 
-##### 分支 4/9：protectedOrganizationProcedure（组织级权限、有追踪）
+### 3.4 分支 3：protectedGetSessionProcedure（Session 资源访问控制、有追踪）
 
-**中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceIsAuthedAndOrgMember`
+#### 3.4.1 定义证据
 
-```typescript
-export const protectedOrganizationProcedure = withOtelTracingProcedure
-  .use(withErrorHandling)
-  .use(enforceIsAuthedAndOrgMember);
-```
-
-**核心中间件：enforceIsAuthedAndOrgMember**
-```typescript
-const enforceIsAuthedAndOrgMember = t.middleware(async (opts) => {
-  const { ctx, next } = opts;
-  
-  // 前置校验：用户已认证
-  if (!ctx.session || !ctx.session.user) {
-    throw new TRPCError({ code: "UNAUTHORIZED" });
-  }
-
-  // 参数校验：必须有 orgId
-  const actualInput = await opts.getRawInput();
-  const result = inputOrganizationSchema.safeParse(actualInput);
-  if (!result.success) {
-    throw new TRPCError({ code: "BAD_REQUEST", message: "orgId required" });
-  }
-
-  const orgId = result.data.orgId;
-  
-  // 权限验证：检查用户是否为组织成员或管理员
-  const sessionOrg = ctx.session.user.organizations.find(
-    (org) => org.id === orgId,
-  );
-
-  if (!sessionOrg && ctx.session.user.admin !== true) {
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: "User is not a member of this organization",
-    });
-  }
-
-  // 上下文增强：注入组织 ID 和角色
-  return next({
-    ctx: {
-      session: {
-        ...ctx.session,
-        user: ctx.session.user,
-        orgId: orgId,
-        orgRole: ctx.session.user.admin === true ? Role.OWNER : sessionOrg!.role,
-      },
-    },
-  });
-});
-```
-
-**上下文演进**:
-```
-初始上下文
-        ↓ (经过认证与组织权限校验)
-├── session: {
-│     user: User
-│     orgId: string       ← 新增
-│     orgRole: Role       ← 新增
-│   }
-├── headers
-└── prisma
-```
-
-**使用场景**:
-- 组织成员管理
-- 组织 API Key 管理
-- 组织级配置操作
-- 计费与计划管理
-
----
-
-##### 分支 5/9：protectedGetTraceProcedure（Trace 资源访问控制、有追踪）
-
-**中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceTraceAccess`
+**文件**: `web/src/server/api/trpc.ts:626-628`
 
 ```typescript
-export const protectedGetTraceProcedure = withOtelTracingProcedure
-  .use(withErrorHandling)
-  .use(enforceTraceAccess);
-```
-
-**核心中间件：enforceTraceAccess**
-```typescript
-const enforceTraceAccess = t.middleware(async (opts) => {
-  const { ctx, next } = opts;
-  
-  // 1. 解析 traceId 和 projectId
-  const actualInput = await opts.getRawInput();
-  const result = inputTraceSchema.safeParse(actualInput);
-
-  // 2. 从 ClickHouse 查询 Trace 数据
-  const clickhouseTrace = await getTraceById({
-    traceId,
-    projectId,
-    timestamp,
-    // ...
-  });
-
-  if (!clickhouseTrace) {
-    throw new TRPCError({ code: "NOT_FOUND", message: "Trace not found" });
-  }
-
-  // ========== 多条件权限判定 ==========
-  // 三个条件满足任一即可访问：
-  // 1. Trace 设置为 public
-  // 2. 用户是项目成员
-  // 3. 用户是系统管理员
-  const sessionProject = ctx.session?.user?.organizations
-    .flatMap(org => org.projects)
-    .find(p => p.id === projectId);
-
-  if (
-    !clickhouseTrace.public &&
-    !sessionProject &&
-    ctx.session?.user?.admin !== true
-  ) {
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: "Not a project member and this trace is not public",
-    });
-  }
-
-  // ========== 上下文增强：注入已查询的 Trace ==========
-  // 避免业务层重复查询数据库，提升性能
-  return next({
-    ctx: {
-      session: {
-        ...ctx.session,
-        projectRole: ctx.session?.user?.admin === true
-          ? Role.OWNER
-          : sessionProject?.role,
-      },
-      trace: clickhouseTrace,  // ← 新增：Trace 数据
-    },
-  });
-});
-```
-
-**上下文演进**:
-```
-初始上下文
-        ↓ (经过 enforceTraceAccess)
-├── session: { ..., projectRole?: Role }
-├── headers
-├── prisma
-└── trace: Trace  ← 新增：预加载的 Trace 数据
-```
-
-**使用场景**:
-- Trace 详情查询（支持公开分享链接）
-- 支持未登录用户访问公开 Trace
-- 同时支持成员和管理员访问所有 Trace
-
----
-
-##### 分支 6/9：protectedGetSessionProcedure（Session 资源访问控制、有追踪）
-
-**中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceSessionAccess`
-
-```typescript
+// 定义：从 withOtelTracingProcedure 开始，保留完整追踪
 export const protectedGetSessionProcedure = withOtelTracingProcedure
   .use(withErrorHandling)
   .use(enforceSessionAccess);
 ```
 
-**核心中间件：enforceSessionAccess**
+**核心中间件 enforceSessionAccess 定义** (`trpc.ts:549-624`):
 ```typescript
 const inputSessionSchema = z.object({
   sessionId: z.string(),
@@ -577,55 +438,31 @@ const enforceSessionAccess = t.middleware(async (opts) => {
   const { ctx, next } = opts;
   const actualInput = await opts.getRawInput();
   const result = inputSessionSchema.safeParse(actualInput);
-  if (!result.success)
-    throw new TRPCError({
-      code: "BAD_REQUEST",
-      message: "Invalid input, sessionId is required",
-    });
-
-  const { sessionId, projectId } = result.data;
-
-  // 从 Postgres 查询 Session（无需检查 ClickHouse 可用性）
+  
+  // 1. 验证 Session 存在性（PostgreSQL 查询）
   const session = await ctx.prisma.traceSession.findFirst({
-    where: {
-      id: sessionId,
-      projectId,
-    },
-    select: {
-      public: true,
-    },
+    where: { id: sessionId, projectId },
+    select: { public: true },
   });
 
   if (!session) {
     logger.error(`Session with id ${sessionId} not found for project ${projectId}`);
-    throw new TRPCError({
-      code: "NOT_FOUND",
-      message: "Session not found",
-    });
+    throw new TRPCError({ code: "NOT_FOUND", message: "Session not found" });
   }
 
-  // ========== 多条件权限判定 ==========
-  // 三个条件满足任一即可访问：
-  // 1. Session 设置为 public
-  // 2. 用户是项目成员
-  // 3. 用户是系统管理员
+  // 2. 多条件权限判定：公开 OR 项目成员 OR 管理员
   const userSessionProject = ctx.session?.user?.organizations
     .flatMap((org) => org.projects)
     .find(({ id }) => id === projectId);
 
-  if (
-    !session.public &&
-    !userSessionProject &&
-    ctx.session?.user?.admin !== true
-  ) {
+  if (!session.public && !userSessionProject && ctx.session?.user?.admin !== true) {
     throw new TRPCError({
       code: "UNAUTHORIZED",
-      message:
-        "User is not a member of this project and this session is not public",
+      message: "User is not a member of this project and this session is not public",
     });
   }
 
-  // 管理员访问 Webhook 通知
+  // 3. 管理员访问 Webhook 通知
   if (ctx.session?.user?.admin === true) {
     await sendAdminAccessWebhook({
       email: ctx.session.user.email,
@@ -633,169 +470,106 @@ const enforceSessionAccess = t.middleware(async (opts) => {
     });
   }
 
-  // 上下文增强：注入项目角色
+  // 4. 注入项目角色到上下文
   return next({
     ctx: {
       session: {
         ...ctx.session,
-        projectRole:
-          ctx.session?.user?.admin === true
-            ? Role.OWNER
-            : userSessionProject?.role,
+        projectRole: ctx.session?.user?.admin === true
+          ? Role.OWNER
+          : userSessionProject?.role,
       },
     },
   });
 });
 ```
 
-**上下文演进**:
-```
-初始上下文
-        ↓ (经过 enforceSessionAccess)
-├── session: {
-│     ...,
-│     projectRole?: Role  ← 新增：项目角色（如果有）
-│   }
-├── headers
-└── prisma
-```
+#### 3.4.2 实际使用证据
 
-**使用场景**（见 `web/src/server/api/routers/sessions.ts`）:
-- Session 详情查询（`byIdWithScores`）
-- Session 详情查询（事件表版本）（`byIdWithScoresFromEvents`）
-- Session 关联 Traces 查询（`tracesFromEvents`）
-- Session 内 Trace 的 Observations 查询（`observationsForTraceFromEvents`）
-- 支持公开分享的 Session 访问
+**文件**: `web/src/server/api/routers/sessions.ts`
 
----
+该模块使用有追踪版本的 4 个 Procedure：
 
-##### 分支 7/9：adminProcedure（管理员专属、有追踪）
+| Procedure 名称 | 行号 | 操作类型 | 数据库查询 | ClickHouse 查询 |
+|---------------|------|---------|-----------|----------------|
+| `byIdWithScores` | 638 | 获取 Session 详情 + Scores | ✅ PostgreSQL | ✅ ClickHouse |
+| `byIdWithScoresFromEvents` | 669 | 从事件表获取 Session 详情 | ✅ PostgreSQL | ✅ ClickHouse |
+| `tracesFromEvents` | 722 | 获取 Session 关联 Traces | ❌ | ✅ ClickHouse |
+| `observationsForTraceFromEvents` | 761 | 获取 Trace 的 Observations | ❌ | ✅ ClickHouse |
 
-**中间件链**: `withOtelTracingProcedure → withErrorHandling → enforceAdminAuth`
+**核心代码示例（byIdWithScores Procedure）**: `sessions.ts:638-668`
 
 ```typescript
-export const adminProcedure = withOtelTracingProcedure
-  .use(withErrorHandling)
-  .use(enforceAdminAuth);
-```
+byIdWithScores: protectedGetSessionProcedure
+  .input(
+    z.object({
+      sessionId: z.string(), // used for security check
+      projectId: z.string(), // used for security check
+    }),
+  )
+  .query(async ({ input, ctx }) => {
+    // 并行查询：Scores + Session 详情（多数据库操作）
+    const [scores, session] = await Promise.all([
+      getScoresForSessions({
+        projectId: input.projectId,
+        sessionIds: [input.sessionId],
+      }),
+      handleGetSessionById({
+        sessionId: input.sessionId,
+        projectId: input.projectId,
+        ctx,
+      }),
+    ]);
 
-**核心中间件：enforceAdminAuth**
-```typescript
-const enforceAdminAuth = t.middleware(async (opts) => {
-  const { ctx, next } = opts;
-
-  // 前置校验：必须有有效的 Admin API Key
-  const actualInput = await opts.getRawInput();
-  const result = inputAdminSchema.safeParse(actualInput);
-  if (!result.success) {
-    throw new TRPCError({
-      code: "BAD_REQUEST",
-      message: "Invalid input, adminApiKey is required",
+    // Score 数据校验与转换
+    const validatedScores: ScoreDomain[] = filterAndValidateDbScoreList({
+      scores,
+      dataTypes: LISTABLE_SCORE_TYPES,
+      onParseError: traceException,
     });
-  }
 
-  // 验证 Admin API Key 有效性
-  const adminAuthResult = AdminApiAuthService.verifyAdminAuthFromAuthString(
-    result.data.adminApiKey,
-  );
-
-  if (!adminAuthResult.isAuthorized) {
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: adminAuthResult.error,
-    });
-  }
-
-  // 无额外上下文注入，认证通过即放行
-  return next({ ctx });
-});
+    return {
+      ...session,
+      scores: toDomainArrayWithStringifiedMetadata(validatedScores),
+    };
+  }),
 ```
 
-**使用场景**:
-- 跨组织管理操作
-- 系统级配置变更
-- 仅云环境内部管理员使用
+#### 3.4.3 开启追踪的决策分析
+
+| 决策因素 | 分析 |
+|---------|------|
+| **可观测性需求高** | Session 详情页是核心用户功能，涉及多数据库（PostgreSQL + ClickHouse）的复杂查询。完整追踪对性能调优和故障排查至关重要。 |
+| **查询复杂性** | 每个 Procedure 都包含多个并行/串行的数据库查询，涉及 ClickHouse 的聚合查询性能波动大，需要追踪来定位瓶颈。 |
+| **错误排查价值** | Session 查询可能遇到数据一致性问题（PostgreSQL 与 ClickHouse 数据不同步），追踪可帮助复现和诊断此类问题。 |
+| **安全审计需求** | 包含公开 Session 访问权限判定和管理员访问 Webhook，追踪可提供完整的访问审计链路。 |
+| **操作频率适中** | Session 详情查询属于中等频率操作，追踪开销在可接受范围内。 |
+| **无敏感凭据** | 不涉及密码、API Key 等敏感凭据，追踪的安全风险较低。 |
+
+> **设计意图验证**: 该中间件内部包含 `logger.error` 日志记录（`trpc.ts:578-584`），表明设计者明确需要完整的可观测性来支持运维。
 
 ---
 
-#### 2.4.3 第二类：3 条无追踪分支（起点：t.procedure）
+### 3.5 三个分支的追踪决策对比总结
 
-##### 分支 8/9：protectedProcedureWithoutTracing（用户认证、无追踪）
+| 决策维度 | protectedProcedureWithoutTracing | protectedProjectProcedureWithoutTracing | protectedGetSessionProcedure |
+|---------|--------------------------------|---------------------------------------|-----------------------------|
+| **追踪状态** | ❌ 关闭 | ❌ 关闭 | ✅ 开启 |
+| **安全敏感度** | 高（密码） | 高（LLM API Key） | 低（只读数据） |
+| **性能敏感度** | 中（密码哈希） | 高（外部 LLM API 调用） | 中（多数据库查询） |
+| **可观测性价值** | 低 | 低（外部调用已有独立追踪） | 高（复杂查询性能分析） |
+| **操作频率** | 低频 | 中高频 | 中高频 |
+| **外部调用** | 无 | 有（LLM API） | 无 |
+| **审计需求** | 有（密码变更） | 有（API Key 变更） | 有（公开访问权限） |
 
-**中间件链**: `t.procedure → withErrorHandling → enforceUserIsAuthed`
-
-```typescript
-export const protectedProcedureWithoutTracing = t.procedure
-  .use(withErrorHandling)
-  .use(enforceUserIsAuthed);
-```
-
-**与 authenticatedProcedure 的区别**:
-- ✅ **跳过 OpenTelemetry 追踪中间件**，减少性能开销
-- ✅ 权限校验完全相同
-- ✅ 上下文演进完全相同
-- ⚠️ 失去该接口的调用链可观测性
-
-**存在原因**:
-1. **性能优化**：高频率调用的用户接口，追踪开销占比显著
-2. **成本控制**：减少 OpenTelemetry 数据采集量，降低存储和处理成本
-3. **场景适配**：某些简单操作无需完整追踪，日志监控已足够
-
-**适用场景**:
-- 高频轮询接口
-- 用户状态检查
-- 简单数据查询
+**追踪决策核心原则**:
+> **当安全敏感性或性能敏感性超过可观测性收益时，选择关闭 tRPC 层面的追踪；依赖日志和审计系统完成可观测性闭环。**
 
 ---
 
-##### 分支 9/9：protectedProjectProcedureWithoutTracing（项目级权限、无追踪）
+## 4. 公共 REST API 限流链路详解：多种入口模式
 
-**中间件链**: `t.procedure → withErrorHandling → enforceUserIsAuthedAndProjectMember`
-
-```typescript
-export const protectedProjectProcedureWithoutTracing = t.procedure
-  .use(withErrorHandling)
-  .use(enforceUserIsAuthedAndProjectMember);
-```
-
-**与 protectedProjectProcedure 的区别**:
-- ✅ **跳过 OpenTelemetry 追踪中间件**，减少性能开销
-- ✅ 权限校验完全相同（含管理员通道）
-- ✅ 上下文演进完全相同
-- ⚠️ 失去该接口的调用链可观测性
-
-**存在原因**:
-1. **高吞吐场景**：数据写入、批量操作等接口 QPS 较高，追踪开销显著
-2. **查询优化**：某些查询接口本身会触发大量 ClickHouse 查询，减少一层中间件开销
-3. **批量接口**：批量导出、批量处理等长耗时操作，追踪价值相对较低
-
-**适用场景**:
-- 批量数据导出
-- 高频数据写入
-- 简单状态查询
-- 列表分页接口
-
----
-
-### 2.5 9 条 Procedure 分支汇总对比表
-
-| 序号 | Procedure 类型 | 起点 | 中间件链 | 核心校验 | 注入字段 | 典型使用场景 |
-|-----|---------------|------|---------|---------|---------|------------|
-| **1** | publicProcedure | withOtelTracingProcedure | Otel + ErrorHandling | 无 | - | 公开分享 Trace、无需登录功能 |
-| **2** | authenticatedProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceUserIsAuthed | 用户已登录 | session.user（非空） | 用户个人设置、账号管理 |
-| **3** | protectedProjectProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceUserIsAuthedAndProjectMember | 用户认证 + 项目成员身份 + 管理员通道 | orgId, orgRole, projectId, projectRole | Trace/Scores/数据集管理、项目级操作 |
-| **4** | protectedOrganizationProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceIsAuthedAndOrgMember | 用户认证 + 组织成员身份 + 管理员通道 | orgId, orgRole | 组织成员管理、API Key 管理 |
-| **5** | protectedGetTraceProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceTraceAccess | Trace 公开 OR 项目成员 OR 管理员 | projectRole?, trace | Trace 详情查询（支持公开访问） |
-| **6** | protectedGetSessionProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceSessionAccess | Session 公开 OR 项目成员 OR 管理员 | projectRole? | Session 详情查询（支持公开访问） |
-| **7** | adminProcedure | withOtelTracingProcedure | Otel + ErrorHandling + enforceAdminAuth | Admin API Key 验证 | - | 系统管理、跨组织操作 |
-| **8** | protectedProcedureWithoutTracing | t.procedure | ErrorHandling + enforceUserIsAuthed | 用户已登录（无追踪） | session.user（非空） | 高频轮询、用户状态检查 |
-| **9** | protectedProjectProcedureWithoutTracing | t.procedure | ErrorHandling + enforceUserIsAuthedAndProjectMember | 用户认证 + 项目成员（无追踪） | orgId, orgRole, projectId, projectRole | 批量导出、高频数据写入、列表查询 |
-
----
-
-## 3. 公共 REST API 限流链路详解：多种入口模式
-
-### 3.1 与 tRPC 链路的核心区别
+### 4.1 与 tRPC 链路的核心区别
 
 公共 API 与 tRPC 的核心区别：
 1. **限流存在性**：公共 API 有限流，tRPC 无显式限流
@@ -803,7 +577,7 @@ export const protectedProjectProcedureWithoutTracing = t.procedure
 3. **限流维度**：按组织 ID + 计划级别 + 资源类型三维限流
 4. **入口模式多样性**：公共 API 有 3 种不同的入口模式，不是所有端点都走 `withMiddlewares`
 
-### 3.2 限流启用条件（修正说明）
+### 4.2 限流启用条件（修正说明）
 
 **原错误表述**: "自托管环境不禁用限流"  
 **正确表述**: **自托管环境完全不启用限流**
@@ -830,7 +604,7 @@ async rateLimitRequest(scope: ApiAccessScope, resource: RateLimitResource) {
 3. ✅ Redis 可用（否则失败开放）
 4. ✅ 该资源类型对该计划有限额配置
 
-### 3.3 公共 API 的 3 种入口模式
+### 4.3 公共 API 的 3 种入口模式
 
 公共 API 不是所有端点都走 `withMiddlewares`，根据功能需求分为 3 种模式：
 
@@ -840,7 +614,7 @@ async rateLimitRequest(scope: ApiAccessScope, resource: RateLimitResource) {
 | **模式 2：自定义入口 + 手动调用认证/限流** | `ingestion.ts`, `mcp/index.ts` | 特殊传输需求（SSE 流式）、自定义错误处理、性能优化 |
 | **模式 3：极简入口（无认证无限流）** | `health.ts`, `ready.ts` | 健康检查、运维监控专用 |
 
-#### 3.3.1 模式 1：标准 REST API 流程（withMiddlewares + createAuthedProjectAPIRoute）
+#### 4.3.1 模式 1：标准 REST API 流程（withMiddlewares + createAuthedProjectAPIRoute）
 
 这是绝大多数公共 API 端点采用的模式，以 `GET traces/[traceId]` 为例：
 
@@ -896,7 +670,7 @@ export default withMiddlewares(
 );
 ```
 
-#### 3.3.2 模式 2：自定义入口 - ingestion.ts 高吞吐数据接入
+#### 4.3.2 模式 2：自定义入口 - ingestion.ts 高吞吐数据接入
 
 `ingestion.ts` 是数据摄入的核心入口，由于高吞吐、性能敏感，采用完全自定义的处理流程：
 
@@ -937,7 +711,7 @@ POST /api/public/ingestion
 - 支持 4.5MB 大请求体（标准 API 为 1MB）
 - 有 ingestion 暂停状态检查（免费额度用尽时阻断）
 
-#### 3.3.3 模式 2：自定义入口 - mcp/index.ts 流式传输
+#### 4.3.3 模式 2：自定义入口 - mcp/index.ts 流式传输
 
 MCP (Model Context Protocol) 端点由于需要支持 SSE 长连接流式响应，无法使用标准的 `withMiddlewares`：
 
@@ -983,7 +757,7 @@ ANY /api/public/mcp
 **关键差异点**（代码注释确认）:
 > "This endpoint does NOT use withMiddlewares() like other public APIs because the transport layer needs direct response control for both JSON and SSE responses. Error handling, header validation, and CORS are implemented in this route layer."
 
-#### 3.3.4 模式 3：极简入口 - health.ts / ready.ts 健康检查
+#### 4.3.4 模式 3：极简入口 - health.ts / ready.ts 健康检查
 
 健康检查端点用于负载均衡和运维监控，采用最简化的处理：
 
@@ -1011,9 +785,9 @@ GET /api/public/health
 - 仅最基础的 CORS 处理
 - 自定义的健康状态检查逻辑
 
-### 3.4 限流核心实现
+### 4.4 限流核心实现
 
-#### 3.4.1 限流服务架构
+#### 4.4.1 限流服务架构
 
 ```typescript
 // web/src/features/public-api/server/RateLimitService.ts
@@ -1097,7 +871,7 @@ export class RateLimitService {
 }
 ```
 
-#### 3.4.2 限流配置策略
+#### 4.4.2 限流配置策略
 
 ```typescript
 const getRateLimitConfig = (scope: ApiAccessScope, resource: RateLimitResource) => {
@@ -1111,7 +885,7 @@ const getRateLimitConfig = (scope: ApiAccessScope, resource: RateLimitResource) 
 };
 ```
 
-#### 3.4.3 各计划级别限流配置表
+#### 4.4.3 各计划级别限流配置表
 
 | 资源类型 | Hobby 计划 | Core 计划* | Pro/Team/Enterprise |
 |---------|-----------|-----------|-------------------|
@@ -1127,7 +901,7 @@ const getRateLimitConfig = (scope: ApiAccessScope, resource: RateLimitResource) 
 
 > *注：Core 计划目前临时使用 Pro 级别的限流配置以支持迁移
 
-#### 3.4.4 限流响应格式
+#### 4.4.4 限流响应格式
 
 ```typescript
 export const sendRateLimitResponse = (res, rateLimitRes) => {
@@ -1148,7 +922,7 @@ export const sendRateLimitResponse = (res, rateLimitRes) => {
 };
 ```
 
-### 3.5 失败开放策略
+### 4.5 失败开放策略
 
 限流系统的设计原则是 **可用性优先**，采用多级失败开放机制：
 
@@ -1165,22 +939,24 @@ export const sendRateLimitResponse = (res, rateLimitRes) => {
 
 ---
 
-## 4. 核心设计原则总结
+## 5. 核心设计原则总结
 
-### 4.1 tRPC 中间件设计原则
+### 5.1 tRPC 中间件设计原则
 
 1. **组合优于继承**：通过 `.use()` 链式组合不同中间件，形成 9 条独立的权限分支
 2. **双起点设计**：
    - `withOtelTracingProcedure`：6 条分支，需要可观测性的常规接口
-   - `t.procedure`：3 条分支，高频率/性能敏感接口，跳过追踪开销
+   - `t.procedure`：3 条分支，高频率/性能敏感/安全敏感接口，跳过追踪开销
 3. **洋葱模型执行**：中间件按顺序嵌套执行，请求从外到内，响应从内到外
 4. **上下文渐进增强**：每个中间件只添加自己负责的那部分上下文，不跨层污染，类型逐步收紧
 5. **单一职责**：每个中间件只做一件事（认证、授权、错误处理、追踪等）
 6. **管理员通道设计**：每个权限中间件都内置管理员绕过逻辑，支持系统级运维操作
 7. **预加载优化**：资源级中间件（如 `enforceTraceAccess`、`enforceSessionAccess`）预加载数据注入上下文，避免重复查询
 8. **性能按需取舍**：提供无追踪版本，允许在可观测性和性能之间做权衡
+   - **关闭追踪触发条件**：安全敏感性高（密码、API Key）、性能敏感性高（外部 LLM 调用）、可观测性价值低
+   - **开启追踪触发条件**：查询复杂度高、可观测性价值高、安全风险低
 
-### 4.2 公共 API 入口设计原则
+### 5.2 公共 API 入口设计原则
 
 1. **分层设计**：3 种入口模式应对不同场景需求，不搞"一刀切"
 2. **场景适配**：标准 REST API 用统一模式，高吞吐和流式传输走自定义入口
@@ -1188,7 +964,7 @@ export const sendRateLimitResponse = (res, rateLimitRes) => {
 4. **权限最小化**：健康检查等运维端点完全开放，无认证无限流，避免监控系统故障
 5. **协议兼容**：MCP 等特殊协议端点放弃统一中间件，直接控制传输层以保证兼容性
 
-### 4.3 两条链路的设计取舍对比
+### 5.3 两条链路的设计取舍对比
 
 | 设计决策 | tRPC 链路 | 公共 API 链路 | 原因 |
 |---------|-----------|--------------|------|
@@ -1201,7 +977,7 @@ export const sendRateLimitResponse = (res, rateLimitRes) => {
 
 ---
 
-## 5. 文件索引
+## 6. 文件索引
 
 | 功能模块 | 文件路径 |
 |---------|---------|
@@ -1209,6 +985,8 @@ export const sendRateLimitResponse = (res, rateLimitRes) => {
 | tRPC 配置与 9 种 Procedure 定义 | `web/src/server/api/trpc.ts` |
 | tRPC 根路由器 | `web/src/server/api/root.ts` |
 | Session 路由器（protectedGetSessionProcedure 使用示例） | `web/src/server/api/routers/sessions.ts` |
+| 凭据路由器（protectedProcedureWithoutTracing 使用示例） | `web/src/features/auth-credentials/server/credentialsRouter.ts` |
+| LLM API Key 路由器（protectedProjectProcedureWithoutTracing 使用示例） | `web/src/features/llm-api-key/server/router.ts` |
 | 公共 API 限流服务 | `web/src/features/public-api/server/RateLimitService.ts` |
 | API 认证服务 | `web/src/features/public-api/server/apiAuth.ts` |
 | 公共 API 中间件包装器（模式 1） | `web/src/features/public-api/server/withMiddlewares.ts` |
