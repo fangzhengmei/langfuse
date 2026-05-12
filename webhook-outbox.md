@@ -347,22 +347,6 @@ await prisma.$transaction(async (tx) => {
 | 4 次 | ✅ 触发 |
 | 5 次及以上 | ✅ 已禁用 |
 
-if (consecutiveFailures >= 4) {
-  // 禁用触发器，停止后续事件触发
-  await tx.trigger.update({
-    where: { id: automation.trigger.id, projectId },
-    data: { status: JobConfigState.INACTIVE },
-  });
-
-  // 记录最后一次失败的 executionId 用于排查
-  await setActionLastFailingExecutionId({ tx, actionId, projectId, executionId });
-
-  logger.warn(
-    `Automation ${automation.trigger.id} disabled after ${consecutiveFailures} consecutive failures`,
-  );
-}
-```
-
 ### 5.4 状态流转图
 
 ```
@@ -459,7 +443,7 @@ WHERE status = 'PENDING'
 | BullMQ attempts | 5 | `webhookQueue.ts:34` | 队列层最大重试次数 |
 | BullMQ backoff delay | 5000ms | `webhookQueue.ts:37` | 队列层初始退避延迟 |
 | HTTP backOff attempts | 4 | `webhooks.ts:221` | 请求内重试次数 |
-| 连续失败熔断阈值 | 4 | `webhooks.ts:294` | 连续失败后禁用触发器 |
+| 连续失败熔断阈值 | 4 | `webhooks.ts:294` | 累计连续失败 >=4 次（含当前失败）触发禁用 |
 | 签名算法 | HMAC-SHA256 | `signature.ts:31` | 签名算法 |
 | 时间戳精度 | 秒 | `signature.ts:38` | 签名时间戳精度 |
 | 重试触发错误类型 | 2 种 | `webhooks.ts:245-247` | 仅 NotFound 和 InternalServerError 触发队列重试 |
