@@ -868,38 +868,50 @@ const usage_details = {
 
 ### 7.5 路径 4：用户提供部分成本字段
 
-这是最复杂的回退逻辑，**7 种组合场景详解**：
+这是最复杂的回退逻辑，**7 种组合场景详解**。
+
+**核心公式再确认**（`IngestionService/index.ts:1300-1306`）：
+```typescript
+const finalTotalCost =
+  provided_cost_details?.["total"] ??
+  // 关键：只要所有提供的键都在 {input, output} 中（即使只有一个），就进入推导
+  (providedCostKeys.every((key) => ["input", "output"].includes(key))
+    ? (provided_cost_details?.["input"] ?? 0) + (provided_cost_details?.["output"] ?? 0)
+    : undefined);
+```
+
+> **修正后的理解**：`every()` 检查的是"用户提供的所有键是否都在白名单中"，而不是"用户必须提供所有白名单键"。
+
+---
 
 #### 场景 4.1：只提供 input，不提供 output/total
 
 **输入**：
 ```typescript
 provided_cost_details = { input: 0.01 }
-usageUnits = { input: 100, output: 200, total: 300 }
-modelPrices = [ { usageType: "input", price: 0.0001 }, ... ]
 ```
 
 **处理逻辑**：
 ```typescript
-providedCostKeys = ["input"]  // ← 长度 > 0，进入用户提供优先模式
+providedCostKeys = ["input"]
 
-// 检查是否只提供了 input + output？
+// 检查：用户提供的所有键是否都在 {input, output} 中？
 providedCostKeys.every(key => ["input", "output"].includes(key))
-// → ["input"].every(...) = true，但不是两个都提供
+// → ["input"].every(...) = true ✅
 
-finalTotalCost = provided_cost_details["total"] ?? (检查不通过 ? ... : undefined)
-// → undefined
+// 推导公式：input ?? 0 + output ?? 0
+finalTotalCost = 0.01 + 0 = 0.01
 ```
 
 **输出**：
 ```typescript
 {
-  cost_details: { input: 0.01 },  // ← 原样保留用户提供的
-  total_cost: undefined           // ← 不会用自动计算的成本！
+  cost_details: { input: 0.01, total: 0.01 },  // ← total 被自动写回！
+  total_cost: 0.01
 }
 ```
 
-**关键点**：`output` 和 `total` 不会被自动计算——用户只要提供了 ANY 字段，其他字段全部放弃自动计算。
+> **关键点**：只提供 input 时，系统会推导 total = input，并写回 cost_details.total。之前的"undefined"结论是错误的。
 
 ---
 
@@ -910,11 +922,19 @@ finalTotalCost = provided_cost_details["total"] ?? (检查不通过 ? ... : unde
 provided_cost_details = { output: 0.02 }
 ```
 
+**处理逻辑**：
+```typescript
+providedCostKeys = ["output"]
+
+// 检查：output 在白名单中 → true
+finalTotalCost = 0 + 0.02 = 0.02
+```
+
 **输出**：
 ```typescript
 {
-  cost_details: { output: 0.02 },
-  total_cost: undefined
+  cost_details: { output: 0.02, total: 0.02 },  // ← total 被自动写回！
+  total_cost: 0.02
 }
 ```
 
@@ -927,6 +947,15 @@ provided_cost_details = { output: 0.02 }
 provided_cost_details = { total: 0.03 }
 ```
 
+**处理逻辑**：
+```typescript
+providedCostKeys = ["total"]
+
+// 检查：total 不在 {input, output} 白名单中 → false
+finalTotalCost = provided_cost_details["total"] ?? (false ? ... : undefined)
+// → 0.03（直接使用用户提供的 total，不进入推导分支）
+```
+
 **输出**：
 ```typescript
 {
@@ -937,7 +966,7 @@ provided_cost_details = { total: 0.03 }
 
 ---
 
-#### 场景 4.4：提供 input + output，不提供 total（唯一会自动推导的场景！）
+#### 场景 4.4：提供 input + output，不提供 total
 
 **输入**：
 ```typescript
@@ -948,9 +977,8 @@ provided_cost_details = { input: 0.01, output: 0.02 }
 ```typescript
 providedCostKeys = ["input", "output"]
 
-// 检查是否只提供了这两个？→ YES
-finalTotalCost = undefined ?? (true ? 0.01 + 0.02 : undefined)
-// → 0.03
+// 检查：所有键都在白名单中 → true
+finalTotalCost = 0.01 + 0.02 = 0.03
 ```
 
 **输出**：
@@ -961,8 +989,6 @@ finalTotalCost = undefined ?? (true ? 0.01 + 0.02 : undefined)
 }
 ```
 
-> **唯一例外**：这是整个系统中**唯一**会"自动补充"用户未提供字段的场景。
-
 ---
 
 #### 场景 4.5：提供 input + total，不提供 output
@@ -972,15 +998,24 @@ finalTotalCost = undefined ?? (true ? 0.01 + 0.02 : undefined)
 provided_cost_details = { input: 0.01, total: 0.03 }
 ```
 
+**处理逻辑**：
+```typescript
+providedCostKeys = ["input", "total"]
+
+// 检查：total 不在白名单中 → false
+// 不会进入推导分支，直接使用用户提供的 total
+finalTotalCost = 0.03
+```
+
 **输出**：
 ```typescript
 {
-  cost_details: { input: 0.01, total: 0.03 },  // ← output 不会被计算
+  cost_details: { input: 0.01, total: 0.03 },  // ← output 不会被反推
   total_cost: 0.03
 }
 ```
 
-> output 字段不会从 total - input 反推——系统不会做任何"智能"推导。
+> **设计原则**：output 字段不会从 total - input 反推——系统不会做任何"智能"反向推导。
 
 ---
 
@@ -1001,10 +1036,7 @@ provided_cost_details = { input: 0.01, search: 0.005 }
 ```typescript
 providedCostKeys = ["input", "search"]
 
-// 检查是否只提供了 input + output？
-providedCostKeys.every(key => ["input", "output"].includes(key))
-// → "search" 不在列表中 → 返回 false
-
+// 检查：search 不在 {input, output} 白名单中 → false
 finalTotalCost = undefined  // ← 不会推导 total
 ```
 
@@ -1017,6 +1049,32 @@ finalTotalCost = undefined  // ← 不会推导 total
 ```
 
 > **设计优点**：系统支持任意自定义成本字段，不会因为字段不认识就拒绝或报错。
+
+---
+
+### 7.6 提供字段组合真值表（新增！）
+
+以下是所有 12 种可能输入组合的完整真值表，逐条对齐源码分支：
+
+| # | 提供的字段 | every() 检查结果 | finalTotalCost 计算 | cost_details 最终字段 | total_cost |
+|---|-----------|-----------------|---------------------|---------------------|-----------|
+| 1 | 无（空对象） | 不进入分支 | 走自动计算模式 | 取决于自动计算 | 取决于自动计算 |
+| 2 | `{ input }` | **true** | input + 0 = input | `{ input, total }` | input |
+| 3 | `{ output }` | **true** | 0 + output = output | `{ output, total }` | output |
+| 4 | `{ total }` | false（total 不在白名单） | 直接取 total | `{ total }` | total |
+| 5 | `{ input, output }` | **true** | input + output | `{ input, output, total }` | input+output |
+| 6 | `{ input, total }` | false（total 不在白名单） | 直接取 total | `{ input, total }` | total |
+| 7 | `{ output, total }` | false（total 不在白名单） | 直接取 total | `{ output, total }` | total |
+| 8 | `{ input, output, total }` | **true** | 直接取用户提供的 total | `{ input, output, total }` | total |
+| 9 | `{ search }` | false | undefined | `{ search }` | undefined |
+| 10 | `{ input, search }` | false | undefined | `{ input, search }` | undefined |
+| 11 | `{ output, search }` | false | undefined | `{ output, search }` | undefined |
+| 12 | `{ total, search }` | false（但有 total） | 直接取 total | `{ total, search }` | total |
+
+**核心规则提炼**：
+1. **白名单原则**：只有当用户提供的**所有**字段都在 `{input, output}` 中时，才会进入 total 推导分支
+2. **优先原则**：用户提供的 total 优先级永远最高，只要提供了就直接使用，不会被覆盖
+3. **非侵入原则**：非标准字段（如 search、rag 等）原样保留，系统不会修改或删除
 
 ### 7.6 路径 5：部分 usage 字段匹配到价格，部分没匹配
 
