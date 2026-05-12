@@ -1117,17 +1117,17 @@ finalCostDetails.total = 0.01
 
 > **关键点**：total 只累加**成功计算**的字段，而不是 usage 中所有字段。
 
-### 7.7 失败路径总结表（修正版，带前置条件）
+### 7.7 失败路径总结表（修正版，带前置条件和示例引用）
 
 | 失败场景 | 回退行为 | 最终结果特征（分情况） |
 |----------|----------|------------------------|
-| **模型未匹配** | internalModel = null，跳过定价和自动成本计算 | **用户未提供 cost**：`internal_model_id = undefined`，成本字段 undefined<br>**用户提供了 cost**：原样保留用户的 cost，按真值表规则推导 total |
+| **模型未匹配** | internalModel = null，跳过定价和自动成本计算 | **用户未提供 cost**：`internal_model_id = undefined`，成本字段 undefined<br>**用户提供了 cost**：原样保留用户的 cost，按真值表规则推导 total<br>**→ 完整端到端示例见 [第 8.10 节** |
 | **定价层级无默认** | matchedTier = null，modelPrices = undefined | **用户未提供 cost**：`usage_pricing_tier_id = undefined`，成本字段 undefined<br>**用户提供了 cost**：原样保留用户的 cost，不受定价层级影响 |
 | **Tokenizer ID 未知** | tokenCount() 返回 undefined | **用户未提供 usage**：`usage_details` 对应字段不存在<br>**用户提供了 usage**：原样保留用户的 usage |
 | **Tokenizer 配置无效** | tokenCount() 返回 undefined | **用户未提供 usage**：`usage_details` 对应字段不存在<br>**用户提供了 usage**：原样保留用户的 usage |
 | **观察状态是 ERROR** | 跳过 Token 估算 | **用户未提供 usage**：`usage_details` 全部 undefined<br>**用户提供了 usage**：原样保留用户的 usage |
 | **Token 估算抛出异常** | 捕获异常，返回空 usage | **用户未提供 usage**：`usage_details = {}`<br>**用户提供了 usage**：原样保留用户的 usage |
-| **用户提供部分成本字段** | 放弃所有自动计算，仅在白名单内推导 total | **every() 通过**：推导 total 并写回<br>**every() 不通过**：不推导 total，用户提供的字段原样保留 |
+| **用户提供部分成本字段** | 放弃所有自动计算，仅在白名单内推导 total | **every() 通过**：推导 total 并写回<br>**every() 不通过**：不推导 total，用户提供的字段原样保留<br>**→ 真值表见 [第 7.6 节]** |
 | **部分 usage 无对应价格** | 只计算能找到价格的字段 | **成功匹配价格的字段**：计算成本<br>**未匹配价格的字段**：成本字段缺失<br>**total**：只累加成功计算的字段成本 |
 
 > **核心原则**：用户提供的数据永远是"一等公民"，无论系统内部发生任何失败，用户数据都会被完整保留，不会被覆盖或清除。
@@ -1531,6 +1531,142 @@ if (!cost_details.hasOwnProperty("total") && finalTotalCost != null) {
 > 1. 用户只提供了 `input` 成本，但 total 被自动推导并写回
 > 2. `output` 成本字段保持缺失（不会用 tokens × 单价自动计算）
 > 3. total_cost = input_cost，与真值表第 2 行完全一致
+
+---
+
+### 8.10 补充示例：模型未匹配但用户已提供 cost（新增！）
+
+这是最容易被误解的场景：系统内部模型匹配失败，但用户数据仍然完整保留。
+
+**用户 API 输入**：
+```json
+{
+  "id": "gen-ghi789",
+  "traceId": "trace-abc123",
+  "model": "my-custom-model-v2",  // ← 这个模型 Langfuse 不认识！
+  "input": [{ "role": "user", "content": "Translate to French" }],
+  "output": "Traduire en français",
+  "usage": {
+    "input": 50,
+    "output": 25,
+    "total": 75
+  },
+  "cost": {
+    "input": 0.0005,  // ← 用户自己提供了准确的成本
+    "output": 0.00075
+  }
+}
+```
+
+---
+
+#### 步骤 1：模型匹配（失败！）
+
+**执行**：`findModel({ projectId, model: "my-custom-model-v2" })`
+
+**结果**：
+```typescript
+// 数据库中没有匹配这个模型名的正则
+internalModel = null;  // ← 模型未匹配！
+```
+
+> **关键观察**：模型匹配失败只是意味着"系统不知道如何自动计算成本"，但不会中断整个 ingestion 流程。
+
+---
+
+#### 步骤 2：获取 Usage Units（不受影响！）
+
+用户完整提供了所有 usage 字段，跳过自动估算。
+
+```typescript
+usage_details = { input: 50, output: 25, total: 75 }
+```
+
+> **关键点**：模型未匹配不影响用户提供的 usage 数据——用户数据原封不动保留。
+
+---
+
+#### 步骤 3：定价层级匹配（直接跳过！）
+
+```typescript
+if (internalModel) {  // ← internalModel 是 null，这个块不会执行！
+  // 不会调用 findPricingTiersForModel
+  // 不会调用 matchPricingTier
+}
+modelPrices = undefined;
+```
+
+---
+
+#### 步骤 4：成本计算（用户提供优先，不受模型未匹配影响！）
+
+**执行**：`calculateUsageCosts(undefined, observationRecord, usage_details)`
+
+```typescript
+// 阶段 1：用户提供成本检查
+const providedCostKeys = Object.entries({ input: 0.0005, output: 0.00075 })
+  .filter(([_, v]) => v != null)
+  .map(([k]) => k);
+// → ["input", "output"] （长度 > 0，进入用户提供优先模式）
+
+// 阶段 2：every() 白名单检查
+providedCostKeys.every((key) => ["input", "output"].includes(key));
+// → true ✅ （两个字段都在白名单中）
+
+// 阶段 3：推导 total
+const finalTotalCost =
+  provided_cost_details?.["total"] ??
+  (true ? 0.0005 + 0.00075 : undefined);
+// → undefined ?? 0.00125 = 0.00125
+
+// 阶段 4：写回 total 到 cost_details
+cost_details = { input: 0.0005, output: 0.00075, total: 0.00125 }
+```
+
+> **震惊但正确**：即使模型未匹配，用户提供的成本字段仍然被完整保留，并且 total 仍然被正确推导！
+
+---
+
+#### 最终落库结果（ClickHouse）
+
+```typescript
+{
+  id: "gen-ghi789",
+  trace_id: "trace-abc123",
+  model: "my-custom-model-v2",
+
+  // 模型匹配相关字段（确实是 undefined）
+  internal_model_id: undefined,        // ← 模型未匹配
+  usage_pricing_tier_id: undefined,
+  usage_pricing_tier_name: undefined,
+
+  // Usage 字段（完整保留！）
+  provided_usage_details: { input: 50, output: 25, total: 75 },
+  usage_details: { input: 50, output: 25, total: 75 },  // ← 不受影响！
+
+  // 成本字段（完整保留 + total 自动推导！）
+  provided_cost_details: { input: 0.0005, output: 0.00075 },
+  cost_details: {
+    input: 0.0005,
+    output: 0.00075,
+    total: 0.00125  // ← 即使模型未匹配，total 仍然被推导并写回！
+  },
+  total_cost: 0.00125,  // ← 成本计算不受模型未匹配影响！
+
+  input: [{ "role": "user", "content": "Translate to French" }],
+  output: "Traduire en français",
+}
+```
+
+---
+
+#### 这个示例揭示的 3 个深层设计原则
+
+1. **失败隔离原则**：模型匹配是一个可选功能，失败不会污染或删除用户已提供的数据
+2. **用户数据主权原则**：用户提供的 usage 和 cost 是"源数据"，系统不会因为自身计算能力不足而丢弃
+3. **优雅降级的本质**：不是"全部成功或全部失败"，而是"能算多少算多少，不能算的原样保留"
+
+> **架构师视角**：这是一个非常优秀的容错设计。即使 Langfuse 缺少某个模型的定价配置，用户仍然可以通过 API 自己提供成本数据，系统不会因为"不认识这个模型"就拒绝 ingestion 或丢弃数据。
 
 ---
 
