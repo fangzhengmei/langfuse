@@ -4,6 +4,10 @@
 
 Langfuse 的成本估算管线是一个三段式处理流程：**模型匹配** → **定价层级匹配** → **Token 估算与成本计算**。该管线负责为每条 LLM 调用追踪记录匹配正确的模型定价，估算 Token 使用量，并最终累加计算出调用成本。
 
+**本报告特别补充：** 完整的失败/回退路径分析、异常分支处理逻辑，以及从 Trace 输入到最终成本落库的端到端示例。
+
+---
+
 ## 管线总览
 
 ```
@@ -21,6 +25,11 @@ Langfuse 的成本估算管线是一个三段式处理流程：**模型匹配** 
 │  │ 正则匹配     │    │ 条件评估(AND)    │    │  OpenAI tokenizer     │ │
 │  │ 缓存(Redis)  │    │ 优先级排序       │    │  Anthropic tokenizer  │ │
 │  └──────────────┘    └──────────────────┘    └───────────────────────┘ │
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  ★ 新增：完整失败/回退路径（第7章）                                 │  │
+│  │  ★ 新增：端到端示例（第8章）                                       │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -256,15 +265,19 @@ interface Model {
 
 ```typescript
 function openAiTokenCount(params: { model: Model; text: unknown }) {
-  const config = OpenAiTokenConfigSchema.parse(params.model.tokenizerConfig);
-  
+  const config = OpenAiTokenConfigSchema.safeParse(params.model.tokenizerConfig);
+  if (!config.success) {
+    logger.warn(`Invalid tokenizer config for model ${params.model.id}: ...`);
+    return undefined;  // ← 配置解析失败直接返回 undefined
+  }
+
   // 对于 Chat 消息数组，使用特殊公式
-  if (isChatMessageArray(parsedText) && isChatModel(config.tokenizerModel)) {
+  if (isChatMessageArray(parsedText) && isChatModel(config.data.tokenizerModel)) {
     return openAiChatTokenCount({ messages: parsedText, config });
   }
-  
+
   // 对于普通文本，直接使用 tiktoken
-  return getTokensByModel(config.tokenizerModel, parsedText);
+  return getTokensByModel(config.data.tokenizerModel, parsedText);
 }
 ```
 
@@ -278,11 +291,11 @@ function openAiChatTokenCount(params: {
   config: OpenAiChatTokenConfig;
 }): number {
   let numTokens = 0;
-  
+
   // 每条消息累加
   for (const message of params.messages) {
     numTokens += params.config.tokensPerMessage;  // 每条消息基础开销
-    
+
     // 计算内容、角色名的 token
     for (const [key, value] of Object.entries(message)) {
       if (["content", "role", "name", "tool_calls", "function_call"].includes(key)) {
@@ -293,9 +306,9 @@ function openAiChatTokenCount(params: {
       }
     }
   }
-  
+
   numTokens += 3;  // 每条回复的固定基础开销（<|start|>assistant<|message|>）
-  
+
   return numTokens;
 }
 ```
@@ -307,13 +320,16 @@ const cachedTokenizerByModel: Record<string, Tiktoken> = {};
 
 function getTokensByModel(model: string, text: string): number {
   // 懒加载 + 缓存 tokenizer 实例，避免重复初始化开销
-  cachedTokenizerByModel[model] = 
-    cachedTokenizerByModel[model] || encoding_for_model(model);
-  
-  // Unicode 安全转换（处理 Emoji 等多字节字符）
-  const cleanedText = unicodeToBytesInString(text);
-  
-  return cachedTokenizerByModel[model].encode(cleanedText, "all").length;
+  try {
+    cachedTokenizerByModel[model] =
+      cachedTokenizerByModel[model] || encoding_for_model(model);
+  } catch {
+    logger.warn("Model not found. Using cl100k_base encoding.");  // ← 回退到通用编码
+    encoding = get_encoding("cl100k_base");
+  }
+
+  const cleanedText = unicodeToBytesInString(text);  // 处理 Emoji 等多字节字符
+  return encoding?.encode(cleanedText, "all").length;
 }
 ```
 
@@ -324,11 +340,25 @@ function getTokensByModel(model: string, text: string): number {
 ```typescript
 function claudeTokenCount(text: unknown): number {
   // 统一转为字符串后计数
-  return isString(text) 
-    ? countTokens(text) 
+  return isString(text)
+    ? countTokens(text)
     : countTokens(JSON.stringify(text));
 }
 ```
+
+### 3.5 Token 估算的失败出口（重点！）
+
+**`tokenCount()` 函数可能返回 `undefined` 的 5 种情况：**
+
+| 序号 | 场景 | 返回值 | 日志 |
+|------|------|--------|------|
+| 1 | 输入文本为 null/undefined/空数组 | `undefined` | 无 |
+| 2 | `tokenizerId` 既不是 "openai" 也不是 "claude" | `undefined` | `logger.error("Unknown tokenizer xxx")` |
+| 3 | `tokenizerId = "openai"` 但 `tokenizerConfig` 解析失败 | `undefined` | `logger.warn("Invalid tokenizer config...")` |
+| 4 | Chat 模型但 Chat 配置解析失败 | `undefined` | `logger.error("Invalid tokenizer config for chat model...")` |
+| 5 | Tiktoken 异常但回退到 cl100k_base 也失败 | `undefined` | （异常被 catch，但 encode 可能失败） |
+
+**重要**：`undefined` 不是失败——它是一个明确的信号，表示"无法估算"，会沿着调用链向上传递。
 
 ---
 
@@ -382,7 +412,7 @@ static calculateUsageCosts(
   usageUnits: UsageCostType,
 ): { cost_details, total_cost } {
   const { provided_cost_details } = observationRecord;
-  
+
   const providedCostKeys = Object.entries(provided_cost_details ?? {})
     .filter(([_, value]) => value != null)
     .map(([key]) => key);
@@ -392,14 +422,19 @@ static calculateUsageCosts(
   // ==========================================
   if (providedCostKeys.length) {
     const cost_details = { ...provided_cost_details };
-    
+
     // 仅当用户只提供了 input + output 时，推导 total
-    const finalTotalCost = 
-      provided_cost_details?.["total"] ?? 
+    const finalTotalCost =
+      provided_cost_details?.["total"] ??
       (providedCostKeys.every(key => ["input", "output"].includes(key))
-        ? (provided_cost_details?.["input"] ?? 0) + 
-          (provided_cost_details?.["output"] ?? 0)
+        ? ((provided_cost_details ?? {})["input"] ?? 0) +
+          ((provided_cost_details ?? {})["output"] ?? 0)
         : undefined);
+
+    if (!Object.prototype.hasOwnProperty.call(cost_details, "total") &&
+        finalTotalCost != null) {
+      cost_details.total = finalTotalCost;
+    }
 
     return { cost_details, total_cost: finalTotalCost };
   }
@@ -411,7 +446,7 @@ static calculateUsageCosts(
 
   for (const [key, units] of Object.entries(usageUnits)) {
     const price = modelPrices?.find(p => p.usageType === key);
-    
+
     // token 数量 × 单价（使用 Decimal 精确计算）
     if (units != null && price) {
       finalCostEntries.push([key, price.price.mul(units).toNumber()]);
@@ -487,9 +522,9 @@ private async calculateUsageAndCosts(
 
   if (internalModel) {
     const pricingTiers = await findPricingTiersForModel(internalModel.id);
-    
+
     const matchedTier = matchPricingTier(pricingTiers, usage_details.usage_details ?? {});
-    
+
     if (matchedTier) {
       usage_pricing_tier_id = matchedTier.pricingTierId;
       usage_pricing_tier_name = matchedTier.pricingTierName;
@@ -518,7 +553,109 @@ private async calculateUsageAndCosts(
 }
 ```
 
-### 5.3 数据流向
+### 5.3 `getUsageUnits` 方法完整流程（关键！）
+
+```typescript
+private async getUsageUnits(
+  observationRecord: { provided_usage_details, level, input, output, id },
+  model: Model | null | undefined,
+): Promise<{ usage_details, provided_usage_details }> {
+
+  // ─────────────────────────────────────────────────────────
+  // 阶段 A: 用户提供的 usage 优先
+  // ─────────────────────────────────────────────────────────
+  const providedUsageDetails: Record<string, number> = {};
+  for (const [key, value] of Object.entries(observationRecord.provided_usage_details)) {
+    if (value != null) {
+      const numValue = Number(value);
+      if (!isNaN(numValue) && numValue >= 0) {  // 只接受非负数字
+        providedUsageDetails[key] = numValue;
+      }
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // 阶段 B: 自动 Token 估算的 3 个前置条件
+  // ─────────────────────────────────────────────────────────
+  // 条件 1: 模型存在
+  // 条件 2: 用户没有提供任何 usage
+  // 条件 3: 观察状态不是 ERROR
+  if (
+    model &&
+    Object.keys(providedUsageDetails).length === 0 &&
+    observationRecord.level !== ObservationLevel.ERROR
+  ) {
+    try {
+      let newInputCount: number | undefined;
+      let newOutputCount: number | undefined;
+
+      // ──────────────────────────────────────────────
+      // 阶段 C: 异步 Token 估算（带同步回退）
+      // ──────────────────────────────────────────────
+      await instrumentAsync({ name: "token-count" }, async (span) => {
+        try {
+          // 并行估算 input 和 output
+          [newInputCount, newOutputCount] = await Promise.all([
+            tokenCountAsync({ text: observationRecord.input, model }),
+            tokenCountAsync({ text: observationRecord.output, model }),
+          ]);
+        } catch (error) {
+          // 异步估算失败 → 回退到同步版本
+          logger.warn("Async tokenization has failed. Falling back to synchronous tokenization");
+          newInputCount = tokenCount({ text: observationRecord.input, model });
+          newOutputCount = tokenCount({ text: observationRecord.output, model });
+        }
+        // ... tracing metrics
+      });
+
+      logger.debug(`Tokenized observation ${observationRecord.id}...`);
+
+      // ──────────────────────────────────────────────
+      // 阶段 D: 计算 total
+      // ──────────────────────────────────────────────
+      const newTotalCount =
+        newInputCount || newOutputCount
+          ? (newInputCount ?? 0) + (newOutputCount ?? 0)
+          : undefined;  // 两个都 undefined → total 也 undefined
+
+      const usage_details: Record<string, number> = {};
+      if (newInputCount != null) usage_details.input = newInputCount;
+      if (newOutputCount != null) usage_details.output = newOutputCount;
+      if (newTotalCount != null) usage_details.total = newTotalCount;
+
+      return { usage_details, provided_usage_details: providedUsageDetails };
+
+    } catch (error) {
+      // ──────────────────────────────────────────────
+      // 阶段 E: 最外层异常捕获
+      // ──────────────────────────────────────────────
+      traceException(error);
+      logger.error(`Tokenization failed for observation ${observationRecord.id}...`);
+      // 关键：发生任何异常时，返回空对象，而不是抛出错误中断整个流程！
+      return {
+        usage_details: {},
+        provided_usage_details: providedUsageDetails,
+      };
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────
+  // 阶段 F: 跳过自动估算，直接使用用户提供的值
+  // ─────────────────────────────────────────────────────────
+  const usageDetails = { ...providedUsageDetails };
+  if (Object.keys(usageDetails).length > 0 && !("total" in usageDetails)) {
+    // 用户提供了部分值但没提供 total → 自动累加
+    usageDetails.total = Object.values(providedUsageDetails).reduce((acc, value) => acc + value, 0);
+  }
+
+  return {
+    usage_details: usageDetails,
+    provided_usage_details: providedUsageDetails,
+  };
+}
+```
+
+### 5.4 数据流向
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -582,9 +719,642 @@ private async calculateUsageAndCosts(
 
 ---
 
-## 第七部分：调试与故障排查
+## 第七部分：完整的失败/回退路径分析（新增！）
 
-### 7.1 常见问题排查路径
+这是本报告的核心补充章节，详细分析所有异常分支的处理逻辑。
+
+### 7.1 异常路径总览图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    成本估算完整失败/回退路径                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  START → 模型匹配 → 定价层级匹配 → Token估算 → 成本计算 → END            │
+│           ↓ 失败         ↓ 失败         ↓ 失败        ↓ 部分字段        │
+│        model=null     使用默认层级   usage={}     部分字段undefined      │
+│                                                                         │
+│  所有失败都是"优雅降级"，从不抛出异常中断管线！                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 路径 1：模型未匹配
+
+**触发条件**：
+- 用户提供的 `modelName` 无法通过正则匹配到任何 model
+- 或 Redis/PG 查询异常
+
+**代码位置**：`modelMatch.ts: findModel()`
+
+**回退行为**：
+```typescript
+return {
+  model: null,        // ← 关键！返回 null 而不是抛出
+  pricingTiers: [],   // ← 空数组
+  source: "none"
+};
+```
+
+**下游影响**：
+```typescript
+// 在 calculateUsageAndCosts 中：
+if (internalModel) {  // ← internalModel 是 null，这个块不会执行
+  // 不会调用 findPricingTiersForModel
+  // 不会调用 matchPricingTier
+  // modelPrices 保持 undefined
+}
+
+// 最终 calculateUsageCosts 收到的 modelPrices = undefined
+// → 不会有任何自动计算的成本项
+```
+
+**最终落库结果**：
+```
+internal_model_id: undefined
+usage_pricing_tier_id: undefined
+usage_pricing_tier_name: undefined
+cost_details: {} （如果用户也没提供成本）
+total_cost: undefined
+```
+
+### 7.3 路径 2：定价层级匹配失败
+
+**触发条件**：
+- 模型存在，但没有任何定价层级
+- 或所有条件层级都不匹配，且没有默认层级
+
+**代码位置**：`pricing-tiers/matcher.ts: matchPricingTier()`
+
+**回退行为**：
+```typescript
+const defaultTier = tiers.find(tier => tier.isDefault);
+return defaultTier ? { ... } : null;  // ← 无默认层级返回 null
+```
+
+**下游影响**：
+```typescript
+const matchedTier = matchPricingTier(...);
+if (matchedTier) {  // ← matchedTier 是 null，这个块不会执行
+  // modelPrices 保持 undefined
+}
+```
+
+**注意**：实际上这种情况很少发生——Langfuse 确保每个内置模型都有默认层级。自定义模型可能因为数据迁移问题缺失默认层级。
+
+### 7.4 路径 3：Token 估算失败（5 个子路径）
+
+**子路径 3a：未识别的 Tokenizer ID**
+
+```typescript
+// tokenCount() 函数：
+if (p.model.tokenizerId === "openai") { /* ... */ }
+else if (p.model.tokenizerId === "claude") { /* ... */ }
+else if (p.model.tokenizerId) {
+  logger.error(`Unknown tokenizer ${p.model.tokenizerId}`);
+}
+return undefined;  // ← 关键：静默返回 undefined
+```
+
+**子路径 3b：Tokenizer 配置无效**
+
+```typescript
+const config = OpenAiTokenConfig.safeParse(p.model.tokenizerConfig);
+if (!config.success) {
+  logger.warn(`Invalid tokenizer config for model ${p.model.id}: ...`);
+  return undefined;  // ← Zod 解析失败直接返回
+}
+```
+
+**子路径 3c：观察状态是 ERROR**
+
+```typescript
+// getUsageUnits() 前置条件检查：
+if (model &&
+    Object.keys(providedUsageDetails).length === 0 &&
+    observationRecord.level !== ObservationLevel.ERROR  // ← ERROR 状态跳过
+) {
+  // Token 估算逻辑不会执行
+}
+```
+
+> **设计理由**：ERROR 状态的 Generation 通常没有有效的 output，进行 Token 估算没有意义。
+
+**子路径 3d：Token Count 抛出异常**
+
+```typescript
+try {
+  // 各种 Token 估算逻辑
+} catch (error) {
+  traceException(error);
+  logger.error(`Tokenization failed for observation ${observationRecord.id}...`);
+  return {  // ← 捕获异常后返回空对象
+    usage_details: {},
+    provided_usage_details: providedUsageDetails,
+  };
+}
+```
+
+**子路径 3e：部分字段估算成功，部分失败**
+
+```typescript
+// 例如 input 估算成功 100 tokens，output 估算失败返回 undefined
+const usage_details = {
+  input: 100,         // ← 成功
+  // output: undefined ← 不存在这个键
+  total: 100          // ← 只累加成功的字段
+};
+```
+
+### 7.5 路径 4：用户提供部分成本字段
+
+这是最复杂的回退逻辑，**7 种组合场景详解**：
+
+#### 场景 4.1：只提供 input，不提供 output/total
+
+**输入**：
+```typescript
+provided_cost_details = { input: 0.01 }
+usageUnits = { input: 100, output: 200, total: 300 }
+modelPrices = [ { usageType: "input", price: 0.0001 }, ... ]
+```
+
+**处理逻辑**：
+```typescript
+providedCostKeys = ["input"]  // ← 长度 > 0，进入用户提供优先模式
+
+// 检查是否只提供了 input + output？
+providedCostKeys.every(key => ["input", "output"].includes(key))
+// → ["input"].every(...) = true，但不是两个都提供
+
+finalTotalCost = provided_cost_details["total"] ?? (检查不通过 ? ... : undefined)
+// → undefined
+```
+
+**输出**：
+```typescript
+{
+  cost_details: { input: 0.01 },  // ← 原样保留用户提供的
+  total_cost: undefined           // ← 不会用自动计算的成本！
+}
+```
+
+**关键点**：`output` 和 `total` 不会被自动计算——用户只要提供了 ANY 字段，其他字段全部放弃自动计算。
+
+---
+
+#### 场景 4.2：只提供 output，不提供 input/total
+
+**输入**：
+```typescript
+provided_cost_details = { output: 0.02 }
+```
+
+**输出**：
+```typescript
+{
+  cost_details: { output: 0.02 },
+  total_cost: undefined
+}
+```
+
+---
+
+#### 场景 4.3：只提供 total，不提供 input/output
+
+**输入**：
+```typescript
+provided_cost_details = { total: 0.03 }
+```
+
+**输出**：
+```typescript
+{
+  cost_details: { total: 0.03 },
+  total_cost: 0.03
+}
+```
+
+---
+
+#### 场景 4.4：提供 input + output，不提供 total（唯一会自动推导的场景！）
+
+**输入**：
+```typescript
+provided_cost_details = { input: 0.01, output: 0.02 }
+```
+
+**处理逻辑**：
+```typescript
+providedCostKeys = ["input", "output"]
+
+// 检查是否只提供了这两个？→ YES
+finalTotalCost = undefined ?? (true ? 0.01 + 0.02 : undefined)
+// → 0.03
+```
+
+**输出**：
+```typescript
+{
+  cost_details: { input: 0.01, output: 0.02, total: 0.03 },
+  total_cost: 0.03
+}
+```
+
+> **唯一例外**：这是整个系统中**唯一**会"自动补充"用户未提供字段的场景。
+
+---
+
+#### 场景 4.5：提供 input + total，不提供 output
+
+**输入**：
+```typescript
+provided_cost_details = { input: 0.01, total: 0.03 }
+```
+
+**输出**：
+```typescript
+{
+  cost_details: { input: 0.01, total: 0.03 },  // ← output 不会被计算
+  total_cost: 0.03
+}
+```
+
+> output 字段不会从 total - input 反推——系统不会做任何"智能"推导。
+
+---
+
+#### 场景 4.6：提供 output + total，不提供 input
+
+类似场景 4.5，input 保持 undefined。
+
+---
+
+#### 场景 4.7：提供非标准字段（如 search、rag 等）
+
+**输入**：
+```typescript
+provided_cost_details = { input: 0.01, search: 0.005 }
+```
+
+**处理逻辑**：
+```typescript
+providedCostKeys = ["input", "search"]
+
+// 检查是否只提供了 input + output？
+providedCostKeys.every(key => ["input", "output"].includes(key))
+// → "search" 不在列表中 → 返回 false
+
+finalTotalCost = undefined  // ← 不会推导 total
+```
+
+**输出**：
+```typescript
+{
+  cost_details: { input: 0.01, search: 0.005 },  // ← 非标准字段原样保留
+  total_cost: undefined
+}
+```
+
+> **设计优点**：系统支持任意自定义成本字段，不会因为字段不认识就拒绝或报错。
+
+### 7.6 路径 5：部分 usage 字段匹配到价格，部分没匹配
+
+**触发条件**：
+- usage_details 有 input、output、total
+- 但 modelPrices 中只有 input 的价格，没有 output 的价格
+
+**处理逻辑**：
+```typescript
+for (const [key, units] of Object.entries(usageUnits)) {
+  const price = modelPrices?.find(p => p.usageType === key);
+
+  if (units != null && price) {  // ← 只有两个条件都满足才计算
+    finalCostEntries.push([key, price.price.mul(units).toNumber()]);
+  }
+}
+```
+
+**示例**：
+```typescript
+usageUnits = { input: 100, output: 200 }
+modelPrices = [ { usageType: "input", price: 0.0001 } ]  // ← 没有 output 的价格
+
+// 计算结果：
+finalCostEntries = [ ["input", 0.01] ]  // ← 只有 input 被计算
+finalCostDetails = { input: 0.01 }
+
+// 推导 total：
+finalTotalCost = 0.01  // ← 只累加已计算的字段
+finalCostDetails.total = 0.01
+```
+
+**最终输出**：
+```typescript
+{
+  cost_details: { input: 0.01, total: 0.01 },  // ← output 不存在
+  total_cost: 0.01
+}
+```
+
+> **关键点**：total 只累加**成功计算**的字段，而不是 usage 中所有字段。
+
+### 7.7 失败路径总结表
+
+| 失败场景 | 回退行为 | 最终结果特征 |
+|----------|----------|--------------|
+| 模型未匹配 | internalModel = null，跳过定价和成本计算 | `internal_model_id = undefined`，所有成本字段 undefined |
+| 定价层级无默认 | matchedTier = null，modelPrices 为空 | `usage_pricing_tier_id = undefined`，所有成本字段 undefined |
+| Tokenizer ID 未知 | 返回 undefined | `usage_details` 对应字段不存在 |
+| Tokenizer 配置无效 | 返回 undefined | `usage_details` 对应字段不存在 |
+| 观察状态是 ERROR | 跳过 Token 估算 | `usage_details` 全部 undefined |
+| Token 估算抛出异常 | 捕获异常，返回空 usage | `usage_details = {}` |
+| 用户提供部分成本字段 | 放弃所有自动计算，仅在 input+output 时推导 total | 未提供的成本字段都是 undefined |
+| 部分 usage 无对应价格 | 只计算能找到价格的字段 | cost_details 字段不完整，total 只累加成功项 |
+
+---
+
+## 第八部分：端到端完整示例（新增！）
+
+以下是一个从 API 输入到 ClickHouse 落库的真实完整示例，包含各种边界情况。
+
+### 8.1 场景设定
+
+**用户 API 输入**：
+```json
+{
+  "id": "gen-abc123",
+  "traceId": "trace-xyz789",
+  "type": "GENERATION",
+  "name": "test-generation",
+  "startTime": "2024-05-15T10:00:00.000Z",
+  "model": "gpt-4-turbo",
+  "input": [{
+    "role": "system",
+    "content": "You are a helpful assistant."
+  }, {
+    "role": "user",
+    "content": "Hello, how are you?"
+  }],
+  "output": "I'm doing well! How can I help you today?",
+  "usage": {
+    "input": 100,
+    // ← 用户故意不提供 output tokens
+    "total": 150
+  },
+  "cost": {
+    // ← 用户不提供任何成本字段，让 Langfuse 自动计算
+  }
+}
+```
+
+**数据库中模型配置**：
+```typescript
+// gpt-4-turbo 模型配置
+{
+  id: "model-gpt4-001",
+  model_name: "gpt-4-turbo",
+  match_pattern: "(?i)^gpt-4-turbo",
+  tokenizer_id: "openai",
+  tokenizer_config: {
+    tokenizerModel: "gpt-4",
+    tokensPerMessage: 3,
+    tokensPerName: 1
+  },
+  pricing_tiers: [
+    {
+      id: "tier-standard",
+      name: "Standard",
+      isDefault: true,
+      priority: 0,
+      conditions: [],
+      prices: [
+        { usageType: "input", price: 0.01 },    // $0.01 per 1k tokens
+        { usageType: "output", price: 0.03 },   // $0.03 per 1k tokens
+      ]
+    }
+  ]
+}
+```
+
+---
+
+### 8.2 步骤 1：模型匹配
+
+**执行**：`findModel({ projectId: "proj-123", model: "gpt-4-turbo" })`
+
+**结果**：
+- L1 缓存未命中 → L2 Redis 未命中 → PostgreSQL 查询
+- 正则 `(?i)^gpt-4-turbo` 匹配成功
+- 返回完整的 Model 对象 + pricingTiers
+
+**中间状态**：
+```typescript
+internalModel = { id: "model-gpt4-001", tokenizer_id: "openai", ... }
+```
+
+---
+
+### 8.3 步骤 2：获取 Usage Units
+
+**执行**：`getUsageUnits(observationRecord, internalModel)`
+
+**阶段 A：处理用户提供的 usage**
+```typescript
+providedUsageDetails = {
+  input: 100,   // ← 来自 API input.usage
+  total: 150,   // ← 来自 API input.usage
+  // 注意：用户没提供 output！
+}
+```
+
+**阶段 B：前置条件检查**
+```typescript
+Object.keys(providedUsageDetails).length === 0
+// → 2 > 0 → 不进行自动 Token 估算！
+```
+
+> **关键**：即使用户只提供了部分 usage 字段，也会完全跳过自动估算，不会去估算缺失的 output 字段。
+
+**阶段 F：推导 total（如果需要）**
+```typescript
+// 用户已经提供了 total，不需要推导
+usageDetails = { input: 100, total: 150 }
+```
+
+**中间状态**：
+```typescript
+usage_details = { input: 100, total: 150 }
+// 注意：output 不存在！
+```
+
+---
+
+### 8.4 步骤 3：定价层级匹配
+
+**执行**：`matchPricingTier(pricingTiers, usage_details)`
+
+**结果**：
+- 唯一的层级是默认层级，无条件匹配
+- 返回 Standard 层级的价格
+
+**中间状态**：
+```typescript
+modelPrices = [
+  { usageType: "input", price: new Decimal(0.01) },
+  { usageType: "output", price: new Decimal(0.03) }
+]
+```
+
+---
+
+### 8.5 步骤 4：成本计算
+
+**执行**：`calculateUsageCosts(modelPrices, observationRecord, usage_details)`
+
+**阶段 1：用户提供成本检查**
+```typescript
+providedCostKeys = Object.keys(provided_cost_details ?? {})
+// → [] （空数组，用户没提供任何成本）
+// → 不进入用户提供优先模式，继续自动计算
+```
+
+**阶段 2：自动计算**
+```typescript
+// 遍历 usage_details 的键
+for (const [key, units] of Object.entries({ input: 100, total: 150 })) {
+
+  // key = "input":
+  const price_input = modelPrices.find(p => p.usageType === "input");
+  // → 找到：price = 0.01
+  finalCostEntries.push(["input", 0.01 * 100]);  // → 1.0
+
+  // key = "total":
+  const price_total = modelPrices.find(p => p.usageType === "total");
+  // → 没找到！modelPrices 里没有 total 的价格
+  // → 跳过
+}
+```
+
+> **关键点**：total 的价格不存在！（大多数模型按 input/output 定价，不是按 total 定价）
+
+**阶段 3：推导 total_cost**
+```typescript
+finalCostDetails = { input: 1.0 }
+
+// 检查是否有 total 字段？→ 没有
+// 检查是否有已计算的成本项？→ 有（input）
+finalTotalCost = [["input", 1.0]].reduce((acc, [_, c]) => acc + c, 0)
+// → 1.0
+
+finalCostDetails.total = 1.0;  // ← 自动添加 total
+```
+
+**最终输出**：
+```typescript
+{
+  cost_details: {
+    input: 1.0,    // ← 计算成功
+    // output 不存在！（因为 usage_details 里就没有 output）
+    total: 1.0     // ← 只累加了 input 的成本
+  },
+  total_cost: 1.0
+}
+```
+
+---
+
+### 8.6 最终落库结果（ClickHouse observations_table）
+
+```typescript
+{
+  // 基础字段
+  id: "gen-abc123",
+  trace_id: "trace-xyz789",
+  type: "GENERATION",
+  model: "gpt-4-turbo",
+
+  // 模型匹配结果
+  internal_model_id: "model-gpt4-001",
+  usage_pricing_tier_id: "tier-standard",
+  usage_pricing_tier_name: "Standard",
+
+  // Usage 字段（用户提供 + 系统推导）
+  provided_usage_details: {
+    input: 100,
+    total: 150
+  },
+  usage_details: {
+    input: 100,
+    total: 150
+    // 注意：output 不存在！
+  },
+
+  // 成本字段
+  provided_cost_details: {},
+  cost_details: {
+    input: 1.0,
+    total: 1.0
+    // 注意：output 不存在！
+  },
+  total_cost: 1.0,
+
+  // 其他字段...
+  input: [{ role: "system", content: "..." }, ...],
+  output: "I'm doing well!...",
+}
+```
+
+---
+
+### 8.7 字段缺失说明
+
+**Q：为什么 output 在最终结果中不存在？**
+
+**A：因为经过了两次"过滤"：**
+1. **Usage 层面**：用户没提供 output tokens，且因为用户提供了部分 usage，系统不会自动估算 output tokens
+2. **成本层面**：usage_details 里没有 output 字段，循环时不会处理到它，自然也就不会有 output_cost
+
+**Q：为什么 total_cost 是 1.0 而不是 1.5（100×0.01 + 50×0.03）？**
+
+**A：因为 total 只累加**成功计算**的字段。output 字段在 usage_details 里不存在，自然不会被计算到成本里。
+
+> **设计哲学**：不猜测、不推断、不做"智能补全"。缺失就是缺失，系统不会假设 output = total - input。
+
+---
+
+### 8.8 如果用户没提供任何 usage（完全自动模式）
+
+作为对比，如果用户的 API 输入是：
+
+```json
+{
+  "usage": {},  // ← 完全不提供 usage
+  "cost": {}
+}
+```
+
+那么流程会是：
+1. **自动 Token 估算**：
+   - input 文本 → 估算得 42 tokens
+   - output 文本 → 估算得 18 tokens
+   - total = 42 + 18 = 60 tokens
+2. **成本计算**：
+   - input_cost = 42 × 0.01 = 0.42
+   - output_cost = 18 × 0.03 = 0.54
+   - total_cost = 0.42 + 0.54 = 0.96
+3. **最终落库**：
+   ```typescript
+   usage_details: { input: 42, output: 18, total: 60 }
+   cost_details: { input: 0.42, output: 0.54, total: 0.96 }
+   total_cost: 0.96
+   ```
+
+---
+
+## 第九部分：调试与故障排查
+
+### 9.1 常见问题排查路径
 
 **问题 1：成本是 undefined**
 1. 检查 `internal_model_id` 是否为 undefined → 模型匹配失败
@@ -601,7 +1371,12 @@ private async calculateUsageAndCosts(
 2. 检查定价层级的 `conditions.usageDetailPattern` 是否匹配键名（如 `input` vs `input_tokens`）
 3. 检查层级 `priority` 排序是否正确
 
-### 7.2 日志调试关键字
+**问题 4：部分成本字段缺失**
+1. 检查 `provided_cost_details` 是否有任何字段（有 → 自动计算被跳过）
+2. 检查 `usage_details` 里对应的字段是否存在
+3. 检查 `modelPrices` 里是否有对应的 `usageType` 价格
+
+### 9.2 日志调试关键字
 
 ```typescript
 // modelMatch.ts 调试日志
@@ -609,6 +1384,11 @@ logger.debug(`Model match resolved`, {
   projectId, model, source, matchedModelId,
   matchedModelName, pricingTierCount
 });
+
+// Tokenizer 错误日志
+logger.error(`Unknown tokenizer ${tokenizerId}`);
+logger.warn(`Invalid tokenizer config for model ${modelId}: ...`);
+logger.error(`Tokenization failed for observation ${observationId}...`);
 
 // IngestionService 成本调试日志
 logger.debug(`Calculated costs and usage`, {
@@ -618,7 +1398,7 @@ logger.debug(`Calculated costs and usage`, {
 });
 ```
 
-### 7.3 缓存清理命令
+### 9.3 缓存清理命令
 
 ```typescript
 // 清理单个项目的模型缓存
@@ -664,10 +1444,10 @@ await clearFullModelCache();
 
 ## 总结
 
-Langfuse 的成本估算管线是一个设计精良的三层架构：
+Langfuse 的成本估算管线是一个设计精良的三层架构，核心设计原则可以用三句话概括：
 
-1. **模型匹配层**：通过正则 + 多级缓存实现高性能的模型识别
-2. **定价层级层**：支持复杂的条件定价，适配不同 LLM 提供商的定价策略
-3. **Token 估算层**：精确的 Token 计数逻辑，实现 provider 级别的估算器
+1. **优雅降级**：任何步骤失败都不会中断管线，只会返回空值或部分结果
+2. **用户优先**：一旦用户提供了任何数据（usage 或 cost），立即停止所有自动计算
+3. **不猜测不推断**：缺失就是缺失，系统不会做任何"智能"补全或反推
 
-三者通过 `calculateUsageAndCosts` 方法无缝整合，最终输出准确的成本数据，为用户提供 LLM 成本可观测性。
+这种设计确保了管线的健壮性——即使在部分数据缺失或组件失败时，也能尽可能多地保存有效数据，而不是整体崩溃。但同时也意味着：**部分字段缺失是正常现象，不是 Bug**。理解这些回退路径，才能正确解释最终落库的数据。
