@@ -1,48 +1,21 @@
 # Webhook 发件箱机制报告
 
-## 一、整体管线概述
+## 一、发件箱写入机制
 
-Langfuse 的 Webhook 系统采用"先发件箱（Outbox）模式，确保事件的可靠投递。整个流程分为三个核心阶段：**发件箱写入**、**签名生成**、**异步投递与退避重试**。
+### 1.1 整体流程
 
----
-
-## 二、发件箱写入机制
-
-### 2.1 触发入口
-
-**文件位置：`worker/src/features/entityChange/promptVersionProcessor.ts`
-
-### 2.2 核心流程
+**注意：写库和入队是两步独立操作，非原子事务**
 
 ```
-事件触发 → 过滤器匹配 → 发件箱持久化 → 队列入队
+事件触发 → 过滤器匹配 → 写库（发件箱） → 入队（BullMQ）
+     ↓ (若入队失败)
+  数据已落库，需手动补偿重试
 ```
 
-### 2.3 发件箱表结构
-
-数据库表：`automation_executions`（Prisma Schema 模型 `AutomationExecution`）
-
-**关键字段：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | String | 执行记录ID（UUID） |
-| `projectId` | String | 项目ID |
-| `automationId` | String | 自动化配置ID |
-| `triggerId` | String | 触发器ID |
-| `actionId` | String | 动作ID |
-| `status` | Enum | 执行状态（PENDING/COMPLETED/ERROR/CANCELLED） |
-| `sourceId` | String | 触发源ID（如 prompt ID） |
-| `input` | Json | webhook 负载数据 |
-| `output` | Json? | 执行结果（HTTP 响应等） |
-| `startedAt` | DateTime? | 开始执行时间 |
-| `finishedAt` | DateTime? | 完成时间 |
-| `error` | String? | 错误信息 |
-
-### 2.4 写入逻辑（`promptVersionProcessor.ts:164-237）
+### 1.2 关键代码路径（`promptVersionProcessor.ts:194-237`）
 
 ```typescript
-// 1. 创建发件箱记录（原子写入数据库）
+// 第一步：写发件箱数据库（原子操作）
 await prisma.automationExecution.create({
   data: {
     id: executionId,
@@ -50,13 +23,14 @@ await prisma.automationExecution.create({
     automationId: automations[0].id,
     triggerId,
     actionId,
-    status: ActionExecutionStatus.PENDING,  // 初始状态为 PENDING
+    status: ActionExecutionStatus.PENDING,  // 初始状态 PENDING
     sourceId: promptData.id,
     input: { ... },
   },
 });
 
-// 2. 加入 BullMQ 队列异步处理
+// 第二步：入队（独立操作，非事务性）
+// 【风险点】：若写库成功但入队失败，数据会停留在 PENDING 状态，需后台补偿
 await WebhookQueue.getInstance()?.add(QueueName.WebhookQueue, {
   timestamp: new Date(),
   id: v4(),
@@ -64,37 +38,82 @@ await WebhookQueue.getInstance()?.add(QueueName.WebhookQueue, {
     projectId,
     automationId: automations[0].id,
     executionId,  // 关联发件箱记录ID
-    payload: { ... },  // webhook 实际负载
+    payload: { ... },
   },
   name: QueueJobs.WebhookJob,
 });
 ```
 
-### 2.5 一致性保障
+### 1.3 发件箱表结构
 
-- **原子性**：先写数据库，再入队，保证即使队列服务故障，数据不会丢失
-- **幂等性**：通过 `executionId` 关联，确保重复投递可追踪
-- **可观测性**：所有执行历史永久保存在数据库中，支持审计
+数据库表：`automation_executions`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | String | 执行记录ID（UUID） |
+| `status` | Enum | PENDING / COMPLETED / ERROR / CANCELLED |
+| `startedAt` | DateTime? | Worker 开始消费时间 |
+| `finishedAt` | DateTime? | 完成/失败时间 |
+| `error` | String? | 错误信息 |
+| `output` | Json? | HTTP 响应结果 |
+
+### 1.4 一致性边界
+
+| 阶段 | 一致性保证 |
+|------|-----------|
+| 写库阶段 | 数据库 ACID 保证，要么成功要么回滚 |
+| 入队阶段 | 无事务保证，写库成功但入队失败会产生「孤儿记录」 |
+| 建议补偿 | 定期扫描 `status=PENDING` 且 `createdAt < N分钟` 的记录 |
+
+---
+
+## 二、Worker 消费流程
+
+### 2.1 队列处理器入口（`webhooks.ts:38-47`）
+
+```typescript
+export const webhookProcessor: Processor = async (
+  job: Job<TQueueJobTypes[QueueName.WebhookQueue]>,
+) => {
+  try {
+    return await executeWebhook(job.data.payload);
+  } catch (error) {
+    logger.error("Error executing WebhookJob", error);
+    throw error;  // 异常透传给 BullMQ 触发队列层重试
+  }
+};
+```
+
+### 2.2 executeWebhook 主流程（`webhooks.ts:50-102`）
+
+```
+1. 查询 automation 配置
+2. 根据 action.type 路由到对应处理器
+   ├─ WEBHOOK → executeWebhookAction
+   ├─ GITHUB_DISPATCH → executeGitHubDispatchAction
+   └─ SLACK → executeSlackAction
+3. 调用共享 HTTP 执行逻辑 executeHttpAction
+```
+
+### 2.3 状态更新时机
+
+- **startedAt**：执行开始时设置（在 executeHttpAction 成功后更新）
+- **finishedAt**：执行完成（成功/失败）时设置
+- **status**：最终落库状态（COMPLETED / ERROR）
 
 ---
 
 ## 三、签名与时间戳机制
 
-### 3.1 签名算法实现
-
-**文件位置**：`packages/shared/src/encryption/signature.ts`
-
-### 3.2 签名生成逻辑
-
-采用 **HMAC-SHA256** 算法，包含时间戳防止重放攻击。
+### 3.1 签名算法实现（`signature.ts:25-40`）
 
 ```typescript
-// signature.ts:25-35
+// 生成 HMAC-SHA256 签名
 export function generateWebhookSignature(
   payload: string,
   timestamp: number,  // Unix 时间戳（秒）
   secret: string,
-) {
+): string {
   const signedPayload = `${timestamp}.${payload}`;
   return crypto
     .createHmac("sha256", secret)
@@ -102,24 +121,17 @@ export function generateWebhookSignature(
     .digest("hex");
 }
 
-// signature.ts:37-40
+// 生成签名头
 export function createSignatureHeader(payload: string, secret: string): string {
   const timestamp = Math.floor(Date.now() / 1000);  // 秒级时间戳
   const signature = generateWebhookSignature(payload, timestamp, secret);
-  return `t=${timestamp},v1=${signature}`;  // 格式：t=123456,v1=abcdef
+  return `t=${timestamp},v1=${signature}`;
 }
 ```
 
-### 3.3 签名头格式
-
-```
-x-langfuse-signature: t=1715423456,v1=a1b2c3d4e5f6...
-```
-
-### 3.4 签名头注入位置（`webhooks.ts:415-425`）
+### 3.2 签名注入位置（`webhooks.ts:415-425`）
 
 ```typescript
-// webhooks.ts:415-425
 try {
   const decryptedSecret = decrypt(webhookConfig.secretKey);
   const signature = createSignatureHeader(webhookPayload, decryptedSecret);
@@ -130,113 +142,154 @@ try {
 }
 ```
 
-### 3.5 验证方验证逻辑（接收方）
+### 3.3 签名头格式
 
-接收方应按以下步骤验证：
+```
+x-langfuse-signature: t=1715423456,v1=a1b2c3d4e5f6...
+```
 
-1. 从 header 中提取 `t`（时间戳）和 `v1`（签名）
-2. 用相同的 secret 重新计算 `HMAC(timestamp + "." + payload`
+### 3.4 接收方验证建议
+
+1. 从 header 提取 `t`（时间戳）和 `v1`（签名）
+2. 用相同 secret 重新计算 `HMAC(timestamp + "." + payload)`
 3. 比较计算结果与 header 中的签名
-4. 验证时间戳是否在合理时间窗口内（如 5 分钟）防止重放
+4. 验证时间戳是否在合理窗口内（如 5 分钟）防止重放
 
 ---
 
-## 四、失败退避与重试机制
+## 四、两层退避重试架构
 
-### 4.1 两层重试架构
-
-Langfuse 采用 **BullMQ 队列层** + **HTTP 请求层** 双层重试保障：
+### 4.1 架构概览
 
 ```
-BullMQ 队列重试（5次，指数退避）
-    ↓
-HTTP 请求内重试（exponential-backoff 库，4次）
+┌─────────────────────────────────────────────────────────────┐
+│                   BullMQ 队列层重试（外层）                    │
+│              attempts: 5 次，指数退避，间隔: 5s/10s/20s/40s/80s  │
+└─────────────────────────────────────────────────────────────┘
+                          ↓ （仅特定错误触发）
+┌─────────────────────────────────────────────────────────────┐
+│                HTTP 请求层重试（内层）                          │
+│              attempts: 4 次，exponential-backoff 库             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 BullMQ 队列层配置（`webhookQueue.ts:31-39`）
+### 4.2 队列层配置（`webhookQueue.ts:31-39`）
 
 ```typescript
 defaultJobOptions: {
-  removeOnComplete: true,      // 成功后删除
-  removeOnFail: 100_000,           // 失败保留最近10万条
-  attempts: 5,                     // 最多重试5次
+  removeOnComplete: true,
+  removeOnFail: 100_000,
+  attempts: 5,                     // 最多重试 5 次
   backoff: {
     type: "exponential",         // 指数退避
-    delay: 5000,                   // 初始延迟5秒
+    delay: 5000,                   // 初始延迟 5 秒
   },
 },
 ```
 
-**退避公式**：`delay = 5000 * 2^(attempt-1) 毫秒
+**退避公式**：`delay = 5000 * 2^(attempt-1)` 毫秒
 
 | 重试次数 | 延迟时间 |
 |---------|---------|
-| 第1次 | 5秒 |
-| 第2次 | 10秒 |
-| 第3次 | 20秒 |
-| 第4次 | 40秒 |
-| 第5次 | 80秒 |
+| 第 1 次 | 5 秒 |
+| 第 2 次 | 10 秒 |
+| 第 3 次 | 20 秒 |
+| 第 4 次 | 40 秒 |
+| 第 5 次 | 80 秒 |
 
 ### 4.3 HTTP 请求层重试（`webhooks.ts:136-223`）
-
-使用 `exponential-backoff` 库，在单次队列任务内再做 4 次重试：
 
 ```typescript
 await backOff(
   async () => {
-    // 实际 HTTP 请求逻辑
     const abortController = new AbortController();
     const timeoutId = setTimeout(() => {
-      abortController.abort();  // 超时中止
-    }, env.LANGFUSE_WEBHOOK_TIMEOUT_MS);  // 配置超时时间
+      abortController.abort();
+    }, env.LANGFUSE_WEBHOOK_TIMEOUT_MS);  // 超时中止
 
-    const redirectResult = await fetchWithSecureRedirects(
-      url,
-      {
-        method: "POST",
-        body: payload,
-        headers,
-        signal: abortController.signal,
-      },
-      redirectOptions,
-    );
+    try {
+      const whitelist = whitelistFromEnv();
+      if (!skipValidation) await validateWebhookURL(url, whitelist);  // URL 白名单
 
-    if (!res.ok) {
-      throw new Error("Webhook does not return 2xx status");
+      const redirectResult = await fetchWithSecureRedirects(
+        url,
+        { method: "POST", body: payload, headers, signal: abortController.signal },
+        redirectOptions,
+      );
+
+      if (!redirectResult.response.ok) {
+        throw new Error("Webhook does not return 2xx status");
+      }
+    } finally {
+      clearTimeout(timeoutId);
     }
   },
   {
-    numOfAttempts: 4,  // 请求内重试4次
+    numOfAttempts: 4,  // 请求内重试 4 次
   },
 );
 ```
 
-### 4.4 熔断器机制（Circuit Breaker）
+**注意**：HTTP 层重试对所有异常都生效，包括：
+- 网络超时（AbortError）
+- 非 2xx 状态码
+- 重定向校验失败
+- DNS 解析失败等网络问题
 
-连续失败 4 次后，自动禁用触发器（Trigger）：
+---
+
+## 五、失败分流策略与补偿建议
+
+### 5.1 失败分流核心逻辑（`webhooks.ts:244-252`）
+
+这是整个机制最关键的分流决策点：
 
 ```typescript
-// webhooks.ts:283-318
-// 检查连续失败次数
+// 【关键判断】哪些错误触发队列层重试，哪些错误直接终止
+const shouldRetryJob =
+  error instanceof LangfuseNotFoundError ||
+  error instanceof InternalServerError;
+
+if (shouldRetryJob) {
+  logger.warn(`Retrying BullMQ for action ${automation.action.id}`);
+  throw error;  // ✅ 抛出异常 → 触发 BullMQ 队列层重试
+}
+
+// ❌ 不抛出异常 → 直接落库为 ERROR，终止重试
+```
+
+### 5.2 错误类型分类与处理策略
+
+| 错误类型 | 触发队列重试？ | 落库状态 | 说明 |
+|---------|---------------|---------|------|
+| `LangfuseNotFoundError` | ✅ 是 | - | 配置未找到（如 automation/action 被删除），可能是临时一致性问题 |
+| `InternalServerError` | ✅ 是 | - | 服务器内部错误（如签名生成失败、数据库异常），可重试 |
+| HTTP 非 2xx 状态码 | ❌ 否 | ERROR | 接收方返回错误，不重试 |
+| 网络超时（AbortError） | ❌ 否 | ERROR | 超时，不重试 |
+| URL 白名单校验失败 | ❌ 否 | ERROR | 安全校验失败，不重试 |
+| 重定向超过次数 | ❌ 否 | ERROR | 安全校验失败，不重试 |
+| 其他网络异常 | ❌ 否 | ERROR | 网络问题，不重试 |
+
+### 5.3 熔断器机制（`webhooks.ts:283-318`）
+
+连续失败 4 次后，自动禁用触发器（Circuit Breaker）：
+
+```typescript
+// 查询该 automation 的连续失败次数
 const consecutiveFailures = await getConsecutiveAutomationFailures({
   automationId: automation.id,
   projectId,
 });
 
 if (consecutiveFailures >= 4) {
-  // 禁用触发器
+  // 禁用触发器，停止后续事件触发
   await tx.trigger.update({
     where: { id: automation.trigger.id, projectId },
     data: { status: JobConfigState.INACTIVE },
   });
 
-  // 记录最后一次失败的 executionId
-  await setActionLastFailingExecutionId({
-    tx,
-    actionId: automation.action.id,
-    projectId,
-    executionId,
-  });
+  // 记录最后一次失败的 executionId 用于排查
+  await setActionLastFailingExecutionId({ tx, actionId, projectId, executionId });
 
   logger.warn(
     `Automation ${automation.trigger.id} disabled after ${consecutiveFailures} consecutive failures`,
@@ -244,106 +297,97 @@ if (consecutiveFailures >= 4) {
 }
 ```
 
-### 4.5 状态流转
+### 5.4 状态流转图
 
 ```
-PENDING → （队列消费 → startedAt 设置
-    ↓
-  发送成功 → COMPLETED + finishedAt + output
-    ↓
-  发送失败 → ERROR + finishedAt + error + output
-    ↓
-  连续失败≥4次 → Trigger 禁用
+                     入队成功
+PENDING ────────────────────────────────────→ Worker 消费
+   │                                                │
+   │ 入队失败                                       │
+   └──→ 孤儿记录（需补偿）                          │
+                                                    │
+                        ┌───────────────────────────┴───────────────────────────┐
+                        │                                                         │
+                   执行成功                                                    执行失败
+                        │                                                         │
+                        ↓                                                         ↓
+                  COMPLETED                                        ┌───────────────────────┐
+                  finishedAt                                       │   判断错误类型         │
+                  output                                           └───────────┬───────────┘
+                                                                               │
+                                                      ┌────────────────────────┴───────────────────────┐
+                                                      │                                                │
+                                          可重试错误（NotFound/Internal）                        不可重试错误
+                                                      │                                                │
+                                                      ↓                                                ↓
+                                          throw error 触发队列重试                              落库 ERROR
+                                                      │                                        finishedAt
+                                                      │                                        error
+                                            (重试 5 次后仍失败)                                output
+                                                      │
+                                                      └────────────→ 最终落库 ERROR
 ```
+
+### 5.5 补偿与运维建议
+
+#### 问题 1：写库成功但入队失败（孤儿记录）
+
+**现象**：`status=PENDING` 且 `startedAt is null` 且 `createdAt` 超过 N 分钟
+
+**建议补偿方案**：
+```sql
+-- 查询可能的孤儿记录
+SELECT id, project_id, created_at
+FROM automation_executions
+WHERE status = 'PENDING'
+  AND started_at IS NULL
+  AND created_at < NOW() - INTERVAL '10 minutes';
+```
+
+**处理方式**：
+1. 定时任务扫描上述记录
+2. 对于有效的 execution，重新入队
+3. 告警通知运维介入
+
+#### 问题 2：队列重试耗尽后仍失败（死信）
+
+**现象**：BullMQ 5 次重试全部失败，任务进入 failed 状态
+
+**建议**：
+1. 配置 BullMQ 的 dead letter queue
+2. 定期检查死信队列
+3. 对于可恢复的错误（如临时网络问题），手动重入队
+
+#### 问题 3：熔断器触发后自动恢复
+
+**当前实现**：熔断器一旦触发，触发器永久禁用，需手动重新启用
+
+**建议改进**：
+1. 增加半开状态（half-open）支持
+2. 配置冷却期后自动尝试恢复
+3. 增加告警通知机制
+
+#### 问题 4：重试风暴风险
+
+**当前风险**：
+- HTTP 层 4 次重试 × 队列层 5 次 = 单任务最多 20 次请求
+- 大量 webhook 同时失败可能导致重试风暴
+
+**缓解建议**：
+1. 增加 jitter（抖动）到退避算法
+2. 配置队列并发度限制
+3. 增加熔断器的快速失败机制
 
 ---
 
-## 五、完整管线流程图
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        事件触发阶段                              │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Prompt 版本变更事件                                          │
-│  2. promptVersionProcessor 接收事件                            │
-│  3. InMemoryFilterService 过滤匹配触发器                        │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                      发件箱写入阶段（原子操作）                       │
-├─────────────────────────────────────────────────────────────────┤
-│  4. 生成 executionId (UUID)                                   │
-│  5. INSERT INTO automation_executions (status=PENDING)            │
-│  6. WebhookQueue.add() 加入 BullMQ 队列                           │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                    Worker 异步消费阶段                                    │
-├─────────────────────────────────────────────────────────────────┤
-│  7. webhookProcessor 从队列取任务                              │
-│  8. executeWebhook() 执行动作                                     │
-│  9. UPDATE automation_executions (startedAt=now)                  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                     签名生成阶段                                  │
-├─────────────────────────────────────────────────────────────────┤
-│ 10. 解密 webhook secret (AES 解密)                                │
-│ 11. timestamp = 当前 Unix 时间戳（秒）                                  │
-│ 12. HMAC-SHA256(timestamp + "." + payload)                │
-│ 13. x-langfuse-signature: t=...,v1=...                         │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                     HTTP 投递阶段                                │
-├─────────────────────────────────────────────────────────────────┤
-│ 14. fetchWithSecureRedirects() 安全重定向                      │
-│ 15. 超时控制 (LANGFUSE_WEBHOOK_TIMEOUT_MS)                     │
-│ 16. URL 白名单校验                                                │
-│ 17. HTTP 2xx 验证                                               │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                   重试与退避阶段                                 │
-├─────────────────────────────────────────────────────────────────┤
-│ 18. 请求内重试 (backOff, 4次)                                  │
-│ 19. 队列层重试 (BullMQ, 5次, 指数退避)                      │
-│ 20. 连续失败≥4次 → 禁用触发器                                  │
-└─────────────────────────────────────────────────────────────────┘
-                              ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                      结果持久化                                      │
-├─────────────────────────────────────────────────────────────────┤
-│ 21. 成功: status=COMPLETED, finishedAt, output                │
-│ 22. 失败: status=ERROR, finishedAt, error, output             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 六、关键配置参数
+## 附录：关键配置参数汇总
 
 | 配置项 | 值 | 位置 | 说明 |
 |--------|-----|------|------|
-| `LANGFUSE_WEBHOOK_TIMEOUT_MS` | 环境变量 | `env.ts` | 单次请求超时时间 |
-| `LANGFUSE_WEBHOOK_MAX_REDIRECTS` | 环境变量 | `env.ts` | 最大重定向次数 |
 | BullMQ attempts | 5 | `webhookQueue.ts:34` | 队列层最大重试次数 |
 | BullMQ backoff delay | 5000ms | `webhookQueue.ts:37` | 队列层初始退避延迟 |
 | HTTP backOff attempts | 4 | `webhooks.ts:221` | 请求内重试次数 |
 | 连续失败熔断阈值 | 4 | `webhooks.ts:294` | 连续失败后禁用触发器 |
 | 签名算法 | HMAC-SHA256 | `signature.ts:31` | 签名算法 |
 | 时间戳精度 | 秒 | `signature.ts:38` | 签名时间戳精度 |
-
----
-
-## 七、一致性保障总结
-
-1. **数据一致性**：先发件箱后入队，数据库事务保证不丢事件
-
-2. **投递一致性**：双层重试机制（队列层 + 请求层，最大化投递成功率
-
-3. **防重放**：时间戳签名，接收方可验证时间窗口
-
-4. **故障隔离**：熔断器机制，避免对故障接收方持续施压
-
-5. **可观测性**：全链路日志 + 数据库持久化，支持审计和问题排查
+| 重试触发错误类型 | 2 种 | `webhooks.ts:245-247` | 仅 NotFound 和 InternalServerError 触发队列重试 |
