@@ -215,44 +215,58 @@ apply(): ClickhouseFilter {
 
 #### 3.1.1 返回字段映射表
 
-| 字段名 | 来源表/CTE | 是否可选 | 受影响的开关/过滤器 | 代码位置 |
-|-------|----------|---------|--------------------|---------|
-| **核心字段** | | | | |
-| `id` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:361` |
-| `project_id` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:362` |
-| `timestamp` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:363` |
-| `tags` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:364` |
-| `bookmarked` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:365` |
-| `name` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:366` |
-| `release` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:367` |
-| `version` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:368` |
-| `user_id` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:369` |
-| `environment` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:370` |
-| `session_id` | `traces` (t) | ✅ 可选 | 始终返回 | `traces-ui-table-service.ts:371` |
-| `public` | `traces` (t) | ❌ 必选 | 始终返回 | `traces-ui-table-service.ts:377` |
-| **Metrics 字段** | | | | |
-| `latency` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
-| `calculatedTotalCost` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:374` |
-| `usage_details` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:372` |
-| `cost_details` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:373` |
-| `aggregated_level` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:372` |
-| `observation_count` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
-| `error_count` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
-| `warning_count` | `observations_stats` (o) | ✅ 可选 | `requiresObservationsJoin=true` | `traces-ui-table-service.ts:369` |
-| **Scores 字段** | | | | |
-| `scores_avg` | `scores_avg` (s) | ✅ 可选 | `requiresScoresJoin=true` | `traces-ui-table-service.ts:375` |
-| `score_categories` | `scores_avg` (s) | ✅ 可选 | `requiresScoresJoin=true` | `traces-ui-table-service.ts:376` |
+**metrics SELECT (`select="metrics"`) - 15 字段**
+
+| 字段名 | 来源表/CTE | SQL 别名表达式 | 代码位置 |
+|-------|----------|--------------|---------|
+| `id` | `traces` (t) | `t.id as id` | `traces-ui-table-service.ts:363` |
+| `project_id` | `traces` (t) | `t.project_id as project_id` | `traces-ui-table-service.ts:364` |
+| `timestamp` | `traces` (t) | `t.timestamp as timestamp` | `traces-ui-table-service.ts:365` |
+| `latency` | `observations_stats` (o) | `o.latency_milliseconds / 1000 as latency` | `traces-ui-table-service.ts:366` |
+| `cost_details` | `observations_stats` (o) | `o.cost_details as cost_details` | `traces-ui-table-service.ts:367` |
+| `usage_details` | `observations_stats` (o) | `o.usage_details as usage_details` | `traces-ui-table-service.ts:368` |
+| `level` | `observations_stats` (o) | `o.aggregated_level as level` | `traces-ui-table-service.ts:369` |
+| `error_count` | `observations_stats` (o) | `o.error_count as error_count` | `traces-ui-table-service.ts:370` |
+| `warning_count` | `observations_stats` (o) | `o.warning_count as warning_count` | `traces-ui-table-service.ts:371` |
+| `default_count` | `observations_stats` (o) | `o.default_count as default_count` | `traces-ui-table-service.ts:372` |
+| `debug_count` | `observations_stats` (o) | `o.debug_count as debug_count` | `traces-ui-table-service.ts:373` |
+| `observation_count` | `observations_stats` (o) | `o.observation_count as observation_count` | `traces-ui-table-service.ts:374` |
+| `scores_avg` | `scores_avg` (s) | `s.scores_avg as scores_avg` | `traces-ui-table-service.ts:375` |
+| `score_categories` | `scores_avg` (s) | `s.score_categories as score_categories` | `traces-ui-table-service.ts:376` |
+| `public` | `traces` (t) | `t.public as public` | `traces-ui-table-service.ts:377` |
+
+**rows SELECT (`select="rows"`) - 12 字段**
+
+| 字段名 | 来源表/CTE | SQL 别名表达式 | 代码位置 |
+|-------|----------|--------------|---------|
+| `id` | `traces` (t) | `t.id as id` | `traces-ui-table-service.ts:381` |
+| `project_id` | `traces` (t) | `t.project_id as project_id` | `traces-ui-table-service.ts:382` |
+| `timestamp` | `traces` (t) | `t.timestamp as timestamp` | `traces-ui-table-service.ts:383` |
+| `tags` | `traces` (t) | `t.tags as tags` | `traces-ui-table-service.ts:384` |
+| `bookmarked` | `traces` (t) | `t.bookmarked as bookmarked` | `traces-ui-table-service.ts:385` |
+| `name` | `traces` (t) | `t.name as name` | `traces-ui-table-service.ts:386` |
+| `release` | `traces` (t) | `t.release as release` | `traces-ui-table-service.ts:387` |
+| `version` | `traces` (t) | `t.version as version` | `traces-ui-table-service.ts:388` |
+| `user_id` | `traces` (t) | `t.user_id as user_id` | `traces-ui-table-service.ts:389` |
+| `environment` | `traces` (t) | `t.environment as environment` | `traces-ui-table-service.ts:390` |
+| `session_id` | `traces` (t) | `t.session_id as session_id` | `traces-ui-table-service.ts:391` |
+| `public` | `traces` (t) | `t.public as public` | `traces-ui-table-service.ts:392` |
+
+> **注意事项**:
+> - `calculatedTotalCost` 字段 **不存在**于后端 SQL SELECT 中，该字段由后续 `convertToUITableMetrics` 函数从 `cost_details.total` 转换计算得出
+> - metrics SELECT 中的 level 字段别名是 `level` 而非 `aggregated_level`
+> - rows SELECT 不包含任何 metrics 或 scores 字段，仅从 traces 表查询
 
 #### 3.1.2 CTE 触发条件
 
 | CTE 名称 | 触发条件 | 代码位置 |
 |---------|---------|---------|
-| `observations_stats` | 过滤器引用 observations 表 OR 选择 metrics 字段 | `traces-ui-table-service.ts:286-310` |
-| `scores_avg` | 过滤器引用 scores 表 (numberObject/categoryOptions) OR 选择 scores 字段 | `traces-ui-table-service.ts:312-326` |
+| `observations_stats` | `select === "metrics"` OR `requiresObservationsJoin=true` (过滤器引用 observations 表) | `traces-ui-table-service.ts:286-310, 451-452` |
+| `scores_avg` | `select === "metrics"` OR `requiresScoresJoin=true` (过滤器引用 scores 表) | `traces-ui-table-service.ts:312-326, 452-453` |
 
 #### 3.1.3 关键代码片段
 
-**SELECT 分支逻辑** (`traces-ui-table-service.ts:357-400`):
+**SELECT 分支逻辑** (`traces-ui-table-service.ts:356-402`):
 
 ```typescript
 switch (select) {
@@ -260,19 +274,45 @@ switch (select) {
     sqlSelect = "uniqExact(t.id) as count";
     break;
   case "metrics":
-    sqlSelect = `t.id, t.project_id, t.timestamp, o.latency_milliseconds / 1000 as latency,
-      o.cost_details, o.usage_details, o.aggregated_level,
-      o.error_count, o.warning_count, o.default_count, o.debug_count,
-      o.observation_count, s.scores_avg, s.score_categories, t.public`;
+    sqlSelect = `
+      t.id as id,
+      t.project_id as project_id,
+      t.timestamp as timestamp,
+      o.latency_milliseconds / 1000 as latency,
+      o.cost_details as cost_details,
+      o.usage_details as usage_details,
+      o.aggregated_level as level,
+      o.error_count as error_count,
+      o.warning_count as warning_count,
+      o.default_count as default_count,
+      o.debug_count as debug_count,
+      o.observation_count as observation_count,
+      s.scores_avg as scores_avg,
+      s.score_categories as score_categories,
+      t.public as public`;
     break;
   case "rows":
-    sqlSelect = `t.id, t.project_id, t.timestamp, t.tags, t.bookmarked,
-      t.name, t.release, t.version, t.user_id, t.environment, t.session_id, t.public`;
+    sqlSelect = `
+      t.id as id,
+      t.project_id as project_id,
+      t.timestamp as timestamp,
+      t.tags as tags,
+      t.bookmarked as bookmarked,
+      t.name as name,
+      t.release as release,
+      t.version as version,
+      t.user_id as user_id,
+      t.environment as environment,
+      t.session_id as session_id,
+      t.public as public`;
+    break;
+  case "identifiers":
+    sqlSelect = `t.id as id, t.project_id as projectId, t.timestamp as timestamp`;
     break;
 }
 ```
 
-**JOIN 条件** (`traces-ui-table-service.ts:450-455`):
+**JOIN 条件** (`traces-ui-table-service.ts:451-453`):
 
 ```typescript
 FROM traces t ${defaultOrder || select === "count" ? "" : "FINAL"}
