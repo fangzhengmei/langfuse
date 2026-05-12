@@ -97,9 +97,35 @@ export const webhookProcessor: Processor = async (
 
 ### 2.3 状态更新时机
 
-- **startedAt**：执行开始时设置（在 executeHttpAction 成功后更新）
-- **finishedAt**：执行完成（成功/失败）时设置
-- **status**：最终落库状态（COMPLETED / ERROR）
+`startedAt` 在成功和失败两条路径都会更新，值为执行开始时间 `executionStart`：
+
+- **成功路径**（`webhooks.ts:226-238`）：
+  ```typescript
+  data: {
+    status: ActionExecutionStatus.COMPLETED,
+    startedAt: executionStart,  // ✅ 更新
+    finishedAt: new Date(),
+  }
+  ```
+
+- **失败路径**（`webhooks.ts:262-281`）：
+  ```typescript
+  data: {
+    status: ActionExecutionStatus.ERROR,
+    startedAt: executionStart,  // ✅ 同样更新
+    finishedAt: new Date(),
+    error: ...,
+    output: ...,
+  }
+  ```
+
+| 字段 | 成功路径 | 失败路径 |
+|------|---------|---------|
+| `startedAt` | ✅ 更新 | ✅ 更新 |
+| `finishedAt` | ✅ 更新 | ✅ 更新 |
+| `status` | COMPLETED | ERROR |
+| `error` | - | ✅ 设置 |
+| `output` | - | ✅ 设置（HTTP 结果） |
 
 ---
 
