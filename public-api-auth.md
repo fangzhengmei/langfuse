@@ -9,7 +9,7 @@
 | **作用对象** | API Key（机器身份，由 ApiAuthService 解析） | User（人类用户，登录态 Session） |
 | **取值范围** | `"organization"` \| `"project"` \| `"scores"` | `OWNER` \| `ADMIN` \| `MEMBER` \| `VIEWER` \| `NONE` |
 | **派生逻辑** | 见「Scope 解析链」章节 | 见「成员角色解析」章节 |
-| **Public API 覆盖范围** | 绝大多数入口生效 | 仅浏览器交互入口生效（如 Slack OAuth） |
+| **Public API 覆盖范围** | 绝大多数入口生效 | 仅 `/api/public/slack/install` 生效，由 hasProjectAccess 基于 Session 进行判断，slack/oauth 回调不做 role 校验 |
 
 ---
 
@@ -193,7 +193,10 @@ projectRoleAccessRights: Record<Role, ProjectScope[]> = {
 |---------|-------------------|-----------------|---------------|-----------------|---------------------|---------|
 | **/api/public/ingestion** | PROJECT only | project / scores | ✅ | ❌ | ❌ | `ingestion.ts:76-88`，直接调用 ApiAuthService，无 hasProjectAccess |
 | **/api/public/traces** | PROJECT only | project | ✅ | ❌ | ❌ | `traces/index.ts:36`，使用 createAuthedProjectAPIRoute，无 Session |
-| **/api/public/scores** | PROJECT only | project / scores | ✅ | ❌ | ❌ | `scores/index.ts`，使用 createAuthedProjectAPIRoute，无 Session |
+| **/api/public/scores (POST)** | PROJECT only | project / scores | ✅ | ❌ | ❌ | `scores/index.ts:21-56`，createAuthedProjectAPIRoute 显式指定 `allowedAccessLevels: ["project", "scores"]` |
+| **/api/public/scores (GET 列表)** | PROJECT only | project | ✅ | ❌ | ❌ | `scores/index.ts:57-102`，createAuthedProjectAPIRoute 无 allowedAccessLevels 配置，默认仅 project |
+| **/api/public/scores/[scoreId] (GET 单个)** | PROJECT only | project | ✅ | ❌ | ❌ | `scores/[scoreId].ts:22-47`，createAuthedProjectAPIRoute 无 allowedAccessLevels 配置，默认仅 project |
+| **/api/public/scores/[scoreId] (DELETE)** | PROJECT only | project | ✅ | ❌ | ❌ | `scores/[scoreId].ts:48-83`，createAuthedProjectAPIRoute 无 allowedAccessLevels 配置，默认仅 project |
 | **/api/public/observations** | PROJECT only | project | ✅ | ❌ | ❌ | `observations/index.ts`，使用 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/datasets** | PROJECT only | project | ✅ | ❌ | ❌ | `datasets.ts`，使用 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/prompts** | PROJECT only | project（不允许 Bearer / scores） | ✅ | ❌ | ❌ | `prompts.ts:31-44`，直接调用 ApiAuthService，显式拒绝 Bearer auth 和 org key，无 Session |
@@ -214,8 +217,8 @@ projectRoleAccessRights: Record<Role, ProjectScope[]> = {
 | **/api/public/annotation-queues/*** | PROJECT only | project | ✅ | ❌ | ❌ | `annotation-queues/*`，使用 ApiAuthService 或 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/v2/*** | PROJECT only | project | ✅ | ❌ | ❌ | `v2/*`，使用 createAuthedProjectAPIRoute，无 Session |
 | **/api/public/unstable/*** | PROJECT only | project | ✅ | ❌ | ❌ | `unstable/*`，使用 createAuthedProjectAPIRoute，无 Session |
-| **/api/public/slack/install** | 不适用 API Key | - | - | ❌ | ✅ | `slack/install/index.ts:27-47`，使用 getServerAuthSession + hasProjectAccess，无 API Key 校验 |
-| **/api/public/slack/oauth** | 不适用 API Key | - | - | ❌ | ❌ | `slack/oauth/index.ts`，纯 OAuth 回调处理，无认证 |
+| **/api/public/slack/install** | 不适用 API Key | - | - | ❌ | ✅ | `slack/install/index.ts:27-48`，使用 getServerAuthSession + hasProjectAccess（scope: "automations:CUD"），无 API Key 校验 |
+| **/api/public/slack/oauth** | 不适用 API Key | - | - | ❌ | ❌ | `slack/oauth/index.ts`，纯 OAuth 回调处理，无认证，无 role 校验 |
 | **/api/public/health** | 不适用 | - | - | ❌ | ❌ | `health.ts`，无任何认证检查 |
 | **/api/public/ready** | 不适用 | - | - | ❌ | ❌ | `ready.ts`，无任何认证检查 |
 
@@ -264,14 +267,15 @@ await RateLimitService.getInstance().rateLimitRequest(
 
 ### 5.2 复用模式二：createAuthedProjectAPIRoute 工厂封装
 
-**适用场景**: 标准 CRUD 接口，需统一参数校验、限流、错误处理
+**适用场景**: 标准 CRUD 接口，需统一参数校验、限流、错误处理，部分接口可自定义 allowedAccessLevels
 
 **工厂内部流程**:
 ```typescript
 export const createAuthedProjectAPIRoute = (config) => {
   return async (req, res) => {
     // 1. 认证：支持 Admin API Key 或普通 API Key
-    const auth = await verifyAuth(req, config.isAdminApiKeyAuthAllowed);
+    //    allowedAccessLevels 默认为 ["project"]，可自定义（如 scores 接口）
+    const auth = await verifyAuth(req, config.isAdminApiKeyAuthAllowed, config.allowedAccessLevels);
     
     // 2. 统一限流检查（默认为 "public-api" resource）
     const rateLimit = await RateLimitService.getInstance()
@@ -304,12 +308,14 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 
 **使用此模式的入口**:
 - 所有 v1/v2 Project CRUD 接口（traces, scores, observations, datasets, sessions 等）
+  - 特殊：`/api/public/scores` POST 显式指定 `allowedAccessLevels: ["project", "scores"]`
 - 所有 unstable eval API 接口
 
 **代码证据**:
 - 工厂封装: `createAuthedProjectAPIRoute.ts:270-403`
 - Admin API Key 认证: `createAuthedProjectAPIRoute.ts:142-228`
 - verifyAuth 函数: `createAuthedProjectAPIRoute.ts:243-268`
+- scores POST allowedAccessLevels 配置: `scores/index.ts:25`
 
 ---
 
@@ -325,6 +331,8 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 | ORGANIZATION scope key 的 scope.projectId 始终为 null | `types.ts:22-30` |
 | `/api/public/prompts` 显式拒绝 Bearer auth（accessLevel = "scores"）和 ORG scope key | `prompts.ts:37-44` |
 | `/api/public/integrations/blob-storage` 要求 accessLevel 必须为 "organization" | `integrations/blob-storage/index.ts:38-44, 118-124` |
+| `/api/public/scores` POST 显式指定 allowedAccessLevels: ["project", "scores"]，允许 Bearer auth | `scores/index.ts:25` |
+| `/api/public/scores` GET 列表/单个、DELETE 无 allowedAccessLevels 配置，默认仅允许 project，拒绝 Bearer auth | `scores/index.ts:57-102`, `scores/[scoreId].ts:22-83` |
 
 ### 6.2 Scope 解析链结论
 
@@ -340,6 +348,7 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 | 结论 | 源码位置 |
 |-----|---------|
 | createAuthedProjectAPIRoute 内置 API Key 认证、限流、参数校验、错误处理 | `createAuthedProjectAPIRoute.ts:270-403` |
+| createAuthedProjectAPIRoute 支持通过 allowedAccessLevels 自定义允许的 accessLevel，默认 ["project"] | `createAuthedProjectAPIRoute.ts:245, scores/index.ts:25` |
 | Admin API Key 认证需同时匹配 Authorization 和 x-langfuse-admin-api-key Header | `createAuthedProjectAPIRoute.ts:178-193` |
 | Admin API Key 认证仅在非 CLOUD 环境可用 | `createAuthedProjectAPIRoute.ts:156-161` |
 | withMiddlewares 提供统一的异常处理和 CORS 支持 | `withMiddlewares.ts:65-186` |
@@ -350,9 +359,9 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 
 | 结论 | 源码位置 |
 |-----|---------|
-| 仅 `/api/public/slack/install` 使用 membership role 校验，其余 Public API 均不检查 | `slack/install/index.ts:27-48` |
-| Slack install 使用 NextAuth Session 而非 API Key 认证 | `slack/install/index.ts:27-31` |
-| Slack oauth 回调完全无认证检查 | `slack/oauth/index.ts:6-27` |
+| 仅 `/api/public/slack/install` 使用 membership role 校验，由 hasProjectAccess 基于 Session 判断 | `slack/install/index.ts:27-48` |
+| `/api/public/slack/install` 检验 scope 为 "automations:CUD" | `slack/install/index.ts:34-38` |
+| `/api/public/slack/oauth` 回调完全无认证检查，无 role 校验 | `slack/oauth/index.ts:6-27` |
 | hasProjectAccess 需传入 session 才能生效 | `checkProjectAccess.ts:56-67` |
 | resolveProjectRole 使用 nullish coalescing 实现 fallback，无额外优先级排序 | `userProjectRoleAuth.ts:15-18` |
 | SQL 查询通过两层 `role != 'NONE'` 过滤无权限用户，无层级继承优先级 | `userProjectRoleAuth.ts:72, 86` |
@@ -364,7 +373,7 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 | 文件路径 | 核心职责 |
 |---------|---------|
 | `web/src/features/public-api/server/apiAuth.ts` | API Key 校验 + Scope 生成 |
-| `web/src/features/public-api/server/createAuthedProjectAPIRoute.ts` | 路由工厂封装 + Admin API Key 支持 |
+| `web/src/features/public-api/server/createAuthedProjectAPIRoute.ts` | 路由工厂封装 + Admin API Key 支持 + allowedAccessLevels 配置 |
 | `web/src/features/public-api/server/withMiddlewares.ts` | 统一异常处理 + CORS |
 | `packages/shared/src/server/auth/types.ts` | Auth Scope 类型 + API_KEY_NON_EXISTENT 常量 |
 | `packages/shared/src/server/auth/apiKeys.ts` | API Key 生成 + bcrypt 哈希 |
@@ -374,6 +383,7 @@ crypto.timingSafeEqual(Buffer.from(token), Buffer.from(env.ADMIN_API_KEY));
 | `web/src/features/rbac/constants/organizationAccessRights.ts` | 组织角色权限矩阵 |
 | `web/src/features/rbac/constants/projectAccessRights.ts` | 项目角色权限矩阵 |
 | `web/src/pages/api/public/ingestion.ts` | 数据摄入 API（模式一范例） |
+| `web/src/pages/api/public/scores/index.ts` | Scores API（模式二范例，自定义 allowedAccessLevels） |
 | `web/src/pages/api/public/prompts.ts` | Prompts API（模式一范例，自定义 Bearer auth 拒绝） |
 | `web/src/pages/api/public/integrations/blob-storage/index.ts` | Blob Storage 集成 API（模式一范例，自定义 Entitlement 检查） |
-| `web/src/pages/api/public/sessions/index.ts` | 标准 CRUD API（模式二范例） |
+| `web/src/pages/api/public/slack/install/index.ts` | Slack 安装入口（Session + hasProjectAccess 范例） |
