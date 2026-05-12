@@ -1117,18 +1117,20 @@ finalCostDetails.total = 0.01
 
 > **关键点**：total 只累加**成功计算**的字段，而不是 usage 中所有字段。
 
-### 7.7 失败路径总结表
+### 7.7 失败路径总结表（修正版，带前置条件）
 
-| 失败场景 | 回退行为 | 最终结果特征 |
-|----------|----------|--------------|
-| 模型未匹配 | internalModel = null，跳过定价和成本计算 | `internal_model_id = undefined`，所有成本字段 undefined |
-| 定价层级无默认 | matchedTier = null，modelPrices 为空 | `usage_pricing_tier_id = undefined`，所有成本字段 undefined |
-| Tokenizer ID 未知 | 返回 undefined | `usage_details` 对应字段不存在 |
-| Tokenizer 配置无效 | 返回 undefined | `usage_details` 对应字段不存在 |
-| 观察状态是 ERROR | 跳过 Token 估算 | `usage_details` 全部 undefined |
-| Token 估算抛出异常 | 捕获异常，返回空 usage | `usage_details = {}` |
-| 用户提供部分成本字段 | 放弃所有自动计算，仅在 input+output 时推导 total | 未提供的成本字段都是 undefined |
-| 部分 usage 无对应价格 | 只计算能找到价格的字段 | cost_details 字段不完整，total 只累加成功项 |
+| 失败场景 | 回退行为 | 最终结果特征（分情况） |
+|----------|----------|------------------------|
+| **模型未匹配** | internalModel = null，跳过定价和自动成本计算 | **用户未提供 cost**：`internal_model_id = undefined`，成本字段 undefined<br>**用户提供了 cost**：原样保留用户的 cost，按真值表规则推导 total |
+| **定价层级无默认** | matchedTier = null，modelPrices = undefined | **用户未提供 cost**：`usage_pricing_tier_id = undefined`，成本字段 undefined<br>**用户提供了 cost**：原样保留用户的 cost，不受定价层级影响 |
+| **Tokenizer ID 未知** | tokenCount() 返回 undefined | **用户未提供 usage**：`usage_details` 对应字段不存在<br>**用户提供了 usage**：原样保留用户的 usage |
+| **Tokenizer 配置无效** | tokenCount() 返回 undefined | **用户未提供 usage**：`usage_details` 对应字段不存在<br>**用户提供了 usage**：原样保留用户的 usage |
+| **观察状态是 ERROR** | 跳过 Token 估算 | **用户未提供 usage**：`usage_details` 全部 undefined<br>**用户提供了 usage**：原样保留用户的 usage |
+| **Token 估算抛出异常** | 捕获异常，返回空 usage | **用户未提供 usage**：`usage_details = {}`<br>**用户提供了 usage**：原样保留用户的 usage |
+| **用户提供部分成本字段** | 放弃所有自动计算，仅在白名单内推导 total | **every() 通过**：推导 total 并写回<br>**every() 不通过**：不推导 total，用户提供的字段原样保留 |
+| **部分 usage 无对应价格** | 只计算能找到价格的字段 | **成功匹配价格的字段**：计算成本<br>**未匹配价格的字段**：成本字段缺失<br>**total**：只累加成功计算的字段成本 |
+
+> **核心原则**：用户提供的数据永远是"一等公民"，无论系统内部发生任何失败，用户数据都会被完整保留，不会被覆盖或清除。
 
 ---
 
@@ -1407,6 +1409,128 @@ finalCostDetails.total = 1.0;  // ← 自动添加 total
    cost_details: { input: 0.42, output: 0.54, total: 0.96 }
    total_cost: 0.96
    ```
+
+---
+
+### 8.9 补充示例：仅填 input_cost（用户提供部分成本字段）
+
+**用户 API 输入**：
+```json
+{
+  "id": "gen-def456",
+  "traceId": "trace-xyz789",
+  "model": "gpt-4-turbo",
+  "input": [{ "role": "user", "content": "Hello" }],
+  "output": "Hi there!",
+  "usage": {
+    "input": 10,
+    "output": 3,
+    "total": 13
+  },
+  "cost": {
+    "input": 0.0001  // ← 只提供 input_cost！
+  }
+}
+```
+
+**数据库模型配置**（与前面相同）：
+- input: $0.01 per 1k tokens
+- output: $0.03 per 1k tokens
+
+---
+
+#### 步骤 1：模型匹配
+
+成功匹配 `gpt-4-turbo` 模型。
+
+---
+
+#### 步骤 2：获取 Usage Units
+
+用户完整提供了所有 usage 字段，跳过自动估算。
+
+```typescript
+usage_details = { input: 10, output: 3, total: 13 }
+```
+
+---
+
+#### 步骤 3：定价层级匹配
+
+成功匹配 Standard 层级价格。
+
+```typescript
+modelPrices = [
+  { usageType: "input", price: new Decimal(0.01) },
+  { usageType: "output", price: new Decimal(0.03) }
+]
+```
+
+---
+
+#### 步骤 4：成本计算（关键！只提供了 input_cost）
+
+**执行**：`calculateUsageCosts(modelPrices, observationRecord, usage_details)`
+
+```typescript
+// 阶段 1：用户提供成本检查
+const providedCostKeys = Object.entries({ input: 0.0001 })
+  .filter(([_, v]) => v != null)
+  .map(([k]) => k);
+// → ["input"] （长度 > 0，进入用户提供优先模式）
+
+// 阶段 2：every() 白名单检查
+providedCostKeys.every((key) => ["input", "output"].includes(key));
+// → ["input"].every(...) = true ✅ （input 在白名单中）
+
+// 阶段 3：推导 total
+const finalTotalCost =
+  provided_cost_details?.["total"] ??
+  (true ? (provided_cost_details?.["input"] ?? 0) + (provided_cost_details?.["output"] ?? 0) : undefined);
+// → undefined ?? (0.0001 + 0) = 0.0001
+
+// 阶段 4：写回 total 到 cost_details
+if (!cost_details.hasOwnProperty("total") && finalTotalCost != null) {
+  cost_details.total = finalTotalCost;
+}
+// → cost_details = { input: 0.0001, total: 0.0001 }  ← total 被自动写回！
+```
+
+---
+
+#### 最终落库结果（ClickHouse）
+
+```typescript
+{
+  id: "gen-def456",
+  trace_id: "trace-xyz789",
+  model: "gpt-4-turbo",
+
+  internal_model_id: "model-gpt4-001",
+  usage_pricing_tier_name: "Standard",
+
+  // Usage 字段（用户完整提供）
+  provided_usage_details: { input: 10, output: 3, total: 13 },
+  usage_details: { input: 10, output: 3, total: 13 },
+
+  // 成本字段（关键！）
+  provided_cost_details: { input: 0.0001 },
+  cost_details: {
+    input: 0.0001,
+    total: 0.0001  // ← total 被系统自动推导并写回！
+    // 注意：output 字段不存在！因为用户只提供了 input
+  },
+  total_cost: 0.0001,
+
+  input: [{ "role": "user", "content": "Hello" }],
+  output: "Hi there!",
+}
+```
+
+> **关键点**：
+> 1. 用户只提供了 `input` 成本，但 total 被自动推导并写回
+> 2. `output` 成本字段保持缺失（不会用 tokens × 单价自动计算）
+> 3. total_cost = input_cost，与真值表第 2 行完全一致
 
 ---
 
