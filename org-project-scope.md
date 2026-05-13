@@ -488,17 +488,23 @@ VALUES
 ```typescript
 whereClause = {
   orgId: query.orgId,
-  OR: [
-    { role: { not: Role.NONE } },                    // 组织角色不是 NONE
-    {
-      ProjectMemberships: {
-        some: {
-          projectId: query.projectId,
-          role: { not: Role.NONE },                 // 当前项目角色不是 NONE
-        },
-      },
-    },
-  ],
+  // restrict to only members with role in a project if projectId is set and showAllOrgMembers is false
+  ...("projectId" in query && !showAllOrgMembers
+    ? {
+        // either org level role or project level role
+        OR: [
+          { role: { not: Role.NONE } },                    // 组织角色不是 NONE
+          {
+            ProjectMemberships: {
+              some: {
+                projectId: query.projectId,
+                role: { not: Role.NONE },                 // 当前项目角色不是 NONE
+              },
+            },
+          },
+        ],
+      }
+    : {}),
 };
 ```
 
@@ -551,7 +557,99 @@ WITH all_eligible_users AS (
 
 ---
 
-### 6.2 getUserProjectRoles() 风险结论重写
+### 6.2 边界场景：showAllOrgMembers = false 时的黑名单误显示问题
+
+#### 触发前提条件
+
+**前提 1 - 查看者权限**：调用 `allMembersRoutes.allFromProject` 接口的用户
+- ✅ 有**项目级**权限：`hasProjectAccess({ projectId, scope: "projectMembers:read" }) = true`
+- ❌ **没有**组织级权限：`hasOrganizationAccess({ scope: "organizationMembers:read" }) = false`
+- 最终：`showAllOrgMembers = orgAccess = false`
+
+**前提 2 - 被查看者配置**：
+- 组织角色非 NONE（如 VIEWER、MEMBER 等）
+- **在当前项目显式设为 NONE**（即黑名单排除）
+
+#### 为什么与"成员表逻辑正确"相冲突？
+
+`OR` 查询条件的逻辑问题：
+```sql
+-- 实际 SQL 条件（showAllOrgMembers = false 时）
+WHERE org.role != 'NONE'                    -- 条件 A：组织角色非 NONE
+   OR EXISTS (                              -- 条件 B：当前项目角色非 NONE
+         SELECT 1 FROM project_memberships pm
+         WHERE pm.org_membership_id = org.id
+           AND pm.project_id = ?
+           AND pm.role != 'NONE'
+       )
+```
+
+**冲突分析**：
+- 黑名单用户满足**条件 A**（组织角色非 NONE），即使在当前项目是 NONE
+- OR 逻辑意味着只要条件 A 满足，用户就被包含在结果中
+- 但根据权限规则，项目角色 NONE 应该完全排除该项目访问权限
+
+#### 实际影响：哪些人会被误显示？
+
+| 用户配置 | 实际最终权限 | showAllOrgMembers=true<br>（组织管理员查看） | showAllOrgMembers=false<br>（仅项目管理员查看） |
+|---------|-------------|-----------------------------------------|---------------------------------------------|
+| 组织角色 MEMBER<br>无项目角色覆盖 | ✅ MEMBER | ✅ 显示（正确） | ✅ 显示（正确） |
+| 组织角色 MEMBER<br>当前项目设为 ADMIN | ✅ ADMIN | ✅ 显示（正确） | ✅ 显示（正确） |
+| 组织角色 MEMBER<br>当前项目设为 NONE<br>（黑名单排除） | ❌ NONE（不可访问） | ✅ 显示（组织管理员可见） | ⚠️ **误显示！**<br>用户实际不能访问项目，但出现在成员表中 |
+| 组织角色 NONE<br>当前项目设为 OWNER | ✅ OWNER | ✅ 显示（正确） | ✅ 显示（正确） |
+
+#### 与现有代码一致的修正思路
+
+**SQL 条件修正**：在第一个 OR 分支中增加"当前项目无显式覆盖"的排除条件：
+
+```sql
+-- 修改前
+WHERE org.role != 'NONE'
+   OR EXISTS (/* 当前项目角色非 NONE */)
+
+-- 修改后（不改变原有代码模式，仅补充条件）
+WHERE (
+  org.role != 'NONE'
+  AND NOT EXISTS (
+    SELECT 1 FROM project_memberships pm
+    WHERE pm.org_membership_id = org.id
+      AND pm.project_id = ?  -- 关键：限定当前项目
+  )
+) OR EXISTS (/* 当前项目角色非 NONE */)
+```
+
+**TypeScript 对应修正**（保持现有代码结构）：
+```typescript
+OR: [
+  // 修改前：{ role: { not: Role.NONE } }
+  // 修改后：
+  {
+    role: { not: Role.NONE },
+    NOT: {
+      ProjectMemberships: {
+        some: { projectId: query.projectId }
+      }
+    }
+  },
+  {
+    ProjectMemberships: {
+      some: {
+        projectId: query.projectId,
+        role: { not: Role.NONE },
+      },
+    },
+  },
+],
+```
+
+**修正逻辑说明**：
+- 第一个分支：组织角色非 NONE **且**在当前项目没有任何显式角色 → 显示（继承组织角色）
+- 第二个分支：在当前项目有显式角色且非 NONE → 显示（项目覆盖）
+- 被排除：组织角色非 NONE 但在当前项目显式设为 NONE → 不显示（黑名单）
+
+---
+
+### 6.3 getUserProjectRoles() 风险结论
 
 #### 核心问题识别
 
@@ -573,6 +671,7 @@ NOT EXISTS (
 | 组织角色 MEMBER<br>在**当前项目**设为 ADMIN | ✅ 显示，项目角色 ADMIN | ✅ 包含，角色 ADMIN | ✅ 可访问 |
 | 组织角色 MEMBER<br>在**其他项目**设为 ADMIN<br>当前项目无覆盖 | ✅ 显示，项目角色空（继承 MEMBER） | ❌ **不包含** | ✅ 可访问 |
 | 组织角色 NONE<br>在当前项目设为 OWNER | ✅ 显示，项目角色 OWNER | ✅ 包含，角色 OWNER | ✅ 可访问 |
+| 组织角色 MEMBER<br>在当前项目设为 NONE<br>（showAllOrgMembers=false） | ⚠️ **误显示** | ❌ 不包含 | ❌ 不可访问 |
 
 #### ⚠️ 准确风险结论
 
@@ -582,7 +681,6 @@ NOT EXISTS (
 3. **通知邮件收件人**：同上，这类用户收不到评论通知
 
 **不影响的范围**：
-- ❌ **不影响**项目设置页面的成员表（使用 getMembers()，逻辑正确）
 - ❌ **不影响**用户实际访问权限（Session 计算逻辑独立、正确）
 - ❌ **不影响**权限中间件和 Scope 断言
 
@@ -623,8 +721,9 @@ NOT EXISTS (
 | 5. 系统管理员访问时 | 自动注入 OWNER 角色 | 检查中间件中的 admin 旁路逻辑 |
 | 6. API 调用 Scope 检查 | 必须调用 `throwIfNoProjectAccess()` | 检查路由 Handler 第一行代码 |
 | 7. 前端路由访问 NONE 项目 | AppLayout 返回 ErrorPage 或 MinimalLayout | 检查 AppLayout index.tsx 第 85-103 行 |
-| 8. getMembers 查询逻辑 | 用户在其他项目有覆盖时仍正确显示 | 对照 allMembersRoutes.ts 第 38-59 行 |
-| 9. getUserProjectRoles 查询逻辑 | 仅影响通知/分配下拉，不影响成员表和访问权限 | 对照 userProjectRoleAuth.ts UNION 查询 |
+| 8. getMembers showAllOrgMembers=true | 显示所有组织成员（组织管理员） | 对照 allMembersRoutes.ts 逻辑 |
+| 9. getMembers showAllOrgMembers=false | 黑名单用户（项目 NONE）不应显示 | 对照 OR 条件补充 NOT EXISTS 逻辑 |
+| 10. getUserProjectRoles 查询逻辑 | 仅影响通知/分配下拉，不影响成员表和访问权限 | 对照 userProjectRoleAuth.ts UNION 查询 |
 
 ---
 
@@ -804,7 +903,20 @@ throwIfNoProjectAccess({ scope: "..." })
 | 6 | 用 U2 登录访问 P1 | 可正常访问 P1，权限正确 |
 | 7 | 结论：成员表显示 ≠ 通知/分配下拉可选用户 | getUserProjectRoles 影响范围仅限下拉列表 |
 
-### 10.3 综合验证矩阵
+### 10.3 showAllOrgMembers=false 黑名单误显示验证
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 创建组织 A，创建项目 P1 | |
+| 2 | 管理员用户 Admin：组织角色 OWNER（有组织级成员管理权限） | |
+| 3 | 项目管理员 PM：组织角色 VIEWER，在 P1 设为 ADMIN<br>→ PM 只有项目级权限，无组织级权限 | |
+| 4 | 黑名单用户 Blacklist：组织角色 MEMBER，在 P1 显式设为 NONE | |
+| 5 | 用 Admin 登录查看 P1 成员表（showAllOrgMembers=true） | Blacklist 显示在列表中，项目角色列显示 NONE |
+| 6 | 用 PM 登录查看 P1 成员表（showAllOrgMembers=false） | ⚠️ **当前代码**：Blacklist 误显示在列表中<br>✅ **修正后期望**：Blacklist 不显示 |
+| 7 | 用 Blacklist 登录访问 P1 | 不能访问 P1（权限正确，与显示问题独立） |
+| 8 | 验证结论：权限计算正确 ≠ 成员表显示正确 | 这是前端展示层面的信息泄露问题，不影响实际访问控制 |
+
+### 10.4 综合验证矩阵
 
 | 验证场景 | 通过标准 | 备注 |
 |---------|---------|------|
@@ -812,3 +924,4 @@ throwIfNoProjectAccess({ scope: "..." })
 | 组织角色 OWNER + 项目角色 NONE | 不能访问项目 | 黑名单排除正常 |
 | 组织角色 ADMIN + 其他项目有覆盖 | Session 计算正确 | resolveProjectRole 按项目独立计算 |
 | 项目成员表 vs 通知下拉 | 两者不一致是已知问题 | 仅影响 UX，不影响权限安全 |
+| 项目管理员查看含黑名单的成员表 | 黑名单用户应被过滤 | showAllOrgMembers=false 场景 |
