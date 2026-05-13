@@ -344,30 +344,30 @@ export const membersRouter = createTRPCRouter({
 │                    权限校验完整执行链路                                │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  用户发送 API 请求                                     │
+│  用户发送 API 请求                                      │
 │      │                                                             │
 │      ▼                                                             │
 │  1. tRPC 中间件 enforceUserIsAuthedAndProjectMember                   │
 │      │                                                             │
-│      ├─ 检查 session.user 是否存在                                   │
-│      ├─ 从输入中解析 projectId                                      │
-│      ├─ 在 session.organizations[*].projects 中查找项目                │
-│      └─ 将 {orgId, orgRole, projectId, projectRole} 注入 ctx.session   │
+│      ├─ 检查 session.user 是否存在                                    │
+│      ├─ 从输入中解析 projectId                                       │
+│      ├─ 在 session.organizations[*].projects 中查找项目                 │
+│      └─ 将 {orgId, orgRole, projectId, projectRole} 注入 ctx.session    │
 │                                                                     │
 │      │                                                             │
 │      ▼                                                             │
-│  2. 路由 Handler 执行                                                │
+│  2. 路由 Handler 执行                                                 │
 │      │                                                             │
 │      ▼                                                             │
-│  3. ⭐ 调用 throwIfNoProjectAccess() 做 Scope 断言                     │
+│  3. ⭐ 调用 throwIfNoProjectAccess() 做 Scope 断言                      │
 │      │                                                             │
-│      ├─ 参数：{ role: ctx.session.projectRole, scope: "..." }         │
-│      ├─ 查表 projectRoleAccessRights[role]                          │
-│      └─ 不包含所需 Scope 则抛出 FORBIDDEN                              │
+│      ├─ 参数：{ role: ctx.session.projectRole, scope: "..." }          │
+│      ├─ 查表 projectRoleAccessRights[role]                           │
+│      └─ 不包含所需 Scope 则抛出 FORBIDDEN                               │
 │                                                                     │
 │      │                                                             │
 │      ▼                                                             │
-│  4. 执行业务逻辑                                                      │
+│  4. 执行业务逻辑                                                       │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -408,26 +408,56 @@ projects: orgMembership.organization.projects
 
 ---
 
-#### 过滤节点 2：前端路由守卫（前端）
+#### 过滤节点 2：前端 AppLayout 层拦截（前端）
 
-位置：`web/src/components/layouts/app-layout/hooks/useProjectAccess.ts:277-283`
+**真实实现逻辑**：
+
+位置：`web/src/components/layouts/app-layout/index.tsx:85-103
 
 ```typescript
-// 基于 Session 中预计算的项目列表校验
-const userProjects =
-  session?.user?.organizations
-    ?.flatMap((org) => org?.projects?.map((p) => p?.id))
-    .filter(Boolean) ?? [];
+// Project access denied - handle based on path type
+if (session.status === "authenticated" && !projectAccess.hasAccess) {
+  // For publishable paths (shared traces/sessions), render minimal layout without sidebar
+  // This allows authenticated users to view shared content without seeing project navigation
+  if (isPublishable) {
+    return <MinimalLayout>{props.children}</MinimalLayout>;
+  }
 
-// ⭐ 由于 Session 中已经没有 NONE 角色的项目，这里的 includes 自然返回 false
-const hasAccess = userProjects.includes(routerProjectId);
+  // For non-publishable paths, show error page
+  return (
+    <ErrorPageWithSentry
+      title="Project Not Found"
+      message="The project you are trying to access does not exist or you do not have access to it."
+      additionalButton={{
+        label: "Go to Home",
+        href: "/",
+      }}
+    />
+  );
+}
 ```
 
-**逻辑**：
-- 由于 Session 阶段已经过滤掉 NONE 项目，`userProjects` 数组中根本没有这些项目 ID
-- 直接访问 `/project/{id}` 时 `includes()` 检查失败
-- `useProjectAccess` 返回 `hasAccess: false`
-- AppLayout 渲染"无权限访问"错误页面
+**触发条件**（同时满足）：
+1. `session.status === "authenticated"` - 用户已登录
+2. `!projectAccess.hasAccess` - Hook 返回无访问权限（即项目不在 Session projects 列表中）
+
+**实际返回结果（分两种情况**：
+- **情况 A - 可公开路径（isPublishable = true）**：
+  - 包括：共享的 traces、sessions 页面
+  - 返回：`<MinimalLayout>` 极简布局（无侧边栏导航）
+  - 目的：允许已登录用户查看共享内容，不暴露项目导航
+
+- **情况 B - 普通项目路径（isPublishable = false）**：
+  - 包括：项目设置、成员管理等所有其他项目页面
+  - 返回：`<ErrorPageWithSentry>` 错误页面
+  - 标题："Project Not Found"
+  - 提示信息："The project you are trying to access does not exist or you do not have access to it."
+  - 带"Go to Home"按钮返回首页
+
+**关键点修正说明**：
+- 不是统一的 403 状态码，而是在 React 组件层面的布局切换
+- 故意使用"Project Not Found"而非"Access Denied"，避免泄露项目存在性信息
+- 共享路径特殊处理保证分享链接体验
 
 ---
 
@@ -461,7 +491,9 @@ VALUES
 
 1. **Session 中的 projects 列表**：仅包含 `project-2`
 2. **前端项目选择器**：只显示 Project 2
-3. **直接访问 `/project/project-1`**：`useProjectAccess` 返回 false → 显示权限错误
+3. **直接访问 `/project/project-1`**：
+   - 非共享路径 → 显示"Project Not Found"错误页面（不是 403）
+   - 共享路径 → 显示 MinimalLayout 极简布局
 4. **直接调用 API `membersRouter.byProjectId`**：
    - 中间件在 `session.user.organizations[*].projects` 中找不到 `project-1`
    - 抛出 `UNAUTHORIZED: "User is not a member of this project"`
@@ -472,9 +504,86 @@ VALUES
 
 ---
 
-## 六、组织角色/项目角色组合权限对照表
+## 六、成员角色查询深挖：跨项目覆盖角色的继承逻辑
 
-### 6.1 组合矩阵说明
+### 6.1 问题场景
+
+用户在组织 A 是 MEMBER，在项目 B 被显式设为 ADMIN，在**当前查询的项目 C** 没有任何 ProjectMembership 记录。此时用户在项目 C 的角色是什么？
+
+### 6.2 查询逻辑深度解析
+
+位置：`packages/shared/src/server/auth/userProjectRoleAuth.ts:66-89`
+
+```sql
+WITH all_eligible_users AS (
+  -- ⭐ 第一部分：仅继承组织角色的用户（无当前项目覆盖）
+  SELECT u.id, u.name, u.email, om.role as role
+  FROM organization_memberships om
+  INNER JOIN users u ON om.user_id = u.id
+  WHERE om.org_id = ?
+    AND om.role != 'NONE'
+    -- 🔑 关键判断条件：NOT EXISTS 检查是否有 ANY 项目覆盖？不是！
+    AND NOT EXISTS (
+      SELECT 1 FROM project_memberships pm 
+      WHERE pm.org_membership_id = om.id
+    )
+  
+  UNION
+  
+  -- 第二部分：有当前项目显式角色覆盖的用户
+  SELECT u.id, u.name, u.email, pm.role as role
+  FROM organization_memberships om
+  INNER JOIN project_memberships pm ON om.id = pm.org_membership_id
+  INNER JOIN users u ON om.user_id = u.id
+  WHERE om.org_id = ?
+    AND pm.project_id = ?  -- 只匹配当前查询的项目
+    AND pm.role != 'NONE'
+)
+```
+
+### 6.3 NOT EXISTS 子查询的真实含义
+
+**注意**：第一个 UNION 分支的 `NOT EXISTS` 条件检查的是：
+
+```sql
+NOT EXISTS (
+  SELECT 1 FROM project_memberships pm 
+  WHERE pm.org_membership_id = om.id
+  -- ❌ 这里没有 AND pm.project_id = ? 过滤！
+)
+```
+
+这意味着：
+- ✅ **检查用户在**任何**项目有项目级别的成员关系**
+- ❌ **不是**检查用户在**当前**项目是否有覆盖
+
+### 6.4 逻辑漏洞与风险结论
+
+#### 实际行为分析
+
+| 场景 | 组织角色 | 用户在其他项目有覆盖？ | 用户在当前项目有覆盖？ | 最终角色来源 | 实际结果 |
+|------|---------|-----------------------|----------------------|-------------|---------|
+| 场景1：无任何项目覆盖 | MEMBER | ❌ 否 | ❌ 否 | 第一分支（组织角色） | ✅ MEMBER |
+| 场景2：当前项目有覆盖 | MEMBER | ✅ 是 | ✅ 是 | 第二分支（项目角色） | ✅ 正确 |
+| **场景3：仅其他项目有覆盖** | **MEMBER** | **✅ 是** | **❌ 否** | **两个分支都不匹配** | **❌ 从成员列表消失** |
+
+#### ⚠️ 风险结论
+
+**关键问题**：当用户在**其他项目**有角色覆盖、但在**当前查询项目**没有覆盖时，该用户不会出现在当前项目的成员列表中。
+
+**影响：
+1. **不可见性**：这类用户在项目成员管理页面不会显示
+2. **权限仍生效**：但 Session 计算时仍按组织角色继承（用户实际上可以访问该项目）
+3. **不一致性**：成员列表 ≠ 实际能访问项目的用户
+4. **审计盲区**：无法从成员列表判断谁实际有权限
+
+#### 根本原因：SQL 查询的 NOT EXISTS 条件过于宽泛，没有限定 `pm.project_id = ?`
+
+---
+
+## 七、组织角色/项目角色组合权限对照表
+
+### 7.1 组合矩阵说明
 
 **使用方法**：横向为组织角色，纵向为项目覆盖角色，交叉点为最终权限结果。
 
@@ -485,11 +594,12 @@ VALUES
 | **MEMBER**   | 最终角色：MEMBER<br>可见项目：✅<br>读写权限<br>（项目覆盖降级） | 最终角色：MEMBER<br>可见项目：✅<br>读写权限<br>（项目覆盖降级） | 最终角色：MEMBER<br>可见项目：✅<br>读写权限 | 最终角色：MEMBER<br>可见项目：✅<br>读写权限<br>（项目覆盖提升权限） | 最终角色：MEMBER<br>可见项目：✅<br>读写权限<br>（项目覆盖提升权限） |
 | **VIEWER**   | 最终角色：VIEWER<br>可见项目：✅<br>只读权限<br>（项目覆盖降级） | 最终角色：VIEWER<br>可见项目：✅<br>只读权限<br>（项目覆盖降级） | 最终角色：VIEWER<br>可见项目：✅<br>只读权限<br>（项目覆盖降级） | 最终角色：VIEWER<br>可见项目：✅<br>只读权限 | 最终角色：VIEWER<br>可见项目：✅<br>只读权限<br>（项目覆盖提升权限） |
 | **NONE**     | 最终角色：NONE<br>可见项目：❌ 被过滤<br>无任何权限<br>（组织内排除） | 最终角色：NONE<br>可见项目：❌ 被过滤<br>无任何权限<br>（组织内排除） | 最终角色：NONE<br>可见项目：❌ 被过滤<br>无任何权限<br>（组织内排除） | 最终角色：NONE<br>可见项目：❌ 被过滤<br>无任何权限<br>（组织内排除） | 最终角色：NONE<br>可见项目：❌ 被过滤<br>无任何权限 |
-| **无覆盖**   | 最终角色：OWNER<br>可见项目：✅<br>全部 Scope<br>（继承组织） | 最终角色：ADMIN<br>可见项目：✅<br>大部分管理权限<br>（继承组织） | 最终角色：MEMBER<br>可见项目：✅<br>读写权限<br>（继承组织） | 最终角色：VIEWER<br>可见项目：✅<br>只读权限<br>（继承组织） | 最终角色：NONE<br>可见项目：❌ 被过滤<br>（继承组织） |
+| **无覆盖（且无任何项目成员记录）**   | 最终角色：OWNER<br>可见项目：✅<br>全部 Scope<br>（继承组织） | 最终角色：ADMIN<br>可见项目：✅<br>大部分管理权限<br>（继承组织） | 最终角色：MEMBER<br>可见项目：✅<br>读写权限<br>（继承组织） | 最终角色：VIEWER<br>可见项目：✅<br>只读权限<br>（继承组织） | 最终角色：NONE<br>可见项目：❌ 被过滤<br>（继承组织） |
+| **⚠️ 无覆盖（但其他项目有覆盖）** | 最终角色：OWNER<br>可见项目：✅<br>**成员列表不可见**<br>Session 正常继承 | 最终角色：ADMIN<br>可见项目：✅<br>**成员列表不可见**<br>Session 正常继承 | 最终角色：MEMBER<br>可见项目：✅<br>**成员列表不可见**<br>Session 正常继承 | 最终角色：VIEWER<br>可见项目：✅<br>**成员列表不可见**<br>Session 正常继承 | 最终角色：NONE<br>可见项目：❌ 被过滤 |
 
 ---
 
-### 6.2 权限复核检查清单
+### 7.2 权限复核检查清单
 
 权限复核时，请对照以下检查项：
 
@@ -501,13 +611,14 @@ VALUES
 | 4. 组织角色为 NONE 时 | 所有项目默认不可见 | 检查 `projectRoleAccessRights[NONE]` 为空数组 |
 | 5. 系统管理员访问时 | 自动注入 OWNER 角色 | 检查中间件中的 admin 旁路逻辑 |
 | 6. API 调用 Scope 检查 | 必须调用 `throwIfNoProjectAccess()` | 检查路由 Handler 第一行代码 |
-| 7. 前端路由访问 NONE 项目 | 返回 403 权限错误 | 检查 `useProjectAccess()` 返回值 |
+| 7. 前端路由访问 NONE 项目 | AppLayout 返回 ErrorPage 或 MinimalLayout | 检查 AppLayout index.tsx 第 85-103 行 |
+| 8. 跨项目覆盖的成员查询 | 其他项目有覆盖但当前没有时，从成员列表消失 | 对照 getUserProjectRoles SQL 的 NOT EXISTS 逻辑 |
 
 ---
 
-## 七、权限范围与角色映射
+## 八、权限范围与角色映射
 
-### 7.1 项目级权限范围定义
+### 8.1 项目级权限范围定义
 
 位置：`web/src/features/rbac/constants/projectAccessRights.ts`
 
@@ -621,9 +732,9 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
 
 ---
 
-## 八、完整权限验证流程
+## 九、完整权限验证流程
 
-### 8.1 数据流概览
+### 9.1 数据流概览
 
 ```
 用户登录
@@ -650,7 +761,7 @@ throwIfNoProjectAccess({ scope: "..." })
 查表 projectRoleAccessRights[role].includes(scope)
 ```
 
-### 8.2 关键设计决策
+### 9.2 关键设计决策
 
 1. **Session 预计算**：登录时一次性计算所有权限，避免每次 API 调用都查数据库
 2. **角色继承优先**：减少 ProjectMembership 记录数量，大多数用户只需组织级角色
@@ -660,7 +771,7 @@ throwIfNoProjectAccess({ scope: "..." })
 
 ---
 
-## 九、SQL 级联查询优化
+## 十、SQL 级联查询优化
 
 位置：`packages/shared/src/server/auth/userProjectRoleAuth.ts:43-96`
 
@@ -694,3 +805,35 @@ SELECT * FROM all_eligible_users
 ```
 
 这种设计避免了 N+1 查询问题，高效获取项目成员列表。
+
+---
+
+## 十一、权限复核最小验证步骤
+
+### 11.1 前端拦截行为验证
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 创建组织 ADMIN 用户，在项目 1 设置 NONE 角色，在项目 2 不设置 | 登录后项目选择器只显示项目 2 |
+| 2 | 用该用户直接浏览器访问 `/project/{项目1-id}/settings` | 页面显示"Project Not Found"错误页面（不是 403），带"Go to Home"按钮 |
+| 3 | 分享一个项目 1 的 trace 链接给该用户，让其点击访问 | 显示 MinimalLayout 极简布局（无侧边栏），能看到 trace 内容 |
+
+### 11.2 跨项目覆盖的成员查询验证
+
+| 步骤 | 操作 | 预期结果 |
+|------|------|---------|
+| 1 | 创建组织 A，创建 3 个项目 P1/P2/P3 | |
+| 2 | 用户 U1：组织角色 MEMBER，不设置任何项目角色 | P1 成员列表能看到 U1，角色 MEMBER |
+| 3 | 用户 U2：组织角色 MEMBER，在 P2 设为 ADMIN，P1/P3 不设置 | P2 成员列表能看到 U2，角色 ADMIN |
+| 4 | ⚠️ 检查 P1 成员列表 | **U2 不在列表中（风险点！） |
+| 5 | 用 U2 登录访问 P1 | **可正常访问 P1（权限仍生效） |
+| 6 | 结论验证：成员列表 ≠ 实际有访问权限的用户列表 | 存在审计盲区 |
+
+### 11.3 综合验证矩阵
+
+| 验证场景 | 通过标准 | 备注 |
+|---------|---------|------|
+| 组织角色 NONE + 项目角色 OWNER | 可以访问项目 | 越级提升正常 |
+| 组织角色 OWNER + 项目角色 NONE | 不能访问项目 | 黑名单排除正常 |
+| 组织角色 ADMIN + 其他项目有覆盖 | Session 计算正确 | resolveProjectRole 按项目独立计算 |
+| 成员列表 API 返回结果 | 与 Session 可见列表对比 | 不一致则说明有跨项目覆盖问题 |
