@@ -684,13 +684,40 @@ export const validateDatasetItem = (itemInput, variables) => {
 
 **触发时机**：`processLLMCall` 阶段的 `replaceVariablesInPrompt` 抛出异常
 
-**触发条件**：
-1. **缺少 placeholder 值**：Chat Prompt 需要的 {placeholder} 在输入中不存在
+---
+
+#### ⚠️ **重要勘误**：普通模板变量 vs Placeholder 的处理差异
+
+| 变量类型 | 缺失时的行为 | 是否会抛错 |
+|---------|-------------|-----------|
+| **普通模板变量** `{{variable}}` | 保留原始占位文本（如 `{{missingVar}}`），静默继续 | ❌ **不会抛错** |
+| **Placeholder 消息** `{placeholder}` | 必须存在且格式合法 | ✅ **会抛错** |
+
+**源码证据**（`worker/src/features/utils/utilities.ts:4-21`）：
+```typescript
+export function compileTemplateString(template, context) {
+  return template.replace(/{{\s*([\w.]+)\s*}}/g, (match, key) => {
+    if (key in context) {
+      // 变量存在：替换为值
+      return value === undefined || value === null ? "" : String(value);
+    }
+    // 变量缺失：返回原始占位符（包括 {{ }}），不报错
+    return match; 
+  });
+}
+```
+
+**结论**：普通模板变量缺失**不是失败条件**，不会中断执行。真正会抛出错误的只有 Placeholder 相关的问题。
+
+---
+
+**触发条件（仅以下场景会抛错）**：
+1. **缺少 placeholder 值**：Chat Prompt 需要的 `{placeholder}` 在输入中不存在
 2. **Placeholder 格式错误**：
    - 值是字符串但无法解析为 JSON 数组
    - 值不是数组类型
    - 数组中的消息不是有效对象
-3. **模板变量替换错误**：`compileTemplateString` 执行失败
+3. **输入格式异常**：`normalizeDatasetItemInput` 抛出 `"Invalid dataset item input"`
 
 **处理逻辑**：
 
