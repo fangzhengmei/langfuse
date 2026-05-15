@@ -217,30 +217,39 @@ async function getItemsToProcess(projectId, datasetId, runId, config) {
 
 **数据集条目验证逻辑**：
 
-**文件**：`packages/shared/src/domain/dataset-items.ts`
+**文件**：`packages/shared/src/features/experiments/utils.ts:29-50`
 
 ```typescript
-// 检查数据集条目输入是否包含所有必需的变量
-export function validateDatasetItem(
-  input: Prisma.JsonValue | null | undefined,
+// 检查数据集条目输入是否匹配至少一个 Prompt 变量
+export const validateDatasetItem = (
+  itemInput: Prisma.JsonValue,
   variables: string[],
-): boolean {
-  // 没有变量 = 始终有效
-  if (variables.length === 0) return true;
-
-  // 字符串输入：只需一个变量，且输入是字符串
-  if (variables.length === 1) {
-    return typeof input === "string" && input.length > 0;
+): boolean => {
+  // 单变量场景：字符串输入即可通过
+  if (
+    typeof itemInput === "string" &&
+    itemInput !== "" &&
+    variables.length === 1
+  ) {
+    return true;
   }
 
-  // 对象输入：检查是否包含所有必需的键
-  if (typeof input === "object" && input !== null && !Array.isArray(input)) {
-    return variables.every((variable) => variable in input);
+  // 对象输入：只需包含至少一个匹配的变量键（不是必须全部）
+  if (!isValidPrismaJsonObject(itemInput)) {
+    return false;
   }
 
-  return false;
-}
+  // 使用 some 而非 every：命中任一变量即可通过
+  return variables.some((variable) =>
+    datasetItemMatchesVariable(itemInput, variable),
+  );
+};
 ```
+
+**验证规则说明**：
+- ✅ **单变量 Prompt**：输入为非空字符串即通过
+- ✅ **多变量 Prompt**：输入对象中只需包含任一 Prompt 变量（不是必须全部包含）
+- ❌ 输入既不是字符串也不是有效对象时验证失败
 
 #### 2.4.3 处理每个数据集条目
 
@@ -890,7 +899,7 @@ const invalidItems = allItems.filter(
 
 ---
 
-## 6. 总结
+## 7. 总结
 
 从数据集条目到实验运行的完整链路具有以下特点：
 
