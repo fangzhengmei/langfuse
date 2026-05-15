@@ -525,46 +525,64 @@ datasetItem.id
 
 ### 4.1 失败分支总览
 
-实验运行过程中有两条主要的失败分支：
+实验运行过程中有三条主要的失败分支：
 
-| 失败类型 | 触发时机 | 影响范围 | 是否重试 |
+| 失败类型 | 触发阶段 | 影响范围 | 失败行为 |
 |---------|---------|---------|---------|
-| **A. 实验配置异常** | `validateAndSetupExperiment` 阶段 | 整个实验所有条目 | 否，直接创建错误记录 |
-| **B. 单条目输入校验不通过** | `getItemsToProcess` 阶段 | 单个数据集条目 | 否，跳过该条目 |
+| **A. 实验配置异常** | `validateAndSetupExperiment` 阶段 | 整个实验所有条目 | 为所有条目创建 ERROR 级别的记录 |
+| **B. 输入校验不通过（条目级）** | `getItemsToProcess` 阶段 | 单个数据集条目 | 静默跳过，不创建任何记录 |
+| **C. 变量替换失败（条目级）** | `processLLMCall` 阶段 | 单个数据集条目 | 已创建 DatasetRunItem，但 Trace/Observation 不完整 |
 
 ```
-                        实验启动
-                           │
-                           ▼
-                 ┌─────────────────────┐
-                 │  验证实验配置        │
-                 └─────────┬───────────┘
-                           │
-              ┌────────────┴────────────┐
-              │ 失败                  成功 │
-              ▼                         ▼
-     ┌──────────────────┐     ┌──────────────────┐
-     │ 配置异常分支     │     │ 获取数据集条目   │
-     │ (所有条目标记)   │     └────────┬─────────┘
-     └──────────────────┘              │
-                              ┌─────────┴─────────┐
-                              │ 逐条校验输入格式 │
-                              └─────────┬─────────┘
-                              ┌─────────┴─────────┐
-                              │  通过   │  不通过  │
-                              ▼         ▼         │
-                        ┌──────────┐ ┌──────────┐  │
-                        │ LLM 调用 │ │  跳过    │  │
-                        └────┬─────┘ └──────────┘  │
-                             │                      │
-                             └──────────────────────┘
+                              实验启动
+                                 │
+                                 ▼
+                       ┌─────────────────────┐
+                       │  验证实验配置        │
+                       └─────────┬───────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │ 失败                  成功 │
+                    ▼                         ▼
+           ┌──────────────────┐     ┌──────────────────┐
+           │ 配置异常分支     │     │ 获取数据集条目   │
+           │ 所有条目创建 ERROR │     └────────┬─────────┘
+           │ 级别的 Trace      │              │
+           └──────────────────┘              │
+                                    ┌─────────┴─────────┐
+                                    │  输入校验过滤     │
+                                    │ (validateDatasetItem) │
+                                    └─────────┬─────────┘
+                                    ┌─────────┴─────────┐
+                                    │  通过   │  不通过  │
+                                    ▼         ▼         │
+                           ┌─────────────┐  ┌─────────┐  │
+                           │  创建       │  │  静默   │  │
+                           │ DatasetRunItem│  │  跳过   │  │
+                           └──────┬──────┘  └─────────┘  │
+                                  │                      │
+                           ┌──────┴──────┐               │
+                           │ 变量替换    │               │
+                           │ replaceVariablesInPrompt│    │
+                           └───┬────┬───┘               │
+                               │    │                   │
+                          ┌────▼──┐┌▼────┐             │
+                          │ 成功  ││失败 │             │
+                          └───┬───┘└────┬┘             │
+                              │         │              │
+                              ▼         ▼              │
+                    ┌─────────────┐ ┌─────────────┐    │
+                    │ 执行 LLM 调用│ │ Trace 不完整│    │
+                    └─────────────┘ └─────────────┘    │
+                              │                         │
+                              └─────────────────────────┘
 ```
 
 ---
 
-### 4.2 失败分支 A：实验配置异常
+### 4.2 失败分支 A：实验配置异常（全局）
 
-**触发条件**：`validateAndSetupExperiment` 函数抛出异常
+**触发时机**：`createExperimentJobClickhouse` → `validateAndSetupExperiment` 抛出异常
 
 **可能的异常原因**：
 1. DatasetRun 记录不存在（PostgreSQL 查询失败）
@@ -585,266 +603,223 @@ async function createAllDatasetRunItemsWithConfigError(
   runId: string,
   errorMessage: string,
 ) {
-  // 1. 获取所有 ACTIVE 数据集条目
-  const datasetItems = await getDatasetItems({
-    projectId,
-    filterState: createDatasetItemFilterState({
-      datasetIds: [datasetId],
-      status: "ACTIVE",
-    }),
-    includeIO: true,
-  });
-
-  // 2. 检查已存在的 runItem，避免重复创建
-  const existingRunItemDatasetItemIds = 
-    await getExistingRunItemDatasetItemIds(projectId, runId, datasetId);
-
-  const newItems = datasetItems.filter(
-    (item) => !existingRunItemDatasetItemIds.has(item.id),
-  );
-
-  // 3. 为每个新条目创建 3 个事件：DATASET_RUN_ITEM_CREATE + TRACE_CREATE + GENERATION_CREATE
-  const events: IngestionEventType[] = newItems.flatMap((datasetItem) => {
-    const traceId = v4();  // 注意：配置错误时 traceId 是随机的，不是确定性的
-    const runItemId = v4();
-    const generationId = v4();
-    const timestamp = new Date().toISOString();
-
-    return [
-      // 事件1：DatasetRunItem 创建事件，带错误信息
-      {
-        id: runItemId,
-        type: eventTypes.DATASET_RUN_ITEM_CREATE,
-        timestamp,
-        body: {
-          id: runItemId,
-          traceId,
-          observationId: null,
-          error: `Experiment configuration error: ${errorMessage}`,
-          createdAt: timestamp,
-          datasetId: datasetItem.datasetId,
-          runId: runId,
-          datasetItemId: datasetItem.id,
-          datasetVersion: datasetItem.validFrom.toISOString(),
-        },
-      },
-      // 事件2：Trace 创建事件
-      {
-        id: traceId,
-        type: eventTypes.TRACE_CREATE,
-        timestamp,
-        body: {
-          id: traceId,
-          environment: LangfuseInternalTraceEnvironment.PromptExperiments,
-          name: `dataset-run-item-${runItemId.slice(0, 5)}`,
-          input: stringInput,  // 数据集条目的输入（JSON 序列化）
-        },
-      },
-      // 事件3：Generation 创建事件（标记 ERROR 级别）
-      {
-        id: generationId,
-        type: eventTypes.GENERATION_CREATE,
-        timestamp,
-        body: {
-          id: generationId,
-          environment: LangfuseInternalTraceEnvironment.PromptExperiments,
-          traceId,
-          input: stringInput,
-          level: "ERROR" as const,  // 关键：标记为 ERROR 级别
-          statusMessage: `Experiment configuration error: ${errorMessage}`,
-        },
-      },
-    ];
-  });
-
-  // 4. 批量写入 ClickHouse
-  if (events.length > 0) {
-    await processEventBatch(
-      events,
-      { validKey: true, scope: { projectId, accessLevel: "project" } },
-      { isLangfuseInternal: true },
-    );
-  }
+  // 为每个数据集条目创建带 ERROR 标记的 3 个事件
+  // DatasetRunItem_CREATE + Trace_CREATE + Generation_CREATE
+  // ...
 }
 ```
 
 **生成的记录特征**：
-
-| 记录类型 | 状态/级别 | 错误信息位置 | 关键特征 |
-|---------|---------|---------|---------|
-| DatasetRunItem | - | `body.error` | 包含完整错误消息前缀 `Experiment configuration error:` |
-| Trace | - | `body.input` | 只记录输入，无输出 |
-| Generation (Observation) | `level: "ERROR"` | `body.statusMessage` | ERROR 级别，无 model、latency、cost 字段 |
-
-**关键区别（配置错误 vs 正常执行）**：
-1. **Trace ID 生成方式**：配置错误时使用随机 `v4()`，不是 `createW3CTraceId` 生成的确定性 ID
-2. **Observation 级别**：配置错误时是 `ERROR`，正常执行是 `DEFAULT`
-3. **字段完整性**：配置错误的 Generation 缺少 model、provider、usage 等 LLM 调用字段
+- DatasetRunItem: `error` 字段包含 `Experiment configuration error:` 前缀
+- Trace: 只记录输入，无输出
+- Generation: `level = "ERROR"`，包含 `statusMessage`，无 LLM 调用字段
 
 ---
 
-### 4.3 失败分支 B：单条目输入校验不通过
+### 4.3 失败分支 B：输入校验不通过（条目级，静默跳过）
+
+**触发时机**：`getItemsToProcess` 阶段的 `filter` 操作
 
 **触发条件**：`validateDatasetItem(input, variables)` 返回 `false`
 
 **校验失败的场景**：
 1. **单变量 Prompt**：数据集条目输入不是字符串或为空
-2. **多变量 Prompt**：数据集条目输入不是对象，或缺少某个必需的变量 key
-3. **Placeholder 消息**：Chat Prompt 的 {placeholder} 对应的值不是有效消息数组
+2. **多变量 Prompt**：数据集条目输入不是有效 JSON 对象
 
-**处理逻辑**：
-
-**文件**：`worker/src/features/experiments/experimentServiceClickhouse.ts:232-290`
-
-```typescript
-async function getItemsToProcess(projectId, datasetId, runId, config) {
-  // 1. 获取所有数据集条目
-  const datasetItems = await getDatasetItems({/* ... */});
-
-  // 2. 过滤并验证：只保留输入格式匹配 Prompt 变量的条目
-  const validatedDatasetItems = datasetItems
-    .filter(({ input }) => {
-      // validateDatasetItem 返回 false 的条目会被静默过滤
-      return validateDatasetItem(input, config.allVariables);
-    })
-    .map((datasetItem) => {
-      // 后续处理...
-    });
-
-  // 3. 校验不通过的条目被直接排除，不会进入 processItem 循环
-  // 注意：这里不会为校验不通过的条目创建任何记录！
-
-  return validatedDatasetItems;
-}
-```
-
-**⚠️ 重要特征：输入校验不通过的条目不会创建任何记录**
-
-与配置异常不同，输入校验不通过的数据集条目是**静默失败**，不会产生任何痕迹：
-- ❌ 不创建 DatasetRunItem 记录
-- ❌ 不创建 Trace 记录
-- ❌ 不创建 Generation/Observation 记录
-- ❌ 不在日志中记录该条目 ID（仅记录总数量）
-- ✅ 该条目在实验结果中完全不显示
-
-**日志记录**：
-```typescript
-logger.info(
-  `Found ${validatedDatasetItems.length} valid items, 
-   ${existingDatasetItemIds.size} already exist, 
-   ${itemsToProcess.length} to process`
-);
-```
-*通过对比数据集总条目数和 valid items 数，可以间接推断有多少条目标记为校验失败*
+**校验规则说明（代码事实）**：
+> **不是必须覆盖全部变量，而是命中任一变量即可通过**
+> - 代码使用 `variables.some(...)` 而非 `variables.every(...)`
+> - 只要输入对象中存在任一 Prompt 变量的 key，就通过校验
+> - 即使缺少其他变量也不会导致校验失败
+> - 单变量 Prompt 可以直接传入字符串，会被自动包装为对象
 
 ---
 
-### 4.4 失败记录查询入口
+#### 🔍 **分类边界：输入校验失败 vs 变量替换失败**
 
-#### 4.4.1 查询配置错误的实验运行
+| 维度 | **B类 - 输入校验失败** | **C类 - 变量替换失败** |
+|-----|-----------------------|----------------------|
+| **执行阶段** | `getItemsToProcess` 阶段（filter） | `processLLMCall` 阶段（try/catch） |
+| **检查对象** | 输入的**类型和基本格式** | 输入值的**内容有效性** |
+| **Prompt 变量规则** | 命中任一变量即可通过（some） | 需要全部变量正确替换 |
+| **Placeholder 处理** | ❌ **不检查** placeholder（placeholder 不是 `validateDatasetItem` 的参数） | ✅ **完整检查**：存在性、JSON解析、数组格式、消息对象有效性 |
+| **错误记录方式** | 完全静默（filter 掉，无任何 DB 记录） | 半成功（DatasetRunItem 已创建，错误只写日志） |
+
+> **关键结论**：Placeholder 值格式错误**不属于**输入校验失败，而是在变量替换阶段才会被检测到。因为 `validateDatasetItem` 函数根本不接收 `placeholderNames` 参数，只接收 `variables` 参数。
+>
+> ```typescript
+> // 函数签名：只有 variables，没有 placeholderNames
+> export const validateDatasetItem = (
+>   itemInput: Prisma.JsonValue,
+>   variables: string[],  // ← 只检查 variables，不检查 placeholders
+> ): boolean => { ... }
+> ```
+
+```typescript
+// 实际校验逻辑（packages/shared/src/features/experiments/utils.ts:29-50）
+export const validateDatasetItem = (itemInput, variables) => {
+  // 单变量场景：字符串输入即可通过
+  if (typeof itemInput === "string" && itemInput !== "" && variables.length === 1) {
+    return true;
+  }
+  
+  // 对象场景：命中任一变量即可通过（some，不是 every）
+  return variables.some(variable => 
+    datasetItemMatchesVariable(itemInput, variable)
+  );
+};
+```
+
+**失败行为**：⚠️ **完全静默，不创建任何记录**
+- ❌ 不创建 DatasetRunItem 记录
+- ❌ 不创建 Trace 记录
+- ❌ 不创建 Generation/Observation 记录
+- ❌ 日志中不记录具体条目 ID，只显示总数
+
+**排障方式**：总条目数 - 已处理条目数 = 校验不通过条目数
+
+---
+
+### 4.4 失败分支 C：变量替换失败（条目级，半成功状态）
+
+**触发时机**：`processLLMCall` 阶段的 `replaceVariablesInPrompt` 抛出异常
+
+**触发条件**：
+1. **缺少 placeholder 值**：Chat Prompt 需要的 {placeholder} 在输入中不存在
+2. **Placeholder 格式错误**：
+   - 值是字符串但无法解析为 JSON 数组
+   - 值不是数组类型
+   - 数组中的消息不是有效对象
+3. **模板变量替换错误**：`compileTemplateString` 执行失败
+
+**处理逻辑**：
+
+**文件**：`worker/src/features/experiments/utils.ts:106-139`
+
+```typescript
+export const replaceVariablesInPrompt = (prompt, itemInput, variables, placeholderNames) => {
+  // 处理消息 placeholder
+  for (const placeholderName of placeholderNames) {
+    if (!(placeholderName in itemInput)) {
+      throw new Error(`Missing placeholder value for '${placeholderName}'`);
+    }
+    // 验证 JSON 可解析
+    // 验证是数组类型
+    // 验证数组元素是有效对象
+  }
+  // ...
+};
+```
+
+**在 processLLMCall 中的错误处理**：
+```typescript
+try {
+  messages = replaceVariablesInPrompt(...);
+} catch (error) {
+  logger.error(
+    `Failed to replace variables in prompt for dataset item ${datasetItem.id}`,
+    error,
+  );
+  return { success: false };  // 直接返回，不执行 LLM 调用
+}
+```
+
+**失败行为**：⚠️ **半成功状态，记录不完整**
+- ✅ **已创建** DatasetRunItem 记录（在 processItem 开头创建）
+  - `traceId` 已设置（确定性 ID）
+  - `observationId = null`
+  - `error = null`（错误只在日志中，不写入数据库）
+- ❌ **未创建** Trace 记录（LLM 调用未执行）
+- ❌ **未创建** Generation/Observation 记录
+- ✅ **有日志**：包含具体 datasetItem ID 和错误原因
+
+**生成的记录特征**：
+| 记录类型 | 是否存在 | 关键特征 |
+|---------|---------|---------|
+| DatasetRunItem | ✅ | `observationId = null`，`error = null` |
+| Trace | ❌ | 无对应记录 |
+| Generation/Observation | ❌ | 无对应记录 |
+
+---
+
+### 4.5 失败记录查询入口
+
+#### 4.5.1 三类失败状态汇总表
+
+| 失败类型 | 前端可见性 | DatasetRunItem | Trace/Observation | 排障方式 |
+|---------|-----------|---------------|-------------------|---------|
+| **A. 配置异常** | ✅ 完全可见 | ✅ 带错误信息 | ✅ ERROR 级别 | UI 中直接看到红色错误状态 |
+| **B. 输入校验不通过** | ❌ 完全不可见 | ❌ 不存在 | ❌ 不存在 | 总数对比法 |
+| **C. 变量替换失败** | ⚠️ 半可见（只有 runItem） | ✅ 存在但无关联 | ❌ 不存在 | 查询 `observationId IS NULL` 的 runItem |
+
+#### 4.5.2 查询配置异常的实验（A 类）
 
 **前端入口**：项目 → 实验 → 具体实验运行详情页
 
-**API 查询方式**：
+**特征**：所有条目都显示错误状态（红色），Level 为 ERROR
 
+**API 查询方式**：
 ```typescript
-// 方式1：通过 experiment items API 查询（带过滤）
+// 过滤 ERROR 级别的条目
 const items = await getExperimentItemsFromEvents({
   projectId: "project-id",
-  baseExperimentId: "run-id",  // experimentId
+  baseExperimentId: "run-id",
   compExperimentIds: [],
-  // 过滤 ERROR 级别的 observation
   filterByExperiment: [{
     experimentId: "run-id",
-    filters: [{
-      column: "level",
-      operator: "=",
-      value: "ERROR"
-    }]
+    filters: [{ column: "level", operator: "=", value: "ERROR" }]
   }]
 });
-
-// 方式2：直接查询 ClickHouse（高级）
-const errorRunItems = await queryClickhouse({
-  query: `
-    SELECT 
-      dataset_item_id,
-      trace_id,
-      error
-    FROM dataset_run_items_rmt
-    WHERE 
-      project_id = {projectId: String}
-      AND dataset_run_id = {runId: String}
-      AND error LIKE 'Experiment configuration error:%'
-  `,
-  params: { projectId, runId }
-});
 ```
 
-**在 UI 中识别配置错误**：
-- 所有条目都显示错误状态（红色）
-- Trace 详情中 Level 显示为 ERROR
-- statusMessage 字段包含具体错误原因
-- 无 LLM 调用相关的指标（latency、cost、usage 都为空）
+#### 4.5.3 排查输入校验不通过的条目（B 类）
 
-#### 4.4.2 排查输入校验不通过的条目
+由于完全不创建记录，只能通过**排除法**：
 
-由于校验不通过的条目不创建记录，需要通过排除法排查：
-
-**步骤1：获取数据集总条目数**
 ```typescript
+// 步骤1：获取数据集 ACTIVE 条目总数
 const totalItems = await getDatasetItemsCount({
-  projectId,
-  filterState: createDatasetItemFilterState({
-    datasetIds: [datasetId],
-    status: "ACTIVE"
-  })
+  projectId, datasetId, status: "ACTIVE"
 });
-```
 
-**步骤2：获取实验已创建的 runItem 数**
-```typescript
-const processedItemIds = await getExistingRunItemDatasetItemIds(
+// 步骤2：获取实验已创建的 runItem 数
+const processedCount = (await getExistingRunItemDatasetItemIds(
   projectId, runId, datasetId
-);
-const processedCount = processedItemIds.size;
+)).size;
+
+// 步骤3：计算校验不通过数量
+const skippedCount = totalItems - processedCount;
 ```
 
-**步骤3：计算校验不通过的条目数**
-```
-校验不通过数量 = 总 ACTIVE 条目数 - 已处理条目数
-```
+#### 4.5.4 排查变量替换失败的条目（C 类）
 
-**步骤4：逐一验证具体条目（调试用）**
-```typescript
-const allItems = await getDatasetItems({
-  projectId,
-  filterState: createDatasetItemFilterState({
-    datasetIds: [datasetId],
-    status: "ACTIVE"
-  }),
-  includeIO: true
-});
+通过查询 `observationId IS NULL` 的 DatasetRunItem：
 
-const variables = ["var1", "var2"]; // 从 Prompt 中提取的变量
-const invalidItems = allItems.filter(
-  item => !validateDatasetItem(item.input, variables)
-);
+```sql
+-- ClickHouse 直接查询
+SELECT 
+  dataset_item_id,
+  trace_id
+FROM dataset_run_items_rmt
+WHERE 
+  project_id = {projectId: String}
+  AND dataset_run_id = {runId: String}
+  AND observation_id IS NULL;
 ```
 
-#### 4.4.3 综合查询入口（tRPC Router）
+**然后查 worker 日志**：
+- 搜索 `Failed to replace variables in prompt for dataset item ${itemId}`
+- 日志包含具体错误原因（缺少 placeholder、JSON 解析失败等）
 
-**文件**：`web/src/features/experiments/server/router.ts`
+#### 4.5.5 综合查询入口（tRPC Router）
 
-| 查询函数 | 用途 | 是否包含失败记录 |
-|---------|------|-----------------|
-| `all` | 查询实验列表 | 是，所有实验都显示 |
-| `byId` | 查询单个实验详情 | 是，包含 ERROR 级别的条目 |
-| `items` | 查询实验条目列表 | 是，配置错误的条目会显示 |
-| `metrics` | 查询实验指标 | 错误条目不计入 latency、cost 等指标 |
-| `batchIO` | 查询批量输入输出 | 错误条目的 output 为空 |
-
-**注意**：输入校验不通过的条目在上述所有 API 中都不会出现，因为它们从未被写入数据库。
+| 查询函数 | 配置异常(A) | 校验不通过(B) | 变量替换失败(C) |
+|---------|------------|--------------|-----------------|
+| `all` | ✅ 实验会显示 | ❌ | ⚠️ 实验显示，但条目数偏少 |
+| `byId` | ✅ | ❌ | ✅ 但指标异常 |
+| `items` | ✅ 显示为 ERROR | ❌ 不显示 | ✅ 显示但 observationId 为空 |
+| `metrics` | ❌ 不计入统计 | ❌ | ❌ 不计入统计 |
+| `batchIO` | ✅ 但 output 为空 | ❌ | ✅ 但 output 为空 |
 
 ---
 
