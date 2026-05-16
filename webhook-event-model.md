@@ -427,7 +427,19 @@ function verifyWebhookSignature(signatureHeader, payload, secret) {
 
 ## 6. 失败处理与自动禁用机制
 
-### 6.1 错误分类与处理策略
+### 6.1 不同动作类型的失败策略差异
+
+> **重要发现**：三种动作类型的自动禁用策略存在显著差异
+
+| 动作类型 | 禁用触发器阈值 | 失败计数逻辑 |
+|---------|--------------|------------|
+| **Webhook** | 连续失败 **>= 4 次** | 有连续失败计数，遇成功即重置 |
+| **GitHub Dispatch** | 连续失败 **>= 4 次** | 与 Webhook 相同（共用 executeHttpAction） |
+| **Slack** | **单次失败** 后立即禁用 | 无失败计数逻辑，一次失败直接禁用 |
+
+---
+
+### 6.2 Webhook / GitHub Dispatch 错误处理
 
 ```typescript
 catch (error) {
@@ -455,20 +467,20 @@ catch (error) {
       },
     });
 
-    // 计算连续失败次数
+    // 3. 计算连续失败次数（仅统计 lastFailingExecutionId 之后的记录）
     const consecutiveFailures = await getConsecutiveAutomationFailures({
       automationId: automation.id,
       projectId,
     });
 
-    // 3. 连续失败阈值：4次后自动禁用触发器
+    // 4. 连续失败阈值：4次后自动禁用触发器
     if (consecutiveFailures >= 4) {
       await tx.trigger.update({
         where: { id: automation.trigger.id, projectId },
         data: { status: JobConfigState.INACTIVE },
       });
 
-      // 记录最后一次失败的执行ID（用于重置计数）
+      // 记录最后一次失败的执行ID（用于重置计数基准）
       await setActionLastFailingExecutionId({
         tx,
         actionId: automation.action.id,
@@ -480,6 +492,142 @@ catch (error) {
     }
   });
 }
+```
+
+---
+
+### 6.3 Slack 错误处理（单次失败即禁用）
+
+```typescript
+catch (error) {
+  logger.error("Error executing Slack action", error);
+
+  // Slack 无失败重试或计数逻辑：单次失败立即禁用触发器
+  await prisma.$transaction(async (tx) => {
+    // 1. 更新执行状态为 ERROR
+    await tx.automationExecution.update({
+      where: { id: executionId, projectId },
+      data: {
+        status: ActionExecutionStatus.ERROR,
+        startedAt: executionStart,
+        finishedAt: new Date(),
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+    });
+
+    // 2. 立即禁用触发器（无连续失败判断）
+    await tx.trigger.update({
+      where: { id: automation.trigger.id, projectId },
+      data: { status: JobConfigState.INACTIVE },
+    });
+
+    // 3. 记录失败执行ID
+    await setActionLastFailingExecutionId({
+      tx,
+      actionId: automation.action.id,
+      projectId,
+      executionId,
+    });
+
+    logger.warn(
+      `Automation ${automation.trigger.id} disabled after 1 failure in project ${projectId}`
+    );
+  });
+}
+```
+
+---
+
+### 6.4 完整时序链路：重试、状态流转与禁用条件
+
+```
+  实体变更事件
+      │
+      ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │  创建 AutomationExecution (status = PENDING)              │
+  └───────────────────────────┬───────────────────────────────┘
+                              │
+                              ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │  加入 WebhookQueue (BullMQ)                               │
+  │  队列配置: attempts=5, backoff=exponential(5s)            │
+  └───────────────────────────┬───────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+              ▼                               ▼
+  ┌───────────────────────┐       ┌───────────────────────┐
+  │  处理器接收任务       │       │  5次队列重试耗尽      │
+  │  status → PROCESSING  │       │  (内部错误场景)       │
+  └───────────┬───────────┘       └───────────┬───────────┘
+              │                               │
+              ▼                               ▼
+  ┌─────────────────────────────────────┐   ┌─────────────────┐
+  │   分动作类型执行                    │   │  队列丢弃任务  │
+  │   ├─ Webhook → executeHttpAction    │   └─────────────────┘
+  │   ├─ GitHub → executeHttpAction     │
+  │   └─ Slack → 直接发送 Slack API     │
+  └───────────────────┬─────────────────┘
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+  ┌───────────────┐       ┌───────────────┐
+  │   执行成功    │       │   执行失败    │
+  │ status=COMPLETED │    │  进入失败处理 │
+  └───────┬───────┘       └───────┬───────┘
+          │                       │
+          │                       │
+          │         ┌─────────────┴─────────────┐
+          │         │                           │
+          │         ▼                           ▼
+          │  ┌─────────────────────┐   ┌─────────────────────┐
+          │  │  Webhook/GitHub     │   │  Slack 动作         │
+          │  │  - HTTP内重试4次    │   │  - 无内部重试       │
+          │  │  - 计算连续失败次数 │   │  - 单次失败即禁用   │
+          │  │  - 失败>=4 → 禁用触发器 │   │                 │
+          │  └───────────┬─────────┘   └──────────┬──────────┘
+          │              │                         │
+          │              ▼                         ▼
+          │      ┌───────────────┐         ┌───────────────┐
+          │      │  连续失败<4  │         │  禁用触发器   │
+          │      │  继续等待    │         │  status=INACTIVE │
+          │      └───────┬───────┘         └───────────────┘
+          │              │
+          │              ▼
+          │      ┌───────────────┐
+          │      │  连续失败>=4  │
+          │      │  禁用触发器   │
+          │      └───────────────┘
+          │
+          ▼
+  ┌───────────────────────────────────────────────────────────┐
+  │  执行完成，等待下一次事件触发                              │
+  └───────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 6.5 重试层级的精确边界
+
+```
+BullMQ 队列级重试 (5次, 指数退避)
+  ├─ 触发条件：
+  │   ├─ LangfuseNotFoundError (配置丢失)
+  │   └─ InternalServerError (内部服务错误)
+  └─ 影响范围：整个动作执行流程从头开始
+
+HTTP 请求级重试 (4次, exponential-backoff)
+  ├─ 仅 Webhook/GitHub Dispatch 有此层级
+  ├─ 触发条件：
+  │   ├─ 网络错误 (fetch失败)
+  │   ├─ HTTP 非 2xx 响应
+  │   └─ 请求超时 (abortController)
+  └─ 影响范围：仅 HTTP 请求本身，不影响状态流转
+
+无重试层级 (Slack专属)
+  └─ 任何失败直接进入 ERROR 状态 + 禁用触发器
 ```
 
 ### 6.2 连续失败计数逻辑
