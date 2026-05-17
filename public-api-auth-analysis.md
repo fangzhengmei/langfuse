@@ -46,7 +46,7 @@ OrgEnrichedApiKey = discriminatedUnion("scope", [
 ### Public API 两种路由实现模式
 
 #### A. 项目级路由 (createAuthedProjectAPIRoute) - 95% 端点使用
-- **实现路径**: 大多数 Public API 端点使用此包装器
+- **实现路径**: 绝大多数 Public API 端点使用此包装器
 - **类型约束** [createAuthedProjectAPIRoute.ts:28]:
   ```typescript
   type RouteAccessLevel = Exclude<ApiAccessLevel, "organization">; // 明确排除 organization
@@ -62,27 +62,58 @@ OrgEnrichedApiKey = discriminatedUnion("scope", [
 - **权限等级配置**:
   - 默认 `["project"]` - 仅项目级密钥可用
   - `POST /api/public/scores` 特殊配置 `["project", "scores"]` - 同时支持 Bearer 公钥
-    - **证据来源**: [web/src/pages/api/public/scores/index.ts:25]
 
-#### B. 组织级路由 (直接调用 ApiAuthService) - 仅 3 个端点
-- **路径前缀**: `/api/public/organizations/*`
-- **实现方式**: 不使用 `createAuthedProjectAPIRoute`，直接调用 `ApiAuthService`
-- **校验逻辑**: 主动检查 `accessLevel === "organization"`，否则返回 403
+#### B. 组织级路由 (直接调用 ApiAuthService) - 4 大类 14 个端点
+- **统一校验模式**: 所有组织级路由都直接调用 `ApiAuthService`，并执行完全相同的两级校验：
   ```typescript
   if (authCheck.scope.accessLevel !== "organization" || !authCheck.scope.orgId) {
-    return res.status(403).json({ error: "Organization-scoped API key required" });
+    return res.status(403).json({ message: "Organization-scoped API key required" });
   }
   ```
-- **实际端点列表**:
-  1. `/api/public/organizations/projects` - 获取组织下所有项目
-  2. `/api/public/organizations/apiKeys` - 管理组织 API 密钥
-  3. `/api/public/organizations/memberships` - 管理组织成员
+
+### 组织级密钥端点完整盘点 (14个端点)
+
+#### 类别 1: /api/public/organizations/* - 3个端点
+| 端点路径 | 方法 | 所需 Entitlement | 返回码 |
+|---------|------|-----------------|--------|
+| `/organizations/projects` | GET | admin-api | 401/403/200 |
+| `/organizations/apiKeys` | GET | admin-api | 401/403/200 |
+| `/organizations/memberships` | GET/PUT/DELETE | admin-api | 401/403/200 |
+
+#### 类别 2: /api/public/projects/* - 4个端点 (项目管理操作)
+| 端点路径 | 方法 | 所需 Entitlement | 额外校验 |
+|---------|------|-----------------|---------|
+| `/projects/[projectId]` | PUT/DELETE | admin-api | 校验项目属于该组织 |
+| `/projects/[projectId]/apiKeys` | GET/POST | admin-api | 校验项目属于该组织 |
+| `/projects/[projectId]/memberships` | GET/PUT/DELETE | admin-api + rbac-project-roles | 校验项目属于该组织 |
+
+#### 类别 3: /api/public/scim/* - 6个端点
+| 端点路径 | 方法 | 所需 Entitlement | 响应格式 |
+|---------|------|-----------------|---------|
+| `/scim/Users` | GET/POST | 无 | SCIM 格式 |
+| `/scim/Users/[id]` | GET/PUT/PATCH/DELETE | 无 | SCIM 格式 |
+| `/scim/ServiceProviderConfig` | GET | 无 | SCIM 格式 |
+| `/scim/Schemas` | GET | 无 | SCIM 格式 |
+| `/scim/ResourceTypes` | GET | 无 | SCIM 格式 |
+
+> **SCIM 特殊说明**: SCIM 端点使用 SCIM 标准错误格式而非标准 JSON，但鉴权逻辑与其他组织级端点完全一致：
+> - 401: 认证失败
+> - 403: 非组织级密钥访问
+> - 响应格式带 schemas 字段
+
+#### 类别 4: /api/public/integrations/blob-storage/* - 2个端点
+| 端点路径 | 方法 | 所需 Entitlement | 实现模式 |
+|---------|------|-----------------|---------|
+| `/integrations/blob-storage` | GET/PUT | scheduled-blob-exports | withMiddlewares 包装 |
+| `/integrations/blob-storage/[id]` | GET/DELETE | scheduled-blob-exports | withMiddlewares 包装 |
+
+> **Blob Storage 特殊说明**: 此端点使用 `withMiddlewares` 统一错误处理（与项目级路由相同），但鉴权逻辑仍是组织级校验模式。
 
 ### 管理员密钥认证 (Admin API Key)
 - **生效路由**: 仅 LLM Connections 相关接口
-  - `GET /api/public/llm-connections` [llm-connections/index.ts:27]
-  - `PUT /api/public/llm-connections` [llm-connections/index.ts:84]
-  - `DELETE /api/public/llm-connections/:id` [llm-connections/[id].ts:25]
+  - `GET /api/public/llm-connections`
+  - `PUT /api/public/llm-connections`
+  - `DELETE /api/public/llm-connections/:id`
 - **触发条件** (必须全部满足):
   1. 无 `NEXT_PUBLIC_LANGFUSE_CLOUD_REGION` (仅自托管可用)
   2. `Authorization: Bearer <ADMIN_API_KEY>`
@@ -111,19 +142,19 @@ OrgEnrichedApiKey = discriminatedUnion("scope", [
 ### Public API 租户隔离
 
 #### 项目级路由隔离 (createAuthedProjectAPIRoute)
-- **项目级强制**: `projectId` 必须存在且为 `string`，组织级密钥直接被拒绝
+- **项目级强制**: `projectId` 必须存在且为 `string`，组织级密钥直接被拒绝 (403)
 - **作用域注入**: 自动将 `auth.scope.projectId` 注入处理函数上下文
-- **适用端点**: 除 `/api/public/organizations/*` 外的所有 Public API
+- **适用端点**: 除上述 14 个组织级端点外的所有 Public API
 
 #### 组织级路由隔离
-- **组织级强制**: `orgId` 必须存在且 `accessLevel === "organization"`
-- **作用域注入**: 使用 `auth.scope.orgId` 跨项目访问组织资源
-- **适用端点**: 仅 `/api/public/organizations/*` 下的 3 个端点
+- **组织级强制**: `orgId` 必须存在且 `accessLevel === "organization"`，项目级密钥直接被拒绝 (403)
+- **跨项目访问**: 使用 `auth.scope.orgId` 作为隔离边界，可访问组织下所有项目
+- **额外项目校验**: 操作特定项目资源的端点会二次校验项目属于该组织 (404)
 
 ### Ingestion 租户隔离 [统一最终口径]
 - **项目级隔离 - 绝对强制**: `projectId` 必须为非空字符串
   - 组织级密钥因 `projectId === null` 被 401 拒绝
-  - 不存在"组织级密钥可访问所有项目"的 ingestion 场景
+  - **不存在**"组织级密钥可跨项目写入数据"的场景
 - **组织级属性**: 通过 API Key 传递 `plan`、`rateLimitOverrides` 等元数据
   - 仅 **项目级密钥** 才能用于数据摄入，但其背后关联的组织信息用于限流和计划检查
 - **上下文传递**: 通过 OpenTelemetry context 将 `projectId` 注入处理流程
@@ -132,7 +163,7 @@ OrgEnrichedApiKey = discriminatedUnion("scope", [
 ### 租户隔离对比表
 | 隔离维度 | Public API 项目级路由 | Public API 组织级路由 | Ingestion/SDK | 校验位置 |
 |---------|---------------------|---------------------|--------------|---------|
-| Project ID 必填 | ✓ 必须为 string | ✗ 应为 null | ✓ 必须为 string | createAuthedProjectAPIRoute.ts:113, ingestion.ts:84 |
+| Project ID 必填 | ✓ 必须为 string | ✗ 始终为 null | ✓ 必须为 string | createAuthedProjectAPIRoute.ts:113, ingestion.ts:84 |
 | Organization ID 存在 | ✓ | ✓ | ✓ | ApiAuthService |
 | Plan 级别隔离 | ✓ | ✓ | ✓ | 组织 cloudConfig |
 | Rate Limit 覆盖 | ✓ | ✓ | ✓ | RateLimitService |
@@ -143,7 +174,7 @@ OrgEnrichedApiKey = discriminatedUnion("scope", [
 
 ## 4. 错误处理差异
 
-### Public API 错误处理 (两种模式)
+### Public API 错误处理（三种模式）
 
 #### A. 项目级路由错误处理 (withMiddlewares + createAuthedProjectAPIRoute)
 - **统一错误捕获**: 通过 `withMiddlewares` 中间件统一捕获
@@ -159,15 +190,25 @@ OrgEnrichedApiKey = discriminatedUnion("scope", [
   | ZodError | 400 | 请求参数校验失败 |
 - **日志策略**: 401/404 仅 info，500 记录 error 并上报异常
 
-#### B. 组织级路由错误处理 (直接处理)
-- **独立错误处理**: handler 内直接处理
+#### B. 组织级路由错误处理 (独立 try/catch) - 12 个端点
+- **独立错误处理**: handler 内直接 try/catch
 - **错误分类与状态码**:
   | 错误类型 | HTTP 状态码 | 触发条件 |
   |---------|-----------|---------|
   | 认证失败 | 401 | 无效 API Key |
-  | 权限不足 | 403 | 使用项目级密钥访问组织级路由 |
+  | 权限不足 | 403 | 使用项目级密钥访问组织级路由、无 Entitlement |
+  | 资源不存在 | 404 | 项目/用户不存在或不属于该组织 |
   | 方法不支持 | 405 | HTTP Method 错误 |
-  | 计划无权限 | 403 | 无 `admin-api` entitlement |
+  | 参数错误 | 400 | 请求参数校验失败 |
+
+#### C. SCIM 端点错误处理 (SCIM 标准格式) - 6 个端点
+- **错误格式特殊**: 返回 SCIM 标准格式带 `schemas` 字段
+- **状态码逻辑同其他组织级端点**
+- **特殊状态码**: 409 (冲突) - 最后一个 Owner 无法删除、并发去重冲突
+
+#### D. Blob Storage 端点错误处理 (混合模式) - 2 个端点
+- **使用 withMiddlewares 统一错误捕获**
+- **鉴权逻辑与组织级端点一致**
 
 ### Ingestion 错误处理 (ingestion.ts)
 - **独立错误处理**: handler 内直接 try/catch
@@ -182,15 +223,15 @@ OrgEnrichedApiKey = discriminatedUnion("scope", [
 - **限流响应**: 调用 `RateLimitService.sendRestResponseIfLimited()`
 
 ### 错误处理对比表
-| 特性 | Public API 项目级路由 | Public API 组织级路由 | Ingestion |
-|-----|---------------------|---------------------|-----------|
-| 统一错误捕获 | ✓ (withMiddlewares) | ✗ 独立处理 | ✗ 独立处理 |
-| 标准化错误响应 | ✓ | 部分实现 | 部分实现 |
-| 日志分级策略 | ✓ | 基本日志 | 仅 401+ 记录 |
-| 异常追踪上报 | ✓ (5xx 错误) | ✓ | ✓ (非 401 错误) |
-| ClickHouse 资源错误处理 | ✓ | ✗ | ✗ |
-| 207 批量响应支持 | ✗ | ✗ | ✓ |
-| Entitlement 检查 | ✗ | ✓ (admin-api) | ✗ |
+| 特性 | Public API 项目级路由 | Public API 组织级路由 | SCIM 端点 | Blob Storage | Ingestion |
+|-----|---------------------|---------------------|-----------|--------------|-----------|
+| 统一错误捕获 | ✓ | ✗ 独立处理 | ✗ 独立处理 | ✓ | ✗ 独立处理 |
+| 标准化错误响应 | ✓ | 部分实现 | SCIM 格式 | ✓ | 部分实现 |
+| 日志分级策略 | ✓ | 基本日志 | 基本日志 | ✓ | 仅 401+ 记录 |
+| 异常追踪上报 | ✓ (5xx 错误) | ✓ | ✓ | ✓ | ✓ (非 401 错误) |
+| ClickHouse 资源错误处理 | ✓ | ✗ | ✗ | ✗ | ✗ |
+| 207 批量响应支持 | ✗ | ✗ | ✗ | ✗ | ✓ |
+| Entitlement 检查 | ✗ | ✓ | ✗ | ✓ | ✗ |
 
 ---
 
@@ -224,7 +265,7 @@ SDK 发起请求
 │    ├─ 检查 allowedAccessLevels 包含当前 accessLevel             │
 │    └─ 检查 projectId 非 null (组织级密钥被 403 拒绝)            │
 │                                                                 │
-│  组织级路由 (/api/public/organizations/*):                       │
+│  组织级路由 (/api/public/organizations/* 等):                   │
 │    ├─ 检查 accessLevel === organization                         │
 │    └─ 检查 orgId 存在                                           │
 │                                                                 │
@@ -254,12 +295,12 @@ SDK 发起请求
 |-----|---------------------|---------------------|--------------|
 | 认证入口 | createAuthedProjectAPIRoute | 直接 ApiAuthService | 直接 ApiAuthService |
 | 支持的 accessLevel | project, scores | organization | project, scores |
-| 组织级密钥可用 | ✗ 403 | ✓ | ✗ 401 |
+| 组织级密钥可用 | ✗ 403 | ✓ 14 个端点 | ✗ 401 |
 | 管理员密钥可用 | ✓ (仅 LLM Connections) | ✗ | ✗ |
-| 错误处理 | withMiddlewares 统一 | handler 独立 | handler 独立 |
-| 响应格式 | 标准 JSON | 标准 JSON | 支持 207 批量 |
+| 错误处理 | withMiddlewares 统一 | handler 独立 / SCIM | handler 独立 |
+| 响应格式 | 标准 JSON | 标准 JSON / SCIM 格式 | 支持 207 批量 |
 | projectId 必填 | ✓ (组织级密钥 403) | ✗ (应为 null) | ✓ (组织级密钥 401) |
-| Entitlement 检查 | ✗ | ✓ (admin-api) | ✗ |
+| Entitlement 检查 | ✗ | ✓ (admin-api, scheduled-blob-exports 等) | ✗ |
 | Bearer 公钥支持 | 仅 POST /scores | ✗ | ✓ |
 
 ---
@@ -274,17 +315,17 @@ SDK 发起请求
 | projectId null 检查 (项目级路由) | web/src/features/public-api/server/createAuthedProjectAPIRoute.ts | 113-118 |
 | Bearer 认证禁用组织密钥 | web/src/features/public-api/server/apiAuth.ts | 205-209 |
 | Ingestion projectId null 检查 | web/src/pages/api/public/ingestion.ts | 84-88 |
-| 组织级路由 accessLevel 检查 | web/src/pages/api/public/organizations/projects/index.ts | 39-47 |
+| 组织级路由 accessLevel 检查 | 所有 14 个组织级端点文件 | 各路由 40-50 行附近 |
 | 管理员密钥触发条件 | web/src/features/public-api/server/createAuthedProjectAPIRoute.ts | 148-212 |
 | scores POST 允许 scores 级别 | web/src/pages/api/public/scores/index.ts | 25 |
 
-### 测试证据索引
-| 验证项 | 测试文件 | 用例说明 |
-|-------|---------|---------|
-| Bearer 公钥可 POST scores | scores-api-v1.servertest.ts | 1332-1363 |
-| Bearer 公钥不可 GET scores | scores-api-v1.servertest.ts | 1365-1376 |
-| 组织级密钥要求 (组织 API) | organizations-api.servertest.ts | 多处 |
-| 组织级密钥不可访问项目 API | projects-api.servertest.ts | 347-360 |
+### 组织级端点清单索引
+| 类别 | 端点数量 | 文件路径前缀 |
+|-----|---------|------------|
+| Organizations | 3 个 | web/src/pages/api/public/organizations/ |
+| Projects 管理 | 3 个 | web/src/pages/api/public/projects/[projectId]/ |
+| SCIM | 6 个 | web/src/pages/api/public/scim/ |
+| Blob Storage | 2 个 | web/src/pages/api/public/integrations/blob-storage/ |
 
 ---
 
@@ -292,32 +333,35 @@ SDK 发起请求
 
 ### 本次校准修正的核心结论冲突
 
-#### 🔴 修正 1: Ingestion 对组织级密钥的支持
+#### 🔴 修正 1: 组织级密钥可用端点的范围统计
+- **原错误结论**: "仅 3 个 /api/public/organizations/* 端点支持组织级密钥"
+- **修正后结论**: "共 4 大类 14 个端点支持组织级密钥，包括 Organizations (3个)、Projects 管理 (3个)、SCIM (6个)、Blob Storage (2个)"
+- **证据**: 完整盘点的 14 个端点代码均有 `accessLevel !== "organization"` 校验
+
+#### 🔴 修正 2: Ingestion 对组织级密钥的支持
 - **原错误结论**: "Ingestion 支持所有 API key scope，组织级密钥可访问组织下所有项目"
 - **修正后结论**: "组织级密钥完全无法用于 Ingestion 端点，因 `projectId === null` 触发 401 错误"
 - **证据代码**: [ingestion.ts:84-88] 明确检查 `!authCheck.scope.projectId`
 - **根本原因**: 组织级 API Key 的数据结构设计上 `projectId = null`，无法满足 ingestion 的必填校验
 
-#### 🔴 修正 2: Public API 路由对组织级密钥的支持范围
-- **原错误结论**: "Public API 组织级端点支持组织级密钥" (暗示范围较大)
-- **修正后结论**: "仅 `/api/public/organizations/*` 下的 3 个专用端点支持组织级密钥，其他 95% 端点均通过 `createAuthedProjectAPIRoute` 明确排除组织级密钥 (`RouteAccessLevel = Exclude<ApiAccessLevel, "organization">`)"
-- **证据代码**: [createAuthedProjectAPIRoute.ts:28, 113-118]
+#### 🔴 修正 3: 项目级路由对组织密钥的错误码
+- **原错误结论**: "项目级路由遇组织密钥返回 401"
+- **修正后结论**: "项目级路由遇组织密钥返回 403，Ingestion 遇组织密钥返回 401"
+- **统一口径**:
+  - 403: 认证通过但权限不足（组织密钥访问项目级路由）
+  - 401: 认证无效或不完整（缺少 projectId）
 
-#### 🔴 修正 3: 权限矩阵中的错误标记
-- **原错误矩阵**: "组织级 API Key - Ingestion/SDK: ✓"
-- **修正后矩阵**: "组织级 API Key - Ingestion/SDK: ✗ (401 拒绝)"
-- **统一口径**: 组织级密钥仅用于组织管理类 API，不可用于数据摄入和项目级操作
-
-#### 🔴 修正 4: 租户隔离章节的矛盾描述
-- **原矛盾描述**: 同时声称"组织级密钥可访问组织下所有项目"和"projectId 隔离"
-- **修正后口径**: 明确区分两种路由模式：
-  - 组织级路由 (`/api/public/organizations/*`): 不需要 projectId，以 orgId 为隔离边界
-  - 项目级路由 & Ingestion: projectId 必须为非空字符串，组织级密钥被明确拒绝
+#### 🔴 修正 4: 错误处理模式的多样性
+- **原错误结论**: "组织级路由使用独立错误处理"
+- **修正后结论**: "组织级路由有 3 种错误处理模式：独立 try/catch (12个)、SCIM格式 (6个)、withMiddlewares (2个)"
+- **共同点**: 所有模式的鉴权逻辑和状态码映射是一致的
 
 ### 统一后的核心原则
 1. **密钥-路由匹配原则**: 组织级密钥 → 组织级路由；项目级密钥 → 项目级路由/Ingestion
 2. **Ingestion 项目锁定原则**: 所有数据摄入必须关联明确的单个项目 ID，不支持跨项目摄入
 3. **Bearer 公钥最小权限原则**: 仅用于 scores 写入，禁止读取和组织级操作
-4. **错误码区分原则**: 
+4. **错误码区分原则**:
    - 项目级路由遇组织密钥 → 403 (权限不足)
    - Ingestion 遇组织密钥 → 401 (认证无效，缺少 projectId)
+   - 项目级密钥遇组织路由 → 403 (权限不足)
+5. **Entitlement 分层原则**: 不同组织级端点需要不同的套餐 Entitlement
