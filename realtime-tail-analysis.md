@@ -461,7 +461,9 @@ export const getObservationsWithModelDataFromEventsTable = async (
 };
 ```
 
-#### Step 4: 内部查询实现
+#### Step 4: 内部查询实现（真实代码）
+
+**文件**：`packages/shared/src/server/repositories/events.ts`
 
 ```typescript
 async function getObservationsFromEventsTableInternal<T>(
@@ -483,7 +485,7 @@ async function getObservationsFromEventsTableInternal<T>(
     clickhouseConfigs,
   } = opts;
 
-  // 1. 处理 positionInTrace 特殊筛选
+  // 1. 处理 positionInTrace 特殊筛选（按 trace 分组选择第 N 个 observation）
   const positionFilter = filter.find((f) => f.type === "positionInTrace");
   const baseFilter: typeof filter = [
     ...filter.filter((f) => f.type !== "positionInTrace"),
@@ -529,15 +531,16 @@ async function getObservationsFromEventsTableInternal<T>(
     ["span_id", "name", "trace_name", "user_id", "session_id", "trace_id"],
   );
 
-  // 5. 构建排序
+  // 5. 构建排序条目
   const orderByEntries = orderByToEntries(
     [orderBy ?? null],
     eventsTableUiColumnDefinitions,
   );
 
-  // 6. 使用 EventsQueryBuilder 构建 SQL
+  // 6. 初始化 EventsQueryBuilder
   const queryBuilder = new EventsQueryBuilder({ projectId });
 
+  // 7. 选择字段集
   if (opts.select === "count") {
     queryBuilder.selectFieldSet("count");
   } else {
@@ -545,57 +548,129 @@ async function getObservationsFromEventsTableInternal<T>(
       selectToolData ? "base" : "baseWithoutTools",
       "calculated",
     );
+    // 真实代码：selectIO 接受两个参数
     if (selectIOAndMetadata) {
-      queryBuilder.selectIO(renderingProps.truncated).selectMetadata();
-    }
-    if (limit !== undefined) {
-      queryBuilder.limit(limit);
-    }
-    if (offset !== undefined) {
-      queryBuilder.offset(offset);
-    }
-    if (orderByEntries.length > 0) {
-      queryBuilder.orderBy(orderByEntries);
+      queryBuilder
+        .selectIO(
+          renderingProps.truncated,
+          env.LANGFUSE_SERVER_SIDE_IO_CHAR_LIMIT,
+        )
+        .selectFieldSet("metadata");
     }
   }
 
-  // 7. 应用筛选和搜索
-  queryBuilder.filter(observationsFilter);
-  if (search) {
-    queryBuilder.search(search);
+  // 8. 处理 positionInTrace CTE（真实实现：手动构建 qualifying_obs CTE）
+  // 所有模式使用相同模式：按 trace 对 observations 排序，选择第 N 个
+  // root/first/nthFromStart → ORDER BY start_time ASC
+  // last/nthFromEnd        → ORDER BY start_time DESC
+  if (positionFilter && "key" in positionFilter) {
+    const key = positionFilter.key;
+    const isFromEnd = key === "last" || key === "nthFromEnd";
+    const direction = isFromEnd ? "DESC" : "ASC";
+    const position =
+      key === "last" || key === "first" || key === "root"
+        ? 1
+        : typeof positionFilter.value === "number"
+          ? positionFilter.value
+          : 1;
+
+    // 为 CTE 构建 observation-only 筛选（无 s.* 或 t.* 引用）
+    const nativeFilter = new FilterList(
+      createFilterFromFilterState(
+        baseFilter,
+        eventsTableNativeUiColumnDefinitions,
+      ),
+    );
+    const appliedNativeFilter = nativeFilter.apply();
+    const qualifyingObsBuilder = new EventsQueryBuilder({ projectId })
+      .selectRaw(
+        "e.span_id",
+        `ROW_NUMBER() OVER (PARTITION BY e.trace_id ORDER BY e.start_time ${direction}, e.event_ts ${direction}, e.span_id ${direction}) as _rn`,
+      )
+      .where(appliedNativeFilter)
+      .where(search);
+
+    // 真实调用：withCTE 方法添加 CTE
+    queryBuilder.withCTE(
+      "qualifying_obs",
+      qualifyingObsBuilder.buildWithParams(),
+    );
+
+    // 真实调用：whereRaw 进行子查询过滤
+    queryBuilder.whereRaw(
+      "e.span_id IN (SELECT span_id FROM qualifying_obs WHERE _rn = {_posRn: UInt32})",
+      { _posRn: Math.max(1, position) },
+    );
   }
 
-  // 8. 应用 projectId 时间范围过滤（分区裁剪）
-  if (startTimeFrom) {
-    queryBuilder.filterStartTime(startTimeFrom);
-  }
+  // 9. 真实流式调用链：使用 when 条件链式调用 + withCTE + leftJoin + applyFilters + where + orderByColumns + limit
+  queryBuilder
+    // observation-level scores CTE
+    .when(hasObservationScoresFilter, (b) =>
+      b.withCTE(
+        "scores_agg",
+        eventsScoresAggregation({ projectId, startTimeFrom }),
+      ),
+    )
+    // trace-level scores CTE
+    .when(hasTraceScoresFilter, (b) =>
+      b.withCTE(
+        "trace_scores_agg",
+        eventsTracesScoresAggregation({
+          projectId,
+          startTimeFrom,
+          hasScoreAggregationFilters: true,
+        }),
+      ),
+    )
+    // JOIN observation-level scores
+    .when(hasObservationScoresFilter, (b) =>
+      b.leftJoin("scores_agg AS s", "ON s.observation_id = e.span_id"),
+    )
+    // JOIN trace-level scores
+    .when(hasTraceScoresFilter, (b) =>
+      b.leftJoin(
+        "trace_scores_agg AS ts",
+        "ON ts.trace_id = e.trace_id AND ts.project_id = e.project_id",
+      ),
+    )
+    // 真实调用：applyFilters 应用筛选
+    .applyFilters(observationsFilter)
+    // 真实调用：where 应用搜索条件
+    .where(search)
+    // 真实调用：orderByColumns 排序（不是 orderBy）
+    .when(orderByEntries.length > 0, (b) => b.orderByColumns(orderByEntries))
+    // 真实调用：limit(limit, offset) 一次性传入两个参数（不是分开调用）
+    .limit(limit, offset);
 
-  // 9. 如果有 scores 筛选，添加 scores CTE
-  if (hasObservationScoresFilter || hasTraceScoresFilter) {
-    const timestamp = startTimeFrom ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    queryBuilder.addScoresCte({
-      hasObservationScores: hasObservationScoresFilter,
-      hasTraceScores: hasTraceScoresFilter,
-      timestamp,
-      projectId,
-    });
-  }
-
-  // 10. 如果有 positionInTrace 筛选，添加相应 CTE
-  if (positionFilter) {
-    queryBuilder.addPositionInTraceCte(positionFilter);
-  }
-
-  // 11. 构建并执行查询
+  // 10. 构建查询
   const { query, params } = queryBuilder.buildWithParams();
-  const result = await queryClickhouse({
-    query,
-    query_params: params,
-    tags: opts.tags,
-    ...clickhouseConfigs,
-  });
 
-  return result.data as Array<T>;
+  // 11. 真实调用：measureAndReturn 性能监控 + queryClickhouse + EventsReadOnly 服务选择
+  return measureAndReturn({
+    operationName: "getObservationsFromEventsTableInternal",
+    projectId,
+    input: {
+      params,
+      tags: {
+        ...(opts.tags ?? {}),
+        feature: "tracing",
+        type: "events",
+        projectId,
+        kind: opts.select,
+        operation_name: "getObservationsTableInternal",
+      },
+    },
+    fn: async (input) => {
+      return queryClickhouse<T>({
+        query,
+        params: input.params,
+        tags: input.tags,
+        clickhouseConfigs,
+        preferredClickhouseService: "EventsReadOnly",
+      });
+    },
+  });
 }
 ```
 
