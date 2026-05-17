@@ -2,165 +2,195 @@
 
 ## 1. 密钥来源差异
 
-### Public API 密钥机制
-- **认证方式**: HTTP Basic Auth
-- **凭据组成**: 
-  - Username = Public Key (格式: `pk-lf-<uuid>`)
-  - Password = Secret Key (格式: `sk-lf-<uuid>`)
-- **密钥验证流程**:
-  1. 首次认证: 使用 bcrypt 比较 (hashSecretKey, 11 rounds)
-  2. 后续认证: 使用 SHA256 + Salt 快速哈希 (fastHashedSecretKey)
-  3. Redis 缓存: 验证成功的密钥会缓存到 Redis，TTL 由 `LANGFUSE_CACHE_API_KEY_TTL_SECONDS` 控制
+### 核心类型定义 [packages/shared/src/server/auth/types.ts:22-31]
+```typescript
+OrgEnrichedApiKey = discriminatedUnion("scope", [
+  { scope: ORGANIZATION, projectId: null },    // 组织级密钥 - 无 projectId
+  { scope: PROJECT, projectId: string }         // 项目级密钥 - 有明确 projectId
+])
+```
 
-### SDK/Ingestion 密钥机制
-- 支持**两种认证方式**:
-  - **基础认证 (Basic Auth)**: 提供完整的读写权限 (accessLevel: `project`)
-  - **Bearer 认证 (仅公钥)**: 仅提供分数写入权限 (accessLevel: `scores`)
-- **密钥作用域**:
-  - **组织级密钥**: scope = "ORGANIZATION"，可访问组织下所有项目
-  - **项目级密钥**: scope = "PROJECT"，仅可访问特定项目
-- **SDK Header**: 
-  - `X-Langfuse-Sdk-Name`: 标识 SDK 名称（可选）
-  - `X-Langfuse-Sdk-Version`: 标识 SDK 版本（可选）
-  - `X-Langfuse-Public-Key`: 公钥标识（可选）
-  - **证据来源**: [fern/apis/server/definition/api.yml:25-28]
+### Public API 与 Ingestion 共用的密钥机制
+| 密钥类型 | scope 字段值 | projectId | accessLevel | 可用认证方式 |
+|---------|-------------|-----------|------------|-------------|
+| **组织级 API Key** | `ORGANIZATION` | `null` | `organization` | 仅 Basic Auth |
+| **项目级 API Key** | `PROJECT` | `string` | `project` | Basic Auth / Bearer |
+| **仅公钥 Bearer** | `PROJECT` | `string` | `scores` | 仅 Bearer |
+
+### 关键约束 (来自代码)
+1. **Bearer 认证禁用组织级密钥** [apiAuth.ts:205-209]
+   ```typescript
+   if (dbKey.scope === "ORGANIZATION") {
+     throw new Error("Unauthorized: Cannot use organization key with bearer auth");
+   }
+   ```
+   - Bearer 认证时若检测到组织级密钥，直接抛出错误
+
+2. **Basic Auth 下密钥级别自动映射** [apiAuth.ts:181-182]
+   ```typescript
+   const accessLevel = finalApiKey.scope === "ORGANIZATION" ? "organization" : "project";
+   ```
+   - 组织级密钥自动获得 `organization` 访问级别
+   - 项目级密钥自动获得 `project` 访问级别
+
+### SDK Header 说明
+- `X-Langfuse-Sdk-Name`, `X-Langfuse-Sdk-Version`, `X-Langfuse-Public-Key`
+- **仅用于统计标识，不参与鉴权**
+- 实际鉴权完全依赖 `Authorization` Header
+- **证据来源**: [fern/apis/server/definition/api.yml:25-28]
 
 ---
 
 ## 2. 权限校验差异
 
-### Public API 权限校验
-- **认证入口**: `createAuthedProjectAPIRoute.ts` 中的 `verifyAuth()` 函数
-- **权限等级校验**: `allowedAccessLevels: RouteAccessLevel[]`
-  - **默认值**: `["project"]` - 需要完整的 Basic Auth 认证
-  - **Scores POST 端点**: `["project", "scores"]` - 同时支持 Bearer Auth (仅公钥)
+### Public API 两种路由实现模式
+
+#### A. 项目级路由 (createAuthedProjectAPIRoute) - 95% 端点使用
+- **实现路径**: 大多数 Public API 端点使用此包装器
+- **类型约束** [createAuthedProjectAPIRoute.ts:28]:
+  ```typescript
+  type RouteAccessLevel = Exclude<ApiAccessLevel, "organization">; // 明确排除 organization
+  ```
+- **双重校验逻辑** [createAuthedProjectAPIRoute.ts:102-119]:
+  1. 检查 `allowedAccessLevels` 是否包含当前 `accessLevel`
+  2. 检查 `projectId` 必须存在（非 null），否则返回 403
+     ```typescript
+     if (!regularAuth.scope.projectId) {
+       throw { status: 403, message: "Project ID not found for API token. Are you using an organization key?" };
+     }
+     ```
+- **权限等级配置**:
+  - 默认 `["project"]` - 仅项目级密钥可用
+  - `POST /api/public/scores` 特殊配置 `["project", "scores"]` - 同时支持 Bearer 公钥
     - **证据来源**: [web/src/pages/api/public/scores/index.ts:25]
 
-#### 管理员密钥认证 (Admin API Key)
+#### B. 组织级路由 (直接调用 ApiAuthService) - 仅 3 个端点
+- **路径前缀**: `/api/public/organizations/*`
+- **实现方式**: 不使用 `createAuthedProjectAPIRoute`，直接调用 `ApiAuthService`
+- **校验逻辑**: 主动检查 `accessLevel === "organization"`，否则返回 403
+  ```typescript
+  if (authCheck.scope.accessLevel !== "organization" || !authCheck.scope.orgId) {
+    return res.status(403).json({ error: "Organization-scoped API key required" });
+  }
+  ```
+- **实际端点列表**:
+  1. `/api/public/organizations/projects` - 获取组织下所有项目
+  2. `/api/public/organizations/apiKeys` - 管理组织 API 密钥
+  3. `/api/public/organizations/memberships` - 管理组织成员
+
+### 管理员密钥认证 (Admin API Key)
 - **生效路由**: 仅 LLM Connections 相关接口
   - `GET /api/public/llm-connections` [llm-connections/index.ts:27]
   - `PUT /api/public/llm-connections` [llm-connections/index.ts:84]
   - `DELETE /api/public/llm-connections/:id` [llm-connections/[id].ts:25]
 - **触发条件** (必须全部满足):
-  1. **环境限制**: `NEXT_PUBLIC_LANGFUSE_CLOUD_REGION` 未设置 (仅自托管可用)
-  2. **双重 Header 校验**:
-     - `Authorization: Bearer <ADMIN_API_KEY>`
-     - `x-langfuse-admin-api-key: <ADMIN_API_KEY>` (冗余校验，防止攻击)
-  3. **项目指定**: `x-langfuse-project-id: <project-id>` 必须是有效项目 ID
-  4. **配置要求**: `ADMIN_API_KEY` 环境变量必须已配置
-  5. **安全比较**: 使用 `crypto.timingSafeEqual` 进行时序攻击防护
-    - **证据来源**: [createAuthedProjectAPIRoute.ts:148-212]
+  1. 无 `NEXT_PUBLIC_LANGFUSE_CLOUD_REGION` (仅自托管可用)
+  2. `Authorization: Bearer <ADMIN_API_KEY>`
+  3. `x-langfuse-admin-api-key: <ADMIN_API_KEY>` - 双重 Header 防攻击
+  4. `x-langfuse-project-id: <project-id>` - 必须指定目标项目
+  5. `ADMIN_API_KEY` 环境变量已配置
+  6. 使用 `crypto.timingSafeEqual` 时序攻击防护
+- **证据来源**: [createAuthedProjectAPIRoute.ts:148-212]
 
 ### Ingestion 权限校验
 - **认证入口**: `ingestion.ts` 直接调用 `ApiAuthService.verifyAuthHeaderAndReturnScope()`
-- **访问级别**: 支持所有 API key scope，但要求 `projectId` 必须存在
-- **额外检查**:
-  - `isIngestionSuspended`: 检查组织是否因用量超限而被暂停写入
-
-#### Bearer 公钥 (仅公钥认证) 的真实限制
-- **权限级别**: `accessLevel: "scores"` - 仅写入权限
-- **代码级限制** [apiAuth.ts:200-234]:
-  1. **组织级密钥禁用 Bearer**: 如果 API Key 的 `scope === "ORGANIZATION"`，直接抛出错误
-     > "Unauthorized: Cannot use organization key with bearer auth"
-  2. **仅支持项目级密钥**: Bearer 认证只接受 `scope === "PROJECT"` 的密钥
-- **端点级限制**:
-  - 仅 `POST /api/public/scores` 配置了 `allowedAccessLevels: ["project", "scores"]`
-  - 所有其他 Public API 端点默认仅接受 `["project"]` 级别，Bearer 公钥访问会返回 403
-- **测试证据** [scores-api-v1.servertest.ts:1332-1446]:
-  - ✅ POST /api/public/scores - 返回 200
-  - ❌ GET /api/public/scores - 返回 403
-  - ❌ GET /api/public/scores/:scoreId - 返回 403
-  - ❌ DELETE /api/public/scores/:scoreId - 返回 403
-  - ❌ GET /api/public/traces - 返回 403
-  - ❌ GET /api/public/observations - 返回 403
-  - ❌ GET /api/public/sessions - 返回 403
-
-#### 组织级密钥的生效范围
-- **生效端点** (需要 `accessLevel: "organization"`):
-  - `/api/public/organizations/*` - 组织管理 API
-  - `/api/public/projects` (POST) - 创建项目
-  - `/api/public/projects/:projectId` (DELETE/PUT) - 删除/更新项目
-  - `/api/public/scim/*` - SCIM 用户同步 API
-- **测试证据** [organizations-api.servertest.ts, projects-api.servertest.ts]:
-  - ✅ 组织级密钥可访问组织 API
-  - ❌ 项目级密钥访问组织 API 返回 403 "Organization-scoped API key required"
-
-### 权限层级对比表
-| 认证方式 | Public API | Ingestion/SDK | 访问级别 |
-|---------|-----------|--------------|---------|
-| Basic Auth (公钥 + 私钥) | 所有端点 | ✓ | project |
-| Bearer Auth (仅公钥) | 仅 POST /scores | ✓ | scores |
-| 组织级 API Key | 组织级端点 | ✓ | organization |
-| 管理员 API Key | 仅 LLM Connections (自托管) | ✗ | project |
+- **项目 ID 强制约束** [ingestion.ts:84-88]:
+  ```typescript
+  if (!authCheck.scope.projectId) {
+    throw new UnauthorizedError("Missing projectId in scope. Are you using an organization key?");
+  }
+  ```
+  - ⚠️ **最终结论**: **组织级密钥完全无法用于 Ingestion 端点**
+  - 原因：组织级密钥的 `projectId === null`，触发上述检查直接返回 401
+- **额外检查**: `isIngestionSuspended` - 检查组织是否因用量超限被暂停写入
 
 ---
 
 ## 3. 租户隔离差异
 
 ### Public API 租户隔离
-- **项目级隔离**: 通过 API key 绑定的 `projectId` 进行隔离
-- **组织级隔离**: 通过 API key 绑定的 `orgId` 进行隔离
-- **路由配置**: `createAuthedProjectAPIRoute` 自动将 auth.scope 注入处理函数
-- **权限守卫**: 组织级 API 验证 `scope === "ORGANIZATION"`，项目级 API 验证 `projectId` 存在
 
-### Ingestion 租户隔离
-- **项目级隔离**: 同样通过 `projectId` 隔离，但在 ingestion.ts 中进行校验
-- **组织级属性**: 通过 API key 传递 `plan`、`rateLimitOverrides` 等组织级属性
-- **上下文传递**: 通过 OpenTelemetry context 将 projectId 注入处理流程
-- **Ingestion 暂停保护**: 检查 `cloudFreeTierUsageThresholdState === "BLOCKED"`，对免费 tier 超限组织进行写入拦截
+#### 项目级路由隔离 (createAuthedProjectAPIRoute)
+- **项目级强制**: `projectId` 必须存在且为 `string`，组织级密钥直接被拒绝
+- **作用域注入**: 自动将 `auth.scope.projectId` 注入处理函数上下文
+- **适用端点**: 除 `/api/public/organizations/*` 外的所有 Public API
+
+#### 组织级路由隔离
+- **组织级强制**: `orgId` 必须存在且 `accessLevel === "organization"`
+- **作用域注入**: 使用 `auth.scope.orgId` 跨项目访问组织资源
+- **适用端点**: 仅 `/api/public/organizations/*` 下的 3 个端点
+
+### Ingestion 租户隔离 [统一最终口径]
+- **项目级隔离 - 绝对强制**: `projectId` 必须为非空字符串
+  - 组织级密钥因 `projectId === null` 被 401 拒绝
+  - 不存在"组织级密钥可访问所有项目"的 ingestion 场景
+- **组织级属性**: 通过 API Key 传递 `plan`、`rateLimitOverrides` 等元数据
+  - 仅 **项目级密钥** 才能用于数据摄入，但其背后关联的组织信息用于限流和计划检查
+- **上下文传递**: 通过 OpenTelemetry context 将 `projectId` 注入处理流程
+- **Ingestion 暂停保护**: 检查 `cloudFreeTierUsageThresholdState === "BLOCKED"`
 
 ### 租户隔离对比表
-| 隔离维度 | Public API | Ingestion/SDK | 验证位置 |
-|---------|-----------|--------------|---------|
-| Project ID 隔离 | ✓ | ✓ | ApiAuthService |
-| Organization ID 隔离 | ✓ | ✓ | ApiAuthService |
-| Plan 级别隔离 | ✓ | ✓ | 组织 cloudConfig |
-| Rate Limit 覆盖 | ✓ | ✓ | RateLimitService |
-| Ingestion 暂停检查 | 部分端点 (scores POST) | ✓ | ingestion.ts, scores/index.ts |
+| 隔离维度 | Public API 项目级路由 | Public API 组织级路由 | Ingestion/SDK | 校验位置 |
+|---------|---------------------|---------------------|--------------|---------|
+| Project ID 必填 | ✓ 必须为 string | ✗ 应为 null | ✓ 必须为 string | createAuthedProjectAPIRoute.ts:113, ingestion.ts:84 |
+| Organization ID 存在 | ✓ | ✓ | ✓ | ApiAuthService |
+| Plan 级别隔离 | ✓ | ✓ | ✓ | 组织 cloudConfig |
+| Rate Limit 覆盖 | ✓ | ✓ | ✓ | RateLimitService |
+| Ingestion 暂停检查 | 仅 scores POST | ✗ | ✓ | ingestion.ts, scores/index.ts |
+| 允许组织级密钥 | ✗ 403 拒绝 | ✓ | ✗ 401 拒绝 | 各路由实现 |
 
 ---
 
 ## 4. 错误处理差异
 
-### Public API 错误处理 (withMiddlewares.ts)
-- **统一错误捕获**: 所有路由异常通过统一的中间件捕获处理
+### Public API 错误处理 (两种模式)
+
+#### A. 项目级路由错误处理 (withMiddlewares + createAuthedProjectAPIRoute)
+- **统一错误捕获**: 通过 `withMiddlewares` 中间件统一捕获
 - **错误分类与状态码**:
-  - `UnauthorizedError` (401): 认证失败、无效凭据
-  - `ForbiddenError` (403): 权限不足、Ingestion 被暂停
-  - `LangfuseNotFoundError` (404): 资源不存在
-  - `MethodNotAllowedError` (405): 方法不支持
-  - `ClickHouseResourceError` (422): 资源限制、查询超时
-  - `ZodError` (400): 请求参数校验失败
-- **错误响应格式**:
-  ```json
-  {
-    "message": "错误消息",
-    "error": "错误类型名称"
-  }
-  ```
-- **日志策略**:
-  - 401/404 仅记录 info 级别日志
-  - 500 错误记录 error 并上报异常追踪
+  | 错误类型 | HTTP 状态码 | 触发条件 |
+  |---------|-----------|---------|
+  | UnauthorizedError | 401 | 认证失败、无效凭据 |
+  | ForbiddenError | 403 | 权限不足、使用组织级密钥访问项目级路由 |
+  | ForbiddenError (Admin) | 403 | 云上环境尝试使用管理员 API Key |
+  | LangfuseNotFoundError | 404 | 资源不存在 |
+  | MethodNotAllowedError | 405 | 方法不支持 |
+  | ClickHouseResourceError | 422 | 资源限制、查询超时 |
+  | ZodError | 400 | 请求参数校验失败 |
+- **日志策略**: 401/404 仅 info，500 记录 error 并上报异常
+
+#### B. 组织级路由错误处理 (直接处理)
+- **独立错误处理**: handler 内直接处理
+- **错误分类与状态码**:
+  | 错误类型 | HTTP 状态码 | 触发条件 |
+  |---------|-----------|---------|
+  | 认证失败 | 401 | 无效 API Key |
+  | 权限不足 | 403 | 使用项目级密钥访问组织级路由 |
+  | 方法不支持 | 405 | HTTP Method 错误 |
+  | 计划无权限 | 403 | 无 `admin-api` entitlement |
 
 ### Ingestion 错误处理 (ingestion.ts)
-- **独立错误处理**: 在 handler 内直接进行 try/catch 处理
+- **独立错误处理**: handler 内直接 try/catch
 - **错误分类与状态码**:
-  - `UnauthorizedError` (401): 认证失败
-  - `ForbiddenError` (403): ingestion 被暂停
-  - `MethodNotAllowedError` (405): 方法不支持
-  - `ZodError` (400): 请求数据校验失败
+  | 错误类型 | HTTP 状态码 | 触发条件 |
+  |---------|-----------|---------|
+  | UnauthorizedError | 401 | 认证失败、使用组织级密钥 (projectId 为 null) |
+  | ForbiddenError | 403 | Ingestion 被暂停 (用量超限) |
+  | MethodNotAllowedError | 405 | 非 POST 请求 |
+  | ZodError | 400 | 请求数据校验失败 |
 - **批量响应**: 返回 207 Multi-Status，包含每个事件的处理结果
 - **限流响应**: 调用 `RateLimitService.sendRestResponseIfLimited()`
 
 ### 错误处理对比表
-| 特性 | Public API (withMiddlewares) | Ingestion |
-|-----|------------------------------|-----------|
-| 统一错误捕获 | ✓ | ✗ (handler 内处理) |
-| 标准化错误响应 | ✓ | 部分实现 |
-| 日志分级策略 | ✓ | 仅 401+ 记录 |
-| 异常追踪上报 | ✓ (5xx 错误) | ✓ (非 401 错误) |
-| ClickHouse 资源错误处理 | ✓ | ✗ |
-| 207 批量响应支持 | ✗ | ✓ |
+| 特性 | Public API 项目级路由 | Public API 组织级路由 | Ingestion |
+|-----|---------------------|---------------------|-----------|
+| 统一错误捕获 | ✓ (withMiddlewares) | ✗ 独立处理 | ✗ 独立处理 |
+| 标准化错误响应 | ✓ | 部分实现 | 部分实现 |
+| 日志分级策略 | ✓ | 基本日志 | 仅 401+ 记录 |
+| 异常追踪上报 | ✓ (5xx 错误) | ✓ | ✓ (非 401 错误) |
+| ClickHouse 资源错误处理 | ✓ | ✗ | ✗ |
+| 207 批量响应支持 | ✗ | ✗ | ✓ |
+| Entitlement 检查 | ✗ | ✓ (admin-api) | ✗ |
 
 ---
 
@@ -170,87 +200,124 @@
 ```
 SDK 发起请求
     ↓
-┌─ Request Headers ──────────────────────────────┐
-│  Authorization: Basic base64(pk:sk)           │
-│  OR Authorization: Bearer pk                  │
-│  X-Langfuse-Sdk-Name: langfuse-python        │ ← 可选，仅统计
-│  X-Langfuse-Sdk-Version: 3.x.x               │
-│  X-Langfuse-Public-Key: pk-lf-...           │ ← 可选，冗余标识
-└─────────────────────────────────────────────────┘
+┌─ Request Headers ──────────────────────────────────────────────┐
+│  Authorization: Basic base64(pk:sk) 或 Bearer pk             │
+│  X-Langfuse-Sdk-*: (仅统计，不参与鉴权)                      │
+└────────────────────────────────────────────────────────────────┘
     ↓
-┌─ ApiAuthService.verifyAuthHeaderAndReturnScope() ─┐
-│  1. 解析 Authorization 头                          │
-│  2. 分支:                                          │
-│     ├─ Basic Auth → bcrypt 验证 → accessLevel: project │
-│     └─ Bearer Auth → 验证 scope ≠ ORGANIZATION → accessLevel: scores │
-│  3. 提取 orgId, projectId, plan, rateLimitOverrides │
-│  4. 检查 isIngestionSuspended 状态                  │
-│  5. 注入 OpenTelemetry context                      │
-└─────────────────────────────────────────────────────┘
+┌─ ApiAuthService.verifyAuthHeaderAndReturnScope() ──────────────┐
+│  1. 解析 Authorization 头                                        │
+│  2. 分支验证:                                                    │
+│     ├─ Basic Auth:                                               │
+│     │   ├─ bcrypt 验证 secretKey                                │
+│     │   └─ scope = ORGANIZATION ? accessLevel: organization    │
+│     │                          : accessLevel: project          │
+│     └─ Bearer Auth:                                              │
+│         ├─ 检查 scope ≠ ORGANIZATION (否则 throw 401)           │
+│         └─ accessLevel: scores                                   │
+│  3. 提取 orgId, plan, rateLimitOverrides                         │
+│  4. 检查 isIngestionSuspended 状态                               │
+└────────────────────────────────────────────────────────────────┘
     ↓
-┌─ 业务处理 ──────────────────────────────────────┐
-│  Public API: 校验 allowedAccessLevels         │
-│  Ingestion: 直接使用 auth.scope.projectId     │
-└─────────────────────────────────────────────────┘
+┌─ 路由层二次校验 ────────────────────────────────────────────────┐
+│  项目级路由 (createAuthedProjectAPIRoute):                       │
+│    ├─ 检查 allowedAccessLevels 包含当前 accessLevel             │
+│    └─ 检查 projectId 非 null (组织级密钥被 403 拒绝)            │
+│                                                                 │
+│  组织级路由 (/api/public/organizations/*):                       │
+│    ├─ 检查 accessLevel === organization                         │
+│    └─ 检查 orgId 存在                                           │
+│                                                                 │
+│  Ingestion:                                                      │
+│    └─ 检查 projectId 非 null (组织级密钥被 401 拒绝)            │
+└────────────────────────────────────────────────────────────────┘
+    ↓
+业务处理
 ```
-
-### 密钥安全加固点
-1. **时序攻击防护**:
-   - 管理员 API Key: 使用 `crypto.timingSafeEqual`
-   - 普通 API Key: bcrypt + SHA256 双重哈希
-
-2. **缓存安全**:
-   - **API_KEY_NON_EXISTENT 标记**: 不存在的密钥也会被缓存，防止暴力破解数据库查询
-   - **TTL 控制**: 缓存有过期时间，防止密钥撤销后长期有效
-
-3. **密钥层级原则**:
-   - 公钥 (pk-lf): 可公开，仅用于标识
-   - 私钥 (sk-lf): 必须保密，用于认证
-   - 管理员 API Key: 环境变量配置，仅自托管可用
 
 ---
 
-## 6. 关键证据来源
+## 6. 权限矩阵与边界矩阵
+
+### 按认证方式 × 路由类型的权限矩阵
+
+| 认证方式 | 项目级 Public API | 组织级 Public API | Ingestion/SDK |
+|---------|-----------------|-----------------|--------------|
+| Basic Auth (项目级 API Key) | ✓ 200 | ✗ 403 | ✓ 200 |
+| Basic Auth (组织级 API Key) | ✗ 403 | ✓ 200 | ✗ 401 |
+| Bearer Auth (仅项目级公钥) | 仅 POST /scores 200 | ✗ 403 | ✓ 200 |
+| 管理员 API Key (自托管) | 仅 LLM Connections 200 | ✗ | ✗ |
+
+### Public API vs SDK/Ingestion 边界矩阵
+
+| 维度 | Public API 项目级路由 | Public API 组织级路由 | SDK/Ingestion |
+|-----|---------------------|---------------------|--------------|
+| 认证入口 | createAuthedProjectAPIRoute | 直接 ApiAuthService | 直接 ApiAuthService |
+| 支持的 accessLevel | project, scores | organization | project, scores |
+| 组织级密钥可用 | ✗ 403 | ✓ | ✗ 401 |
+| 管理员密钥可用 | ✓ (仅 LLM Connections) | ✗ | ✗ |
+| 错误处理 | withMiddlewares 统一 | handler 独立 | handler 独立 |
+| 响应格式 | 标准 JSON | 标准 JSON | 支持 207 批量 |
+| projectId 必填 | ✓ (组织级密钥 403) | ✗ (应为 null) | ✓ (组织级密钥 401) |
+| Entitlement 检查 | ✗ | ✓ (admin-api) | ✗ |
+| Bearer 公钥支持 | 仅 POST /scores | ✗ | ✓ |
+
+---
+
+## 7. 关键证据索引
 
 ### 代码位置索引
 | 验证项 | 文件路径 | 行号 |
 |-------|---------|-----|
-| Bearer 认证禁用组织密钥 | `web/src/features/public-api/server/apiAuth.ts` | 205-209 |
-| Bearer 认证 accessLevel | `web/src/features/public-api/server/apiAuth.ts` | 224 |
-| Scores 端点允许 scores 级别 | `web/src/pages/api/public/scores/index.ts` | 25 |
-| 管理员密钥触发条件 | `web/src/features/public-api/server/createAuthedProjectAPIRoute.ts` | 148-212 |
-| 管理员密钥生效路由 | `web/src/pages/api/public/llm-connections/index.ts` | 27, 84 |
-| Ingestion 暂停检查 | `web/src/pages/api/public/ingestion.ts` | 90-94 |
-| SDK Headers 定义 | `fern/apis/server/definition/api.yml` | 25-28 |
+| 组织级密钥 projectId = null | packages/shared/src/server/auth/types.ts | 25 |
+| RouteAccessLevel 排除 organization | web/src/features/public-api/server/createAuthedProjectAPIRoute.ts | 28 |
+| projectId null 检查 (项目级路由) | web/src/features/public-api/server/createAuthedProjectAPIRoute.ts | 113-118 |
+| Bearer 认证禁用组织密钥 | web/src/features/public-api/server/apiAuth.ts | 205-209 |
+| Ingestion projectId null 检查 | web/src/pages/api/public/ingestion.ts | 84-88 |
+| 组织级路由 accessLevel 检查 | web/src/pages/api/public/organizations/projects/index.ts | 39-47 |
+| 管理员密钥触发条件 | web/src/features/public-api/server/createAuthedProjectAPIRoute.ts | 148-212 |
+| scores POST 允许 scores 级别 | web/src/pages/api/public/scores/index.ts | 25 |
 
 ### 测试证据索引
-| 验证项 | 测试文件 | 测试用例位置 |
-|-------|---------|-----------|
-| Bearer 公钥可 POST scores | `scores-api-v1.servertest.ts` | 1332-1363 |
-| Bearer 公钥不可 GET scores | `scores-api-v1.servertest.ts` | 1365-1376 |
-| Bearer 公钥不可访问其他端点 | `scores-api-v1.servertest.ts` | 1419-1446 |
-| 组织级密钥要求 | `projects-api.servertest.ts` | 347-360 |
-| 管理员密钥认证测试 | `admin-api-key-auth.servertest.ts` | 完整文件 |
+| 验证项 | 测试文件 | 用例说明 |
+|-------|---------|---------|
+| Bearer 公钥可 POST scores | scores-api-v1.servertest.ts | 1332-1363 |
+| Bearer 公钥不可 GET scores | scores-api-v1.servertest.ts | 1365-1376 |
+| 组织级密钥要求 (组织 API) | organizations-api.servertest.ts | 多处 |
+| 组织级密钥不可访问项目 API | projects-api.servertest.ts | 347-360 |
 
 ---
 
-## 7. 总结与边界矩阵
+## 8. 冲突修正说明
 
-### Public API vs SDK/Ingestion 边界矩阵
+### 本次校准修正的核心结论冲突
 
-| 维度 | Public API | SDK/Ingestion |
-|-----|-----------|--------------|
-| 认证入口 | `createAuthedProjectAPIRoute` | 直接调用 `ApiAuthService` |
-| 权限级别控制 | 路由级别配置 `allowedAccessLevels` | 统一处理，依赖密钥本身 scope |
-| 管理员密钥支持 | ✓ (仅 LLM Connections，自托管) | ✗ |
-| 错误处理 | 统一中间件处理 | Handler 内独立处理 |
-| 响应格式 | 标准 JSON | 支持 207 批量响应 |
-| Ingestion 暂停检查 | 部分端点 (scores POST) | ✓ |
-| Bearer 公钥支持 | 仅 POST /scores | ✓ |
-| 组织级密钥支持 | ✓ (组织级端点) | ✓ |
+#### 🔴 修正 1: Ingestion 对组织级密钥的支持
+- **原错误结论**: "Ingestion 支持所有 API key scope，组织级密钥可访问组织下所有项目"
+- **修正后结论**: "组织级密钥完全无法用于 Ingestion 端点，因 `projectId === null` 触发 401 错误"
+- **证据代码**: [ingestion.ts:84-88] 明确检查 `!authCheck.scope.projectId`
+- **根本原因**: 组织级 API Key 的数据结构设计上 `projectId = null`，无法满足 ingestion 的必填校验
 
-### 关键结论
-1. **Bearer 公钥权限极有限**: 仅支持 Scores 写入，禁止读取，禁止组织级密钥使用
-2. **管理员密钥高度受限**: 仅自托管，仅 LLM Connections 端点，需双重 Header 校验
-3. **组织级密钥需明确端点**: 仅组织管理类 API 接受组织级密钥，其他端点均返回 403
-4. **Ingestion 与 Public API 共享底层认证**: 但上层权限校验逻辑差异显著
+#### 🔴 修正 2: Public API 路由对组织级密钥的支持范围
+- **原错误结论**: "Public API 组织级端点支持组织级密钥" (暗示范围较大)
+- **修正后结论**: "仅 `/api/public/organizations/*` 下的 3 个专用端点支持组织级密钥，其他 95% 端点均通过 `createAuthedProjectAPIRoute` 明确排除组织级密钥 (`RouteAccessLevel = Exclude<ApiAccessLevel, "organization">`)"
+- **证据代码**: [createAuthedProjectAPIRoute.ts:28, 113-118]
+
+#### 🔴 修正 3: 权限矩阵中的错误标记
+- **原错误矩阵**: "组织级 API Key - Ingestion/SDK: ✓"
+- **修正后矩阵**: "组织级 API Key - Ingestion/SDK: ✗ (401 拒绝)"
+- **统一口径**: 组织级密钥仅用于组织管理类 API，不可用于数据摄入和项目级操作
+
+#### 🔴 修正 4: 租户隔离章节的矛盾描述
+- **原矛盾描述**: 同时声称"组织级密钥可访问组织下所有项目"和"projectId 隔离"
+- **修正后口径**: 明确区分两种路由模式：
+  - 组织级路由 (`/api/public/organizations/*`): 不需要 projectId，以 orgId 为隔离边界
+  - 项目级路由 & Ingestion: projectId 必须为非空字符串，组织级密钥被明确拒绝
+
+### 统一后的核心原则
+1. **密钥-路由匹配原则**: 组织级密钥 → 组织级路由；项目级密钥 → 项目级路由/Ingestion
+2. **Ingestion 项目锁定原则**: 所有数据摄入必须关联明确的单个项目 ID，不支持跨项目摄入
+3. **Bearer 公钥最小权限原则**: 仅用于 scores 写入，禁止读取和组织级操作
+4. **错误码区分原则**: 
+   - 项目级路由遇组织密钥 → 403 (权限不足)
+   - Ingestion 遇组织密钥 → 401 (认证无效，缺少 projectId)
