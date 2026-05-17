@@ -707,7 +707,7 @@ export const getTracesTable = async (p: {
   page?: number;
   clickhouseConfigs?: ClickHouseClientConfigOptions | undefined;
 }) => {
-  // 调用泛型查询函数，构建 traces CTE
+  // 调用泛型查询函数，构建 observations_stats 和 scores_avg CTE
   const rows = await getTracesTableGeneric({
     select: "rows",
     tags: { kind: "list" },
@@ -726,23 +726,85 @@ export const getTracesTable = async (p: {
 };
 ```
 
-**getTracesTableGeneric 内部构建的 CTE**:
-- `traces` CTE: 从 traces 表查询基础字段
-- `observations_stats` CTE: 聚合 observation 统计（延迟、Token 等）
-- `scores_avg` CTE: 聚合评分数据
+**getTracesTableGeneric 实际 SQL 结构（无 traces CTE）**:
+
+**文件**：`packages/shared/src/server/services/traces-ui-table-service.ts:286-348`
+
+```typescript
+// 1. 构建 CTE 字符串（仅包含 observations_stats 和 scores_avg）
+const observationsAndScoresCTE = `
+  WITH observations_stats AS (
+    SELECT
+      COUNT(*) AS observation_count,
+      sumMap(usage_details) as usage_details,
+      SUM(total_cost) AS total_cost,
+      ... 其他聚合字段
+      trace_id,
+      project_id
+    FROM observations o ${skipObservationsDedup ? "" : "FINAL"}
+    WHERE o.project_id = {projectId: String}
+      ... 其他过滤条件
+    GROUP BY trace_id, project_id
+  ),
+       scores_avg AS (
+         SELECT
+           project_id,
+           trace_id,
+           groupArrayIf(tuple(name, avg_value), ...) AS scores_avg,
+           groupArrayIf(concat(name, ':', string_value), ...) AS score_categories
+         FROM (
+                SELECT
+                  project_id, trace_id, name, data_type, string_value,
+                  avg(value) as avg_value
+                FROM scores s FINAL
+                WHERE project_id = {projectId: String}
+                  ... 其他过滤条件
+                GROUP BY project_id, trace_id, name, data_type, string_value
+            ) tmp
+         GROUP BY project_id, trace_id
+       )
+`;
+
+// 2. 主查询：直接从 traces 表查询，无 traces CTE
+const query = `
+  ${observationsAndScoresCTE}  -- 仅注入 observations_stats 和 scores_avg
+
+  SELECT ${sqlSelect}
+  -- 主表：直接查询 traces 表（不是从 CTE 查询）
+  FROM traces t  ${defaultOrder || select === "count" ? "" : "FINAL"}
+  -- 有条件 JOIN：只有 metrics 查询或筛选/排序需要时才 JOIN
+  ${select === "metrics" || requiresObservationsJoin ? `LEFT JOIN observations_stats o on o.project_id = t.project_id and o.trace_id = t.id` : ""}
+  ${select === "metrics" || requiresScoresJoin ? `LEFT JOIN scores_avg s on s.project_id = t.project_id and s.trace_id = t.id` : ""}
+  WHERE t.project_id = {projectId: String}
+    ... 其他过滤、排序、分页条件
+`;
+```
+
+**关键要点修正**:
+1. ❌ **不存在 `traces` CTE** - 主查询直接 `FROM traces t` 查询原始表
+2. ✅ **只有 2 个 CTE**: `observations_stats` 和 `scores_avg`
+3. ✅ **CTE 不是无条件使用**: 只有 `select === "metrics"` 或筛选/排序涉及对应表时才 `LEFT JOIN`
+4. ✅ **原始表使用 FINAL 修饰**: 非默认排序时 `traces t FINAL` 保证数据一致性
 
 ### 4.3 Traces vs Events 查询构建路径对比
 
 | 维度 | Traces 查询 | Events 查询 |
 |------|------------|------------|
 | **入口函数** | `getTracesTable` | `getEventList` |
-| **查询构建器** | 自定义 CTE 构建 | `EventsQueryBuilder` 流式 API |
-| **表选择** | `traces` 表 + 关联查询 | `events_core` / `events_full`（自动选择） |
-| **Model 数据** | 无 | `enrichObservationsWithModelData` 单独查询 |
-| **Score 聚合** | CTE 内聚合 | 查询后单独查询并聚合 |
-| **I/O 字段** | 无 | `batchIO` 端点单独获取（列表页不包含） |
-| **分页计算** | `page * limit` | `(page - 1) * limit` (1-indexed) |
-| **筛选处理** | `applyCommentFilters` | `applyCommentFilters` + `positionInTrace` 特殊处理 |
+| **查询构建方式** | 直接拼接 SQL 字符串 + 多个 CTE | `EventsQueryBuilder` 流式 API + `when` 条件链式调用 |
+| **主数据表** | `traces` 表 (Postgres) + 关联 ClickHouse CTE | `events_core` / `events_full`（ClickHouse，自动选择） |
+| **分页索引** | 0-indexed: `offset = page * limit` | 1-indexed: `offset = (page - 1) * limit` |
+| **limit 方法** | 原生 SQL `LIMIT {limit} OFFSET {offset}` | `queryBuilder.limit(limit, offset)` (单方法双参数) |
+| **排序方法** | 原生 SQL `ORDER BY` 拼接 | `queryBuilder.orderByColumns(entries)` |
+| **筛选应用** | 直接拼接 SQL 条件 | `queryBuilder.applyFilters(filterList)` |
+| **搜索条件应用** | 直接拼接 SQL 条件 | `queryBuilder.where(searchCondition)` |
+| **Score 聚合方式** | CTE 内 `scores_avg` + `LEFT JOIN` 聚合 | **2 种方式**：1) scores CTE JOIN；2) `getEventList` 中单独查询 scores 表 |
+| **Observation 聚合** | CTE 内 `observations_stats` + `LEFT JOIN` | ClickHouse 行级字段，无单独聚合 |
+| **Model 定价数据** | 无 | 查询后 `enrichObservationsWithModelData` 单独查询 Prisma |
+| **I/O 字段策略** | 无 | 列表页不包含，`batchIO` 端点单独异步获取 |
+| **特殊筛选** | 无 | `positionInTrace` 筛选：需额外 `qualifying_obs` CTE + `ROW_NUMBER() OVER (...)` |
+| **评论筛选** | `applyCommentFilters` | `applyCommentFilters`（注解队列共用） |
+| **性能监控** | 无封装，直接调用 | `measureAndReturn` 包裹监控 + `EventsReadOnly` ClickHouse 服务选择 |
 
 ### 4.4 双表查询策略
 
