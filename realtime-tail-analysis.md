@@ -265,20 +265,60 @@ all: protectedProjectProcedure
   }),
 ```
 
-### 3.3 分页参数
+### 3.3 分页参数（双口径区分）
 
-Langfuse 使用**偏移分页**而非键集分页（keyset pagination）：
+Langfuse 使用**偏移分页**而非键集分页（keyset pagination），但 **traces 和 events 使用不同的 page 索引口径**，不可混用：
 
+#### 统一的 Zod 定义
 ```typescript
-// packages/shared/src/types.ts 中的 paginationZod
+// packages/shared/src/types.ts 中的 paginationZod（无索引语义，只定义类型）
 const paginationZod = {
   page: z.number().int().min(0),
   limit: z.number().int().min(0).max(100),
 };
-
-// 分页计算在 ClickHouse 查询中实现
-// LIMIT {limit} OFFSET {page * limit}
 ```
+
+#### Traces 查询：0-indexed（page 从 0 开始）
+**文件**：`packages/shared/src/server/services/traces-ui-table-service.ts:470`
+```typescript
+// Traces: page 0 = 第 1 页，page 1 = 第 2 页
+const res = await queryClickhouse({
+  query: `... LIMIT {limit: Int32} OFFSET {offset: Int32}`,
+  params: {
+    limit: limit,
+    offset: limit && page ? limit * page : 0,  // ✅ 0-indexed: offset = page * limit
+    // page=0 → offset=0（第 1 页）
+    // page=1 → offset=limit（第 2 页）
+  },
+});
+```
+
+#### Events 查询：1-indexed（page 从 1 开始）
+**文件**：`web/src/features/events/server/eventsService.ts:91`
+```typescript
+// Events: page 1 = 第 1 页，page 2 = 第 2 页（代码注释明确说明）
+const params = {
+  projectId: params.projectId,
+  filter: params.filter,
+  searchQuery: params.searchQuery,
+  searchType: params.searchType,
+  orderBy: params.orderBy,
+  limit: params.limit,
+  offset: (params.page - 1) * params.limit,  // ✅ 1-indexed: offset = (page - 1) * limit
+  // page=1 → offset=0（第 1 页）
+  // page=2 → offset=limit（第 2 页）
+};
+```
+
+#### 关键区别对比表
+| 维度 | Traces 查询 (0-indexed) | Events 查询 (1-indexed) |
+|------|------------------------|------------------------|
+| **page 起始值** | 0 | 1 |
+| **offset 公式** | `offset = page * limit` | `offset = (page - 1) * limit` |
+| **第 1 页** | `page=0` → `offset=0` | `page=1` → `offset=0` |
+| **第 2 页** | `page=1` → `offset=limit` | `page=2` → `offset=limit` |
+| **代码注释** | 无显式注释 | `// Page is 1-indexed (page 1 = offset 0)` |
+| **计算位置** | traces-ui-table-service.ts (ClickHouse params) | eventsService.ts (服务层参数转换) |
 
 ---
 
@@ -791,7 +831,7 @@ const query = `
 | 维度 | Traces 查询 | Events 查询 |
 |------|------------|------------|
 | **入口函数** | `getTracesTable` | `getEventList` |
-| **查询构建方式** | 直接拼接 SQL 字符串 + 多个 CTE | `EventsQueryBuilder` 流式 API + `when` 条件链式调用 |
+| **查询构建方式** | 直接拼接 SQL 字符串 + 2 个有条件 JOIN 的 CTE | `EventsQueryBuilder` 流式 API + `when` 条件链式调用 |
 | **主数据表** | `traces` 表 (Postgres) + 关联 ClickHouse CTE | `events_core` / `events_full`（ClickHouse，自动选择） |
 | **分页索引** | 0-indexed: `offset = page * limit` | 1-indexed: `offset = (page - 1) * limit` |
 | **limit 方法** | 原生 SQL `LIMIT {limit} OFFSET {offset}` | `queryBuilder.limit(limit, offset)` (单方法双参数) |
