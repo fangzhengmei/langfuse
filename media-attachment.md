@@ -949,37 +949,298 @@ throw new InternalServerError(
 
 ---
 
-## 九、安全设计要点
+## 九、第五轮深度核对结果（前端链路盲点复核）
 
-### 9.1 现有安全措施
+### 9.1 问题一：useMedia、SectionMedia、LangfuseMediaView 与 getById 的实际调用顺序
+
+**结论：✅ 批量结果一定会再经过 getById 的状态过滤，不存在直接泄漏未成功媒体URL的风险**
+
+#### 完整调用链路图
+
+```
+TraceDetailView / ObservationDetailView
+  │
+  ├─ useMedia({ projectId, traceId, observationId? })
+  │   └─ api.media.getByTraceOrObservationId.useQuery()
+  │       └─ SQL查询：无状态过滤，返回 MediaReturnType[]（含 url, urlExpiry）
+  │
+  └─ IOPreview
+       ├─ IOPreviewPretty（Pretty视图）
+       │   └─ ChatMessageList
+       │       ├─ 计算 remainingMedia（过滤已在内容中内联渲染的媒体）
+       │       └─ SectionMedia
+       │           └─ 对每个媒体调用 LangfuseMediaView(mediaAPIReturnValue={m})
+       │               └─ api.media.getById.useQuery()  ✅ 状态过滤
+       │
+       ├─ IOPreviewJSONSimple（JSON视图）
+       │   └─ PrettyJsonView
+       │       ├─ 对每个字段渲染 MarkdownViewer（内联媒体）
+       │       │   └─ LangfuseMediaView(mediaReferenceString="...")
+       │       │       └─ api.media.getById.useQuery()  ✅ 状态过滤
+       │       └─ SectionMedia（通过 media.filter 按 field 分组）
+       │           └─ 同上
+       │
+       └─ IOPreviewJSON（JSON Beta视图）
+           └─ MultiSectionJsonViewer
+               ├─ Section Header: MediaButtonGroup(media)
+               │   └─ MediaPreview(mediaItem)
+               │       └─ api.media.getById.useQuery()  ✅ 状态过滤
+               └─ 内容渲染：LangfuseMediaView
+                   └─ api.media.getById.useQuery()  ✅ 状态过滤
+```
+
+#### 关键代码证据
+
+**LangfuseMediaView 无条件调用 getById**（`LangfuseMediaView.tsx:68-80`）:
+```typescript
+// 无论传入的是 mediaAPIReturnValue 还是 mediaReferenceString，
+// 最终都会调用 getById 获取签名URL
+const { data } = api.media.getById.useQuery(
+  {
+    mediaId: mediaData.id,
+    projectId: projectId as string,
+  },
+  {
+    enabled: Boolean(projectId),
+    // ...
+  },
+);
+
+const mediaUrl = data?.url;  // 只使用 getById 返回的 url
+if (!mediaUrl) return null;  // 未成功的媒体返回null，不渲染
+```
+
+**批量返回的 url 被完全忽略**:
+- `MediaReturnType` 类型虽然包含 `url` 和 `urlExpiry` 字段
+- 但所有消费方都不直接使用这些字段，而是**重新调用 getById 获取**
+- 批量返回的 `url` 目前是死数据，没有任何代码路径使用
+
+---
+
+### 9.2 问题二：区分三层行为，重算批量查询未过滤的真实用户影响
+
+**结论：⚠️ 安全影响为低，但性能影响为中；用户看不到未成功上传的媒体，但会产生无效的N+1查询**
+
+#### 三层行为模型
+
+| 层级 | 行为 | 状态过滤 | 结果 |
+|------|------|---------|------|
+| **第一层：预取** | `getByTraceOrObservationId` | ❌ 无过滤 | 返回所有关联媒体，包括未上传/失败的 |
+| **第二层：二次查询** | `LangfuseMediaView` 中的 `getById` | ✅ 严格过滤 | 未成功的媒体返回 404 错误 |
+| **第三层：渲染** | `LangfuseMediaView` 返回值 | ✅ 隐式过滤 | `data.url` 为 `undefined` 时返回 `null`，不渲染 |
+
+#### 真实影响量化
+
+| 影响类型 | 严重程度 | 详细说明 |
+|---------|---------|---------|
+| **安全影响** | 🟢 低 | 未成功媒体的签名URL从未被使用或暴露<br>最终渲染时100%被过滤 |
+| **性能影响** | 🟡 中 | N+1查询问题：<br>- 批量查询返回 M 个媒体<br>- 每个触发 1 次 getById 查询<br>- 其中 K 个是无效的（返回404）<br>- 浪费 K 次数据库查询和网络往返 |
+| **用户体验** | 🟢 低 | 用户看不到任何失效媒体<br>可能有轻微的加载延迟（无效查询的等待时间） |
+| **日志污染** | 🟡 中 | 大量 404 错误会出现在后端日志中<br>干扰真实错误的排查 |
+
+#### 场景示例
+
+假设一个 trace 关联了 5 个媒体：
+- 2 个上传成功（status=200）
+- 2 个上传失败（status=403）
+- 1 个从未上传（status=NULL）
+
+**当前行为**:
+1. 批量查询返回 5 个媒体（包含 3 个无效）
+2. 前端发起 5 个 getById 查询
+3. 3 个 getById 返回 404 错误（后端日志记录 3 条错误）
+4. 前端只渲染 2 个成功的媒体
+
+**修复后行为**:
+1. 批量查询返回 2 个媒体（只返回成功的）
+2. 前端发起 2 个 getById 查询
+3. 全部成功，无错误日志
+4. 前端渲染 2 个成功的媒体
+
+**节省**: 3 次无效数据库查询 + 3 次网络往返 + 3 条错误日志
+
+---
+
+### 9.3 问题三：哪些页面或组件路径会直接消费批量结果而绕开 getById
+
+**结论：✅ 不存在直接消费批量结果 URL 的路径；所有路径最终都会经过 getById**
+
+#### 所有消费路径排查
+
+| 组件 | 传入批量结果的字段 | 实际使用方式 | 是否绕开 getById |
+|------|------------------|------------|----------------|
+| **SectionMedia** | `mediaAPIReturnValue={m}` | 传入 LangfuseMediaView → getById | ❌ 不绕开 |
+| **LangfuseMediaView** | `mediaReferenceString` | 解析 mediaId → getById | ❌ 不绕开 |
+| **LangfuseMediaView** | `mediaAPIReturnValue` | 提取 mediaId → getById | ❌ 不绕开 |
+| **MediaButtonGroup** | `media` 数组 | 分组显示按钮 → MediaPreview → getById | ❌ 不绕开 |
+| **MediaPreview** | `mediaItem` | 提取 mediaId → getById | ❌ 不绕开 |
+| **PrettyJsonView** | `media?.filter((m) => m.field === "input")` | 传入 SectionMedia → 同上 | ❌ 不绕开 |
+| **ChatMessageList** | `remainingMedia` | 传入 SectionMedia → 同上 | ❌ 不绕开 |
+| **MarkdownViewer** | 内联媒体标签 | 解析 mediaReferenceString → getById | ❌ 不绕开 |
+
+#### 唯一"直接消费"的字段
+
+批量返回的 `MediaReturnType` 中，只有以下字段被直接使用（不经过 getById）：
+- `mediaId` - 用于后续 getById 查询的参数
+- `contentType` - 用于判断渲染类型（图片/音频/视频/文件）
+- `field` - 用于按 input/output/metadata 分组
+- `url` 和 `urlExpiry` - **从未被使用**
+
+#### 风险触达边界
+
+**不存在安全风险边界**：
+- 没有任何代码路径会将批量返回的 `url` 传递给浏览器进行网络请求
+- 所有媒体访问都经过 `getById` 的状态校验
+- 未成功上传的媒体永远无法获得可访问的签名URL
+
+**存在性能风险边界**：
+- `TraceDetailView` - trace 详情页（trace 级别媒体）
+- `ObservationDetailView` - observation 详情页（observation 级别媒体）
+- 所有包含媒体的 trace/observation 列表页面（如果未来有）
+
+---
+
+### 9.4 问题四：基于事实重写优先级建议
+
+**结论：⚠️ 优先级从"高"调整为"中"；安全影响低，但性能和可维护性影响仍值得修复**
+
+#### 优先级重估依据
+
+| 维度 | 之前评估 | 当前评估 | 调整原因 |
+|------|---------|---------|---------|
+| **安全影响** | 🔴 高 | 🟢 低 | 所有路径最终经过 getById 过滤<br>未成功媒体URL从未暴露 |
+| **性能影响** | 未评估 | 🟡 中 | N+1查询浪费，无效请求消耗资源<br>错误日志污染 |
+| **用户体验** | 🔴 高 | 🟢 低 | 用户看不到无效媒体<br>仅可能有轻微加载延迟 |
+| **数据一致性** | 未评估 | 🟡 中 | 前后端状态口径不一致<br>批量接口契约不准确 |
+| **可维护性** | 未评估 | 🟡 中 | 批量返回的 `url` 字段是死代码<br>误导未来开发者 |
+| **修复成本** | 低 | 低 | SQL层增加过滤条件，改动极小 |
+
+#### 最终优先级建议
+
+| 问题 | 原优先级 | 新优先级 | 调整理由 |
+|------|---------|---------|---------|
+| 批量查询未过滤 | 🔴 高 | 🟡 中 | 安全风险被前端二次查询消解<br>但性能和可维护性问题仍存在 |
+| 非S3后端完整性校验缺失 | 🔴 高 | 🔴 高 | 缓存污染攻击风险真实存在<br>前端无法防御 |
+| 200/201状态处理不一致 | 🟡 中 | 🟡 中 | 影响去重效率，但不影响功能正确性 |
+| PATCH异常分支错误信息拼接 | 🟡 中 | 🟢 低 | 仅影响错误排查，不影响功能 |
+| 前端URL过期无自动续签 | 🟡 中 | 🟡 中 | 影响用户体验，需要修复 |
+| 多bucket参数名误导 | 🟢 低 | 🟢 低 | 单bucket场景下无实际影响 |
+
+#### 是否仍应列为高优先的判断
+
+**不建议列为高优先**，理由：
+1. ✅ 不存在安全漏洞（用户数据安全未受威胁）
+2. ✅ 不影响核心功能正确性（用户看不到无效媒体）
+3. ⚠️ 但建议尽快修复，因为：
+   - 修复成本极低（SQL增加一行过滤条件）
+   - 性能收益明显（减少无效查询）
+   - 消除日志污染，便于排查真实问题
+   - 统一前后端契约，提升代码可维护性
+
+**建议列入下一个迭代的技术债务修复**，而非紧急安全修复。
+
+---
+
+### 9.5 完整修复方案（覆盖 trace 与 observation 两条分支）
+
+#### SQL层过滤（推荐，性能最优）
+
+**Trace 分支**（`web/src/server/api/routers/media.ts:97-112`）:
+```sql
+SELECT
+  tm.field,
+  m.id,
+  m.bucket_name,
+  m.bucket_path,
+  m.content_type,
+  m.content_length
+FROM
+  trace_media tm
+  INNER JOIN media m  -- ✅ 改为INNER JOIN，排除关联不存在的情况
+    ON tm.media_id = m.id 
+    AND tm.project_id = m.project_id
+WHERE
+  tm.project_id = ${projectId}
+  AND tm.trace_id = ${traceId}
+  AND m.upload_http_status IN (200, 201)  -- ✅ 新增：只返回上传成功的媒体
+```
+
+**Observation 分支**（`web/src/server/api/routers/media.ts:124-140`）:
+```sql
+SELECT
+  om.field,
+  m.id,
+  m.bucket_name,
+  m.bucket_path,
+  m.content_type,
+  m.content_length
+FROM
+  observation_media om
+  INNER JOIN media m  -- ✅ 改为INNER JOIN
+    ON om.media_id = m.id 
+    AND om.project_id = m.project_id
+WHERE
+  om.project_id = ${projectId}
+  AND om.trace_id = ${traceId}
+  AND om.observation_id = ${input.observationId}
+  AND m.upload_http_status IN (200, 201)  -- ✅ 新增：只返回上传成功的媒体
+```
+
+#### 额外优化：移除批量返回的死字段
+
+由于 `url` 和 `urlExpiry` 从未被使用，可以考虑：
+1. 从 SQL SELECT 中移除，减少数据传输
+2. 或从 `MediaReturnType` 类型中移除，明确契约
+
+#### 修复验证清单
+
+- [ ] Trace 分支 SQL 增加 `upload_http_status IN (200, 201)` 过滤
+- [ ] Trace 分支 JOIN 改为 INNER JOIN
+- [ ] Observation 分支 SQL 增加 `upload_http_status IN (200, 201)` 过滤
+- [ ] Observation 分支 JOIN 改为 INNER JOIN
+- [ ] 新增 E2E 测试用例验证未成功上传的媒体不被返回
+- [ ] 新增 E2E 测试用例验证 observation 分支过滤逻辑
+- [ ] 验证错误日志中不再出现大量媒体404错误
+
+---
+
+## 十、安全设计要点
+
+### 10.1 现有安全措施
 
 1. **权限隔离**: 所有操作通过 `projectId` 边界校验，防止跨项目访问
 2. **签名过期**: URL 有效期严格限制（默认3600秒），降低泄露风险
 3. **完整性校验（S3）**: 上传时强制校验 SHA256 哈希和 Content-Length（存储层）
 4. **去重机制**: 基于 SHA256 哈希 + contentType 实现"相同内容+相同类型"去重
 5. **状态机（单条查询）**: `getById` 和 GET API 中 `uploadHttpStatus` 确保只有上传成功的媒体才能被访问
-6. **幂等性**: 高并发场景下使用原生 SQL + 重试机制保证数据一致性
-7. **审计日志**: 所有上传操作记录指标，支持监控和审计
-8. **应用层大小限制**: 获取上传URL时校验 `contentLength < MAX_CONTENT_LENGTH`
-9. **允许重传**: 支持不同 contentType、不同 contentLength、不同 content 的重试上传
+6. **状态机（前端兜底）**: `LangfuseMediaView` 无条件调用 `getById`，为批量查询提供二次过滤
+7. **幂等性**: 高并发场景下使用原生 SQL + 重试机制保证数据一致性
+8. **审计日志**: 所有上传操作记录指标，支持监控和审计
+9. **应用层大小限制**: 获取上传URL时校验 `contentLength < MAX_CONTENT_LENGTH`
+10. **允许重传**: 支持不同 contentType、不同 contentLength、不同 content 的重试上传
 
-### 9.2 已核实的安全缺陷（按优先级）
+### 10.2 已核实的安全缺陷（按优先级，第五轮更新）
 
 | 优先级 | 问题 | 影响 | 所在章节 |
 |--------|------|------|---------|
-| 🔴 高 | 批量查询（trace/observation）未过滤未成功上传的媒体 | 未上传/上传失败的媒体也能获得签名URL，存在缓存污染风险 | 8.4 |
 | 🔴 高 | 非S3后端存储层完整性校验缺失 | 客户端可上传与声明的SHA256/Size不符的文件，存在缓存污染攻击 | 8.7（第三轮） |
-| 🟡 中 | 200/201状态处理不一致 | S3 PUT成功返回201时去重失效，重复上传浪费资源 | 8.1 |
+| 🟡 中 | 批量查询（trace/observation）未过滤未成功上传的媒体 | N+1查询浪费，错误日志污染，前后端契约不一致<br>⚠️ 安全风险被前端二次查询消解 | 9.5（第五轮） |
+| 🟡 中 | 200/201状态处理不一致 | S3 PUT成功返回201时去重失效，重复上传浪费资源 | 8.1（第四轮） |
 | 🟡 中 | 前端URL过期无自动续签 | 用户长时间停留页面时URL过期，导致403错误 | 5.2 |
-| 🟡 中 | PATCH异常分支错误信息拼接bug | 错误信息丢失上下文前缀，调试困难 | 8.5 |
+| 🟢 低 | PATCH异常分支错误信息拼接bug | 错误信息丢失上下文前缀，调试困难 | 8.5 |
 | 🟢 低 | 多bucket参数名误导 | 当前单bucket设计下无影响，未来扩展需注意 | 8.6 |
 | 🟢 低 | seed-media硬编码200 | 内部脚本，无实际影响 | 8.3 |
+| 🟢 低 | 批量返回的url/urlExpiry是死字段 | 无代码路径使用，仅影响可维护性 | 9.1（第五轮） |
 
-### 9.3 设计边界澄清
+### 10.3 设计边界澄清（第五轮更新）
 
 1. **单 bucket 部署**: 当前系统明确设计为单 bucket 部署，所有媒体共享一个存储桶。多 bucket 支持不在当前设计范围内。
 2. **S3 为一等公民**: 完整性校验在 S3 后端得到完整实现，其他后端为兼容实现，安全级别不同。
-3. **状态机部分生效**: 状态机校验仅在单条查询（`getById`、GET API）中生效，批量查询（`getByTraceOrObservationId`）未实现。
-4. **客户端信任模型**: SHA256 哈希由客户端计算并提供，非 S3 后端无法在存储层验证其真实性。
-5. **去重边界**: 去重是"相同内容（SHA256）+ 相同类型（contentType）+ 状态200"才短路，允许同一内容以不同类型重传。
-6. **写入口径统一**: 公开API和seed-media脚本的写入/去重口径统一为 `uploadHttpStatus === 200`，读取口径更宽松（接受200和201）。
+3. **状态机双层防护**:
+   - 第一层（后端）：单条查询（`getById`、GET API）严格校验 `uploadHttpStatus`
+   - 第二层（前端）：`LangfuseMediaView` 无条件调用 `getById`，批量查询返回的 URL 从未被使用
+4. **批量查询的真实定位**: 本质是"媒体元数据预取"，而非"签名URL批量获取"，返回的 `url`/`urlExpiry` 是死字段。
+5. **客户端信任模型**: SHA256 哈希由客户端计算并提供，非 S3 后端无法在存储层验证其真实性。
+6. **去重边界**: 去重是"相同内容（SHA256）+ 相同类型（contentType）+ 状态200"才短路，允许同一内容以不同类型重传。
+7. **写入口径统一**: 公开API和seed-media脚本的写入/去重口径统一为 `uploadHttpStatus === 200`，读取口径更宽松（接受200和201）。
+8. **N+1查询设计**: 前端媒体展示采用"批量预取元数据 + 逐条获取签名URL"的模式，是有意的设计选择（利用 TanStack Query 缓存）。
