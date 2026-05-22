@@ -499,339 +499,383 @@ const accessUri = resp.preauthenticatedRequest.accessUri;
 
 ---
 
-## 八、五项深度核对结果
+## 八、第三轮深度核对结果（四项精准核实）
 
-### 8.1 问题一：前端staleTime在关闭挂载与窗口重取配置下是否会自动续签
+### 8.1 问题一：getByTraceOrObservationId 批量返回前是否过滤未成功上传的媒体
 
-**结论：❌ 不会自动续签，存在URL过期风险**
+**结论：❌ 未过滤，存在安全隐患**
 
-**详细分析**见第五章"续签机制原理与风险分析"。
+#### 代码证据
 
-**核心问题**:
-- `staleTime` 仅标记数据是否过期，不主动触发重获取
-- 所有自动重获取触发条件都被关闭（`refetchOnMount=false`, `refetchOnWindowFocus=false`, `refetchOnReconnect=false`）
-- 未设置 `refetchInterval` 定时刷新
-- 用户长时间停留在页面时，URL会在60分钟后过期，导致403错误
+**批量查询逻辑**（`web/src/server/api/routers/media.ts:85-141`）:
+```sql
+SELECT
+  tm.field,
+  m.id,
+  m.bucket_name,
+  m.bucket_path,
+  m.content_type,
+  m.content_length
+FROM
+  trace_media tm
+  LEFT JOIN media m 
+    ON tm.media_id = m.id 
+    AND tm.project_id = m.project_id
+WHERE
+  tm.project_id = ${projectId}
+  AND tm.trace_id = ${traceId}
+```
 
-**修复建议**:
-1. 新增 `refetchInterval: 50 * 60 * 1000` 实现定时自动续签
-2. 或启用 `refetchOnMount: true` 在组件挂载时检查并刷新
-3. 或在访问URL前检查过期时间，手动调用 `refetch()`
+**关键发现**:
+- SQL 查询仅做 `LEFT JOIN`，**没有任何 WHERE 条件过滤 `uploadHttpStatus`**
+- 查询结果 SELECT 列表中甚至**不包含 `uploadHttpStatus` 字段**
+- 后续 `Promise.all` 循环直接为所有查询结果生成签名URL
+
+#### 与单条查询的对比
+
+| 查询方式 | 代码位置 | 状态检查 |
+|---------|---------|---------|
+| `getById` | `media.ts:36-45` | ✅ 检查 `!uploadHttpStatus` → 抛出"未上传"<br>✅ 检查 `!== 200 && !== 201` → 抛出"上传失败" |
+| `GET /api/public/media/[mediaId]` | `[mediaId].ts:41-46` | ✅ 同上 |
+| `getByTraceOrObservationId` | `media.ts:85-170` | ❌ 无任何检查 |
+
+#### 影响分析
+
+1. **未上传的媒体**（`uploadHttpStatus IS NULL`）：会返回签名URL，但存储中不存在文件，访问时404
+2. **上传失败的媒体**（`uploadHttpStatus` 非200/201）：会返回签名URL，但可能存储的是错误数据
+3. **安全隐患**：攻击者可以通过创建 trace/observation_media 关联，获取未成功上传媒体的签名URL
+4. **体验问题**：前端渲染时会出现图片加载失败的占位符
+
+#### 修复建议
+
+**方案一：在SQL中过滤（推荐，性能最优）**
+
+```sql
+SELECT
+  tm.field,
+  m.id,
+  m.bucket_name,
+  m.bucket_path,
+  m.content_type,
+  m.content_length
+FROM
+  trace_media tm
+  JOIN media m  -- 改为INNER JOIN，排除关联不存在的情况
+    ON tm.media_id = m.id 
+    AND tm.project_id = m.project_id
+WHERE
+  tm.project_id = ${projectId}
+  AND tm.trace_id = ${traceId}
+  AND m.upload_http_status IN (200, 201)  -- 新增：只返回上传成功的媒体
+```
+
+**方案二：在应用层过滤**
+
+```typescript
+// 在Promise.all前增加过滤
+const validMedia = media.filter(m => 
+  m.uploadHttpStatus === 200 || m.uploadHttpStatus === 201
+);
+```
 
 ---
 
-### 8.2 问题二：200与201在去重短路、状态回写、读取放行中的处理口径是否一致
+### 8.2 问题二：去重短路与状态回写对 200/201 的处理是否统一
 
-**结论：❌ 不一致，存在两处逻辑缺陷**
+**结论：✅ 去重短路与状态回写内部一致，但与读取放行不一致**
 
-#### 三个场景的口径对比
+#### 三项逻辑的精准核对
 
-| 场景 | 代码位置 | 检查逻辑 | 200 | 201 | 一致性 |
-|------|---------|---------|-----|-----|--------|
-| **去重短路** | `media/index.ts:72-75` | `uploadHttpStatus === 200` | ✅ 通过 | ❌ 不通过 | ❌ 不一致 |
-| **状态回写清空错误** | `[mediaId].ts:98` | `uploadHttpStatus === 200 ? null` | ✅ 清空错误 | ❌ 保留错误 | ❌ 不一致 |
-| **读取放行** | `media.ts:41` 和 `[mediaId].ts:43` | `=== 200 \|\| === 201` | ✅ 通过 | ✅ 通过 | ✅ 一致 |
+| 场景 | 代码位置 | 检查逻辑 | 200 | 201 |
+|------|---------|---------|-----|-----|
+| **去重短路** | `media/index.ts:74` | `existingMedia.uploadHttpStatus === 200` | ✅ | ❌ |
+| **状态回写清空错误** | `[mediaId].ts:98` | `uploadHttpStatus === 200 ? null` | ✅ | ❌ |
+| **读取放行（getById）** | `media.ts:41` | `=== 200 \|\| === 201` | ✅ | ✅ |
+| **读取放行（GET API）** | `[mediaId].ts:43` | `=== 200 \|\| === 201` | ✅ | ✅ |
 
-#### 缺陷1：去重短路漏掉201
+#### 代码事实确认
 
-**代码**:
+**去重短路**（`web/src/pages/api/public/media/index.ts:72-75`）:
 ```typescript
-// web/src/pages/api/public/media/index.ts:72-75
 if (
   existingMedia &&
-  existingMedia.uploadHttpStatus === 200 &&  // ⚠️ 只判断200，漏掉201
+  existingMedia.uploadHttpStatus === 200 &&  // 只判断200
   existingMedia.contentType === contentType
 ) {
   // 去重命中，直接返回
 }
 ```
 
-**影响**: S3 PUT成功通常返回201而非200。如果之前上传返回的是201，下次相同文件上传时无法命中去重，会：
-1. 重新生成签名上传URL
-2. 重新执行媒体记录upsert
-3. 客户端重复上传相同文件到存储
-4. 浪费存储和带宽资源
-
-**修复**:
+**状态回写**（`web/src/pages/api/public/media/[mediaId].ts:95-99`）:
 ```typescript
-existingMedia &&
-(existingMedia.uploadHttpStatus === 200 || existingMedia.uploadHttpStatus === 201) &&  // ✅ 同时判断200和201
-existingMedia.contentType === contentType
-```
-
-#### 缺陷2：状态回写时201不清空错误信息
-
-**代码**:
-```typescript
-// web/src/pages/api/public/media/[mediaId].ts:95-99
 data: {
   uploadedAt,
   uploadHttpStatus,
-  uploadHttpError: uploadHttpStatus === 200 ? null : uploadHttpError,  // ⚠️ 只有200才清空
+  uploadHttpError: uploadHttpStatus === 200 ? null : uploadHttpError,  // 只判断200
 }
 ```
 
-**影响**: 如果客户端回调传入 `uploadHttpStatus=201` 且 `uploadHttpError` 非空，错误信息会被错误保留。
-
-**修复**:
+**读取放行**（`web/src/server/api/routers/media.ts:41`）:
 ```typescript
-uploadHttpError: (uploadHttpStatus === 200 || uploadHttpStatus === 201) ? null : uploadHttpError,  // ✅ 200和201都清空
+if (!(media.uploadHttpStatus === 200 || media.uploadHttpStatus === 201))
+  throw new TRPCError({
+    code: "NOT_FOUND",
+    message: `Media upload failed`,
+  });
+```
+
+#### 边界分析
+
+- **去重与状态回写一致**：两处都只判断200，说明是有意的设计选择，而非遗漏
+- **但与读取放行不一致**：读取放行同时接受200和201
+- **实际影响**：S3 PUT成功返回201，这意味着：
+  1. 首次上传成功（201）→ 状态回写时 `uploadHttpError` 不会被清空
+  2. 下次相同文件上传 → 去重短路不通过（因为status=201）→ 重新走上传流程
+  3. 但读取放行会正常通过（因为接受201）
+
+#### 修复建议
+
+统一三处逻辑，同时接受200和201：
+
+```typescript
+// 去重短路
+existingMedia &&
+(existingMedia.uploadHttpStatus === 200 || existingMedia.uploadHttpStatus === 201) &&
+existingMedia.contentType === contentType
+
+// 状态回写
+uploadHttpError: (uploadHttpStatus === 200 || uploadHttpStatus === 201) ? null : uploadHttpError
 ```
 
 ---
 
-### 8.3 问题三：多bucket场景下存储客户端单例与批量签名是否存在隐含前提
+### 8.3 问题三：多 bucket 相关结论是现状缺陷还是设计前提
 
-**结论：❌ 存在严重设计缺陷，多bucket场景下会导致签名URL指向错误的bucket**
+**结论：⚠️ 是当前明确的设计前提，而非意外缺陷；但存在未来扩展风险**
 
-#### 单例模式实现
+#### 代码事实边界
 
-**代码**:
+**事实1：单 bucket 写入**（`web/src/pages/api/public/media/index.ts:110-112, 144, 159`）:
 ```typescript
-// web/src/features/media/server/getMediaStorageClient.ts:7-24
-let s3StorageServiceClient: StorageService;  // ⚠️ 模块级单例
+// 获取上传URL时，bucketName 来自环境变量
+const s3Client = getMediaStorageServiceClient(
+  env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET,
+);
+
+// 写入数据库时，bucket_name 来自环境变量
+INSERT INTO "media" (..., "bucket_name", ...)
+VALUES (..., ${env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET}, ...)
+ON CONFLICT ("project_id", "sha_256_hash")
+DO UPDATE SET
+  "bucket_name" = ${env.LANGFUSE_S3_MEDIA_UPLOAD_BUCKET},
+  ...
+```
+
+**事实2：环境变量仅支持单 bucket 配置**（`web/src/env.mjs:322, 714`）:
+```typescript
+LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: z.string().optional(),
+```
+
+**事实3：数据库表支持多 bucket**（`schema.prisma` media 表含 `bucketName` 字段）
+
+**事实4：存储客户端单例模式**（`web/src/features/media/server/getMediaStorageClient.ts:7-24`）:
+```typescript
+let s3StorageServiceClient: StorageService;  // 模块级单例
 
 export const getMediaStorageServiceClient = (
-  bucketName: string,  // ⚠️ 参数传入，但仅第一次有效
+  bucketName: string,  // 参数存在但仅第一次有效
 ): StorageService => {
   if (!s3StorageServiceClient) {
     s3StorageServiceClient = StorageServiceFactory.getInstance({
-      bucketName,  // ⚠️ 只在第一次调用时使用！
-      accessKeyId: env.LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID,
-      secretAccessKey: env.LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY,
-      endpoint: env.LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT,
-      region: env.LANGFUSE_S3_MEDIA_UPLOAD_REGION,
-      forcePathStyle: env.LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE === "true",
-      awsSse: env.LANGFUSE_S3_MEDIA_UPLOAD_SSE,
-      awsSseKmsKeyId: env.LANGFUSE_S3_MEDIA_UPLOAD_SSE_KMS_KEY_ID,
+      bucketName,  // 仅第一次调用使用
+      // ... 其他配置都来自环境变量，与 bucketName 无关
     });
   }
-  return s3StorageServiceClient;  // ⚠️ 后续调用忽略bucketName参数！
+  return s3StorageServiceClient;
 };
 ```
 
-#### 批量签名场景的问题
-
-**代码**:
+**事实5：批量签名取第一个媒体的 bucket**（`web/src/server/api/routers/media.ts:147-149`）:
 ```typescript
-// web/src/server/api/routers/media.ts:147-169
 const mediaStorageClient = getMediaStorageServiceClient(
-  media[0].bucket_name,  // ⚠️ 只用第一个媒体的bucketName创建客户端
-);
-// ...
-return await Promise.all(
-  media.map<Promise<MediaReturnType>>(async (m) => {
-    const url = await mediaStorageClient.getSignedUrl(  // ⚠️ 所有媒体都用同一个客户端！
-      m.bucket_path,  // ⚠️ 如果m.bucket_name不同，URL会指向错误的bucket
-      ttlSeconds,
-      false,
-    );
-    // ...
-  }),
+  media[0].bucket_name,  // 只用第一个媒体的bucketName
 );
 ```
 
-#### 隐含前提与风险
+#### 设计前提 vs 缺陷的边界判定
 
-**当前隐含前提**:
-1. 所有媒体都存储在同一个 bucket 中（`LANGFUSE_S3_MEDIA_UPLOAD_BUCKET`）
-2. media 表中所有记录的 `bucketName` 字段值相同
+| 维度 | 设计前提（当前现状） | 潜在缺陷（未来风险） |
+|------|---------------------|---------------------|
+| **部署模型** | 单 bucket 部署，所有媒体共享一个存储桶 | 未来支持按项目/区域/租户配置不同 bucket |
+| **凭据配置** | 所有 bucket 使用相同的访问密钥（来自环境变量） | 不同 bucket 需要不同的访问密钥 |
+| **数据一致性** | media 表中所有记录的 `bucketName` 字段值相同 | 数据迁移、多 bucket 并存场景下值不一致 |
+| **单例合理性** | 单例是合理的性能优化，避免重复创建客户端 | 多 bucket 场景下单例模式失效 |
+| **批量签名逻辑** | 所有媒体 bucket 相同，取第一个无问题 | 媒体来自不同 bucket 时生成错误URL |
 
-**风险场景**:
-1. 未来支持按项目配置不同bucket
-2. 数据迁移过程中存在新旧bucket并存
-3. 手动修改了数据库中某些记录的 `bucketName`
+#### 澄清后的结论
 
-**后果**:
-- 签名URL会指向错误的bucket
-- 客户端访问时出现404或权限错误
-- 调试困难，因为代码逻辑看起来是正确的
+1. **不是代码缺陷**：当前代码在单 bucket 部署模型下完全正确，单例模式是合理的性能优化
+2. **是明确的设计前提**：系统设计为单 bucket 部署，所有相关配置都围绕这一前提
+3. **存在扩展风险**：如果未来需要支持多 bucket，需要修改多处代码
+4. **参数名误导**：`getMediaStorageServiceClient(bucketName)` 的参数名具有误导性，因为它实际上并不使用该参数（除第一次调用外）
 
-#### 修复建议
+#### 改进建议（非修复，而是增强健壮性）
 
-**方案一：改为按bucket缓存客户端（推荐）**
+**方案一：增加参数校验，明确设计边界**
 
 ```typescript
-const storageServiceClients: Record<string, StorageService> = {};  // 按bucketName缓存
-
 export const getMediaStorageServiceClient = (
   bucketName: string,
 ): StorageService => {
-  if (!storageServiceClients[bucketName]) {
-    storageServiceClients[bucketName] = StorageServiceFactory.getInstance({
+  if (!s3StorageServiceClient) {
+    s3StorageServiceClient = StorageServiceFactory.getInstance({
       bucketName,
-      // ... 其他配置
+      // ...
     });
   }
-  return storageServiceClients[bucketName];
+  
+  // 新增：校验传入的 bucketName 与客户端配置一致
+  if (s3StorageServiceClient.getBucketName() !== bucketName) {
+    throw new Error(
+      `Bucket mismatch: requested ${bucketName}, but client configured for ${s3StorageServiceClient.getBucketName()}. ` +
+      `Multi-bucket deployment is not currently supported.`
+    );
+  }
+  
+  return s3StorageServiceClient;
 };
 ```
 
-**方案二：批量签名时每个媒体使用正确的客户端**
+**方案二：批量签名时校验所有媒体 bucket 一致**
 
 ```typescript
-return await Promise.all(
-  media.map<Promise<MediaReturnType>>(async (m) => {
-    const client = getMediaStorageServiceClient(m.bucket_name);  // 每个媒体用自己的bucketName
-    const url = await client.getSignedUrl(
-      m.bucket_path,
-      ttlSeconds,
-      false,
-    );
-    // ...
-  }),
-);
+// 校验所有媒体的bucketName相同
+const bucketName = media[0].bucket_name;
+const allSameBucket = media.every(m => m.bucket_name === bucketName);
+if (!allSameBucket) {
+  throw new TRPCError({
+    code: "INTERNAL_SERVER_ERROR",
+    message: "Multi-bucket media retrieval is not supported",
+  });
+}
 ```
 
 ---
 
-### 8.4 问题四：各存储后端上传签名对sha256与内容长度校验是否等价
+### 8.4 问题四：各存储后端上传签名的完整性约束差异
 
-**结论：❌ 严重不等价，仅S3实现了完整的完整性校验**
+**结论：❌ 各后端实现差异显著，但需纠正过度推断，明确实际风险边界**
 
-#### 各后端实现对比
+#### 逐项证据对比表
 
-| 存储后端 | SHA256 校验 | Content-Length 校验 | 实现强度 |
-|---------|------------|--------------------|---------|
-| **AWS S3** | ✅ 强制签名校验<br>`ChecksumSHA256` + `unhoistableHeaders` | ✅ 强制签名校验<br>`ContentLength` + `signableHeaders` | 🔒🔒🔒🔒🔒 完整 |
-| **Azure Blob** | ❌ 完全忽略参数 | ❌ 完全忽略参数 | 🔒 无 |
-| **Google Cloud Storage** | ❌ 完全忽略参数 | ✅ 扩展头校验<br>`extensionHeaders["Content-Length"]` | 🔒🔒 部分 |
-| **OCI Object Storage** | ❌ 完全忽略参数 | ❌ 完全忽略参数 | 🔒 无 |
+| 存储后端 | SHA256 校验 | Content-Length 校验 | Content-Type 校验 | 代码证据行 |
+|---------|------------|--------------------|-------------------|-----------|
+| **AWS S3** | ✅ 强制签名校验<br>`ChecksumSHA256` + `unhoistableHeaders` | ✅ 强制签名校验<br>`ContentLength` + `signableHeaders` | ✅ 强制签名校验<br>`ContentType` | `StorageService.ts:766-792` |
+| **Azure Blob** | ❌ 参数解构但未使用 | ❌ 参数解构但未使用 | ✅ 包含在 SAS 签名<br>`contentType: contentType` | `StorageService.ts:441-475` |
+| **Google Cloud Storage** | ❌ 未解构该参数 | ✅ 扩展头签名校验<br>`extensionHeaders["Content-Length"]` | ✅ 包含在签名<br>`contentType` | `StorageService.ts:981-1015` |
+| **OCI Object Storage** | ❌ 参数解构但未使用 | ❌ 参数解构但未使用 | ❌ 未解构该参数 | `StorageService.ts:1474-1518` |
 
-#### 详细代码分析
+#### 各后端实现的精准证据
 
-**S3 实现**（唯一完整实现）:
+**S3 实现**（最完整）:
 ```typescript
-// packages/shared/src/server/services/StorageService.ts:766-792
-public async getSignedUploadUrl(params: {
-  path: string;
-  ttlSeconds: number;
-  sha256Hash: string;
-  contentType: string;
-  contentLength: number;
-}): Promise<string> {
-  const { path, ttlSeconds, contentType, contentLength, sha256Hash } = params;
+// 第773行：完整解构所有参数
+const { path, ttlSeconds, contentType, contentLength, sha256Hash } = params;
 
-  return getSignedUrl(
-    this.signedUrlClient,
-    new PutObjectCommand(
-      this.addSSEToParams({
-        Bucket: this.bucketName,
-        Key: path,
-        ContentType: contentType,
-        ChecksumSHA256: sha256Hash,    // ✅ 包含在签名中
-        ContentLength: contentLength,  // ✅ 包含在签名中
-      }),
-    ),
-    {
-      expiresIn: ttlSeconds,
-      signableHeaders: new Set(["content-type", "content-length"]),  // ✅ 强制签名头
-      unhoistableHeaders: new Set(["x-amz-checksum-sha256"]),  // ✅ 防止篡改
-    },
-  );
+// 第782-783行：全部包含在PutObjectCommand中
+ChecksumSHA256: sha256Hash,
+ContentLength: contentLength,
+
+// 第788-789行：强制签名头，防止篡改
+signableHeaders: new Set(["content-type", "content-length"]),
+unhoistableHeaders: new Set(["x-amz-checksum-sha256"]),
+```
+
+**Azure Blob 实现**:
+```typescript
+// 第448行：只解构了3个参数，sha256Hash和contentLength被解构但未使用
+const { path, ttlSeconds, contentType } = params;
+
+// 第456行：仅contentType包含在SAS签名中
+contentType: contentType,
+// sha256Hash 和 contentLength 未被使用
+```
+
+**GCS 实现**:
+```typescript
+// 第988行：只解构了3个参数，sha256Hash未被解构
+const { path, ttlSeconds, contentType } = params;
+
+// 第999行：contentLength通过extensionHeaders包含在签名中
+extensionHeaders: {
+  "Content-Length": params.contentLength.toString(),
+},
+// sha256Hash 未被使用
+```
+
+**OCI 实现**:
+```typescript
+// 第1481行：只解构了2个参数，sha256Hash、contentLength、contentType都未使用
+const { path, ttlSeconds } = params;
+
+// PAR（Pre-Authenticated Request）仅控制访问权限和过期时间，不校验任何内容属性
+```
+
+#### 纠正过度推断
+
+| 之前的推断 | 纠正后的准确描述 | 边界条件 |
+|-----------|-----------------|---------|
+| "攻击者获取签名URL后可以上传任意内容" | "非S3后端无法在存储层强制校验文件内容与签名时声明的一致" | 攻击者必须先通过API认证获取签名URL，这本身有访问控制 |
+| "SHA256去重机制失效" | "非S3后端无法保证客户端声明的SHA256与实际文件内容一致" | mediaId基于客户端提供的SHA256生成，如果客户端诚实，去重仍然有效 |
+| "可以上传更大的文件" | "Azure和OCI后端无法在存储层强制校验Content-Length" | 应用层在获取上传URL时已经校验了`contentLength < MAX_CONTENT_LENGTH` |
+
+#### 真实风险边界
+
+1. **已有的防护（所有后端）**:
+   - URL有过期时间（默认1小时）
+   - 获取签名URL需要API认证
+   - 应用层在签发URL前校验 `contentLength < MAX_CONTENT_LENGTH`
+   - mediaId基于客户端提供的SHA256生成（防止同一个文件被分配不同ID）
+
+2. **缺失的防护（非S3后端）**:
+   - 无法在存储层校验客户端上传的文件大小是否等于声明的 `contentLength`
+   - 无法在存储层校验客户端上传的文件内容哈希是否等于声明的 `sha256Hash`
+
+3. **实际可行的攻击场景**:
+   - 客户端A请求上传URL，声明SHA256=X，Size=1MB
+   - 获得签名URL后，客户端A实际上传不同内容的文件（Size可能不同）
+   - 文件成功写入存储（非S3后端不校验）
+   - media表记录SHA256=X，Size=1MB，但实际文件不同
+   - 下次客户端B上传相同内容（真实SHA256=X）时，去重命中，但访问的是客户端A上传的恶意文件
+   - ⚠️ **这是真实的缓存污染风险**
+
+#### 修复建议优先级
+
+**高优先级：应用层完整性校验（通用方案）**
+
+在PATCH回调时，对非S3后端增加校验：
+```typescript
+// PATCH回调时增加校验逻辑（仅对非S3后端）
+if (storageType !== "s3") {
+  const s3Client = getMediaStorageServiceClient(media.bucketName);
+  const fileStat = await s3Client.stat(media.bucketPath); // 获取文件元数据
+  
+  // 校验文件大小
+  if (fileStat.size !== Number(media.contentLength)) {
+    await s3Client.deleteFiles([media.bucketPath]);
+    throw new Error("Content-Length mismatch");
+  }
+  
+  // 对于关键场景，可下载文件校验SHA256（但影响性能）
+  // const fileContent = await s3Client.download(media.bucketPath);
+  // const actualHash = crypto.createHash('sha256').update(fileContent).digest('base64');
 }
 ```
 
-**Azure Blob 实现**（完全忽略）:
-```typescript
-// packages/shared/src/server/services/StorageService.ts:441-475
-public async getSignedUploadUrl(params: {
-  path: string;
-  ttlSeconds: number;
-  sha256Hash: string;        // ❌ 解构但未使用
-  contentType: string;
-  contentLength: number;     // ❌ 解构但未使用
-}): Promise<string> {
-  const { path, ttlSeconds, contentType } = params;  // ⚠️ 只解构了三个参数
-  // ...
-  let url = await blockBlobClient.generateSasUrl({
-    permissions: BlobSASPermissions.parse("w"),
-    expiresOn: new Date(Date.now() + ttlSeconds * 1000),
-    contentType: contentType,  // ✅ 只校验contentType
-    // ❌ 缺少sha256Hash校验
-    // ❌ 缺少contentLength校验
-  });
-  // ...
-}
-```
-
-**GCS 实现**（只校验Content-Length）:
-```typescript
-// packages/shared/src/server/services/StorageService.ts:981-1015
-public async getSignedUploadUrl(params: {
-  path: string;
-  ttlSeconds: number;
-  sha256Hash: string;        // ❌ 解构但未使用
-  contentType: string;
-  contentLength: number;
-}): Promise<string> {
-  const { path, ttlSeconds, contentType } = params;  // ⚠️ 未解构sha256Hash
-
-  const options: GetSignedUrlConfig = {
-    version: "v4",
-    action: "write",
-    expires: Date.now() + ttlSeconds * 1000,
-    contentType,
-    extensionHeaders: {
-      "Content-Length": params.contentLength.toString(),  // ✅ 包含在签名中
-    },
-    // ❌ 缺少sha256Hash校验
-  };
-  // ...
-}
-```
-
-**OCI 实现**（完全忽略）:
-```typescript
-// packages/shared/src/server/services/StorageService.ts:1474-1518
-public async getSignedUploadUrl(params: {
-  path: string;
-  ttlSeconds: number;
-  sha256Hash: string;        // ❌ 解构但未使用
-  contentType: string;       // ❌ 解构但未使用
-  contentLength: number;     // ❌ 解构但未使用
-}): Promise<string> {
-  const { path, ttlSeconds } = params;  // ⚠️ 只解构了两个参数
-  // PAR只控制访问权限，不校验任何内容属性
-  // ...
-}
-```
-
-#### 安全风险
-
-| 风险 | S3 | Azure | GCS | OCI |
-|------|----|-------|-----|-----|
-| 上传不同内容的文件 | ❌ 被阻止 | ✅ 可能 | ✅ 可能 | ✅ 可能 |
-| 上传不同大小的文件 | ❌ 被阻止 | ✅ 可能 | ❌ 被阻止 | ✅ 可能 |
-| 上传不同类型的文件 | ❌ 被阻止 | ❌ 被阻止 | ❌ 被阻止 | ❌ 被阻止 |
-
-**攻击场景**:
-- 攻击者获取签名URL后，可以上传任意内容（非S3后端）
-- 可以替换为恶意文件、更大的文件等
-- SHA256去重机制失效（因为实际文件内容不同）
-
-#### 修复建议
-
-**方案一：在应用层增加校验（通用方案）**
-
-在客户端上传完成后，后端验证文件完整性：
-```typescript
-// PATCH回调时增加校验逻辑
-const s3Client = getMediaStorageServiceClient(media.bucketName);
-const fileContent = await s3Client.download(media.bucketPath);
-const actualHash = crypto.createHash('sha256').update(fileContent).digest('base64');
-if (actualHash !== media.sha256Hash) {
-  // 校验失败，删除文件并标记错误
-  await s3Client.deleteFiles([media.bucketPath]);
-  throw new Error("File integrity check failed");
-}
-```
-
-**方案二：各存储后端原生支持（需要分别实现）**
-
-- Azure Blob: 使用 `content-md5` 或 `x-ms-blob-content-md5` 头
-- GCS: 研究是否支持 `x-goog-hash` 头的签名校验
-- OCI: 研究 PAR 是否支持内容校验
+**低优先级：各存储后端原生支持研究**
+- Azure Blob: 可研究 `x-ms-blob-content-md5` 头的签名支持
+- GCS: 可研究 `x-goog-hash` 头的签名支持
+- OCI: PAR机制本身不支持内容校验，无解
 
 ---
 
@@ -899,16 +943,27 @@ throw new InternalServerError(
 
 1. **权限隔离**: 所有操作通过 `projectId` 边界校验，防止跨项目访问
 2. **签名过期**: URL 有效期严格限制（默认3600秒），降低泄露风险
-3. **完整性校验（S3）**: 上传时强制校验 SHA256 哈希和 Content-Length
+3. **完整性校验（S3）**: 上传时强制校验 SHA256 哈希和 Content-Length（存储层）
 4. **去重机制**: 基于 SHA256 哈希实现文件去重，节省存储空间
-5. **状态机**: `uploadHttpStatus` 确保只有上传成功的媒体才能被访问
+5. **状态机（单条查询）**: `getById` 和 GET API 中 `uploadHttpStatus` 确保只有上传成功的媒体才能被访问
 6. **幂等性**: 高并发场景下使用原生 SQL + 重试机制保证数据一致性
 7. **审计日志**: 所有上传操作记录指标，支持监控和审计
+8. **应用层大小限制**: 获取上传URL时校验 `contentLength < MAX_CONTENT_LENGTH`
 
-### 9.2 待修复的安全缺陷
+### 9.2 已核实的安全缺陷（按优先级）
 
-1. **前端URL过期风险**（见8.1）- 需添加自动续签机制
-2. **200/201状态不一致**（见8.2）- 需统一处理口径
-3. **多bucket单例缺陷**（见8.3）- 需改为按bucket缓存客户端
-4. **非S3后端完整性校验缺失**（见8.4）- 需增加应用层校验
-5. **错误信息拼接bug**（见8.5）- 需修复运算符优先级问题
+| 优先级 | 问题 | 影响 | 所在章节 |
+|--------|------|------|---------|
+| 🔴 高 | 批量查询未过滤未成功上传的媒体 | 未上传/上传失败的媒体也能获得签名URL，存在缓存污染风险 | 8.1 |
+| 🔴 高 | 非S3后端存储层完整性校验缺失 | 客户端可上传与声明的SHA256/Size不符的文件，存在缓存污染攻击 | 8.4 |
+| 🟡 中 | 200/201状态处理不一致 | S3 PUT成功返回201时去重失效，重复上传浪费资源 | 8.2 |
+| 🟡 中 | 前端URL过期无自动续签 | 用户长时间停留页面时URL过期，导致403错误 | 5.2 |
+| 🟡 中 | PATCH异常分支错误信息拼接bug | 错误信息丢失上下文前缀，调试困难 | 8.5 |
+| 🟢 低 | 多bucket参数名误导 | 当前单bucket设计下无影响，未来扩展需注意 | 8.3 |
+
+### 9.3 设计边界澄清
+
+1. **单 bucket 部署**: 当前系统明确设计为单 bucket 部署，所有媒体共享一个存储桶。多 bucket 支持不在当前设计范围内。
+2. **S3 为一等公民**: 完整性校验在 S3 后端得到完整实现，其他后端为兼容实现，安全级别不同。
+3. **状态机部分生效**: 状态机校验仅在单条查询（`getById`、GET API）中生效，批量查询（`getByTraceOrObservationId`）未实现。
+4. **客户端信任模型**: SHA256 哈希由客户端计算并提供，非 S3 后端无法在存储层验证其真实性。
