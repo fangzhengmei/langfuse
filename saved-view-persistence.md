@@ -1110,7 +1110,363 @@ useEffect(() => {
 
 ---
 
-## 九、关键文件索引
+## 十、最小复现场景分析
+
+### 场景1：浏览器前进后退操作的状态切换
+
+**前置条件**：
+- 项目ID：`proj_123`
+- 存在视图A（ID: `view_aaa`，名称: "生产环境错误"）和视图B（ID: `view_bbb`，名称: "测试环境全部"）
+- 默认视图：无
+
+---
+
+**步骤1：进入 Traces 页面，选择视图A**
+
+| 状态项 | 值 |
+|--------|----|
+| URL | `/project/proj_123/traces?viewId=view_aaa` |
+| Session Storage `traces-proj_123-viewId` | `"view_aaa"` |
+| Session Storage `traces-filter-query-global` | `"env:production;level:ERROR"`（视图A的筛选编码） |
+| `default_views` 表 | 无相关记录 |
+| `isInitialized` | `true` |
+| `selectedViewId` | `"view_aaa"` |
+
+**触发代码**：
+```typescript
+// data-table-view-presets-drawer.tsx:252-260
+const handleSelectView = (view) => {
+  capture("saved_views:view_selected", { tableName, viewId: view.id });
+  handleSetViewId(view.id);      // 同时写入 URL 和 Session Storage
+  applyViewState(view);          // 应用视图的筛选、列配置等
+};
+
+// useTableViewManager.ts:100-114
+const handleSetViewId = useCallback((viewId) => {
+  setStoredViewId(viewId);       // 写入 Session Storage
+  setSelectedViewId(viewId);     // 写入 URL 参数
+}, [setStoredViewId, setSelectedViewId]);
+```
+
+---
+
+**步骤2：点击导航栏进入 Sessions 页面**
+
+| 状态项 | 值 |
+|--------|----|
+| URL | `/project/proj_123/sessions` |
+| Session Storage `traces-proj_123-viewId` | `"view_aaa"`（保留不变） |
+| Session Storage `sessions-proj_123-viewId` | `null`（初始化默认值） |
+| Session Storage `traces-filter-query-global` | `"env:production;level:ERROR"`（保留不变） |
+| `default_views` 表 | 无相关记录 |
+| `isInitialized` (Sessions页) | `true`（无视图可加载） |
+| `selectedViewId` (Sessions页) | `null` |
+
+**关键机制**：
+- 不同表格的 Session Storage 键相互独立，不互相干扰
+- Traces 页的 `isInitialized` 随组件卸载而销毁，Sessions 页重新初始化
+
+---
+
+**步骤3：点击浏览器后退按钮返回 Traces 页**
+
+组件卸载后重新挂载，`isInitialized` 重置为 `false`，触发完整初始化流程。
+
+| 状态项 | 值 |
+|--------|----|
+| URL（初始） | `/project/proj_123/traces?viewId=view_aaa`（浏览器历史恢复） |
+| URL（最终） | `/project/proj_123/traces?viewId=view_aaa&filter=env%3Aproduction%3Blevel%3AERROR` |
+| Session Storage `traces-proj_123-viewId` | `"view_aaa"` |
+| Session Storage `traces-filter-query-global` | `"env:production;level:ERROR"` |
+| `isInitialized` 变化 | `false` → `true` |
+| `selectedViewId` | `"view_aaa"` |
+
+**触发代码**：
+```typescript
+// useTableViewManager.ts:142-201
+useEffect(() => {
+  if (isInitialized) return;
+  if (!isRouterReady) return;
+
+  // 优先级1：URL 中有 viewId=view_aaa，且非系统预设
+  if (selectedViewId && !isSystemPresetId(selectedViewId)) {
+    return;  // 不做操作，让 getById 查询加载
+  }
+  // ...
+}, [isInitialized, isRouterReady, selectedViewId, ...]);
+
+// useTableViewManager.ts:303-319
+const { data: selectedViewData } = api.TableViewPresets.getById.useQuery(
+  { viewId: selectedViewId, projectId },
+  {
+    enabled: !isInitialized && !!selectedViewId,  // 仅未初始化时查询
+  }
+);
+
+// 查询成功后应用状态
+useEffect(() => {
+  if (!isSelectedViewSuccess) return;
+  applyViewState(selectedViewData);  // 调用 setFiltersWrapper
+  setStoredViewId(requestedViewId);
+  setIsInitialized(true);
+}, [isSelectedViewSuccess, selectedViewData]);
+```
+
+**时序细节**：
+1. 浏览器恢复历史记录 → URL 变为 `?viewId=view_aaa`
+2. `useQueryParam` 检测到 URL 变化 → `selectedViewId` 变为 `"view_aaa"`
+3. `getById` query 启用（因为 `!isInitialized && !!selectedViewId`）
+4. 查询返回视图A数据 → 调用 `applyViewState` → 调用 `setFiltersWrapper`
+5. `setFiltersWrapper` 调用 `queryFilter.setFilterState` → 更新 `filter` URL 参数
+6. `isInitialized` 设为 `true`，锁定状态
+
+---
+
+### 场景2：视图被删除后的回退流程
+
+**前置条件**：
+- 项目ID：`proj_123`
+- 用户A：正在使用视图V（ID: `view_vvv`，名称: "慢查询分析"）
+- 用户B：有 CUD 权限，可以删除视图
+- 默认视图：用户A已将视图V设为个人默认
+- `default_views` 表记录：`{ id: "def_123", projectId: "proj_123", userId: "user_a", viewName: "traces", viewId: "view_vvv" }`
+
+---
+
+**步骤1：用户A在 Traces 页正常使用视图V**
+
+| 状态项 | 值 |
+|--------|----|
+| URL | `/project/proj_123/traces?viewId=view_vvv&filter=duration%3E5000` |
+| Session Storage `traces-proj_123-viewId` | `"view_vvv"` |
+| `default_views` 表 | `{ userId: "user_a", viewName: "traces", viewId: "view_vvv" }` |
+| `isInitialized` | `true` |
+| `selectedViewId` | `"view_vvv"` |
+
+---
+
+**步骤2：用户B删除视图V**
+
+**触发代码（用户B端）**：
+```typescript
+// tableViewPresets.ts:99-133
+delete: protectedProjectProcedure
+  .input(...)
+  .mutation(async ({ input, ctx }) => {
+    // 使用事务确保原子性
+    await ctx.prisma.$transaction(async (tx) => {
+      // 步骤1：删除视图（作为存在性检查）
+      await tx.tableViewPreset.delete({
+        where: { id: input.tableViewPresetsId, projectId: input.projectId },
+      });
+      // 步骤2：清理所有引用该视图的默认视图
+      await tx.defaultView.deleteMany({
+        where: { viewId: input.tableViewPresetsId },  // 同时删除 user_a 的默认视图
+      });
+    });
+    return { success: true };
+  });
+```
+
+**数据库变化**：
+| 表 | 变化 |
+|----|------|
+| `table_view_presets` | `id=view_vvv` 的记录被删除 |
+| `default_views` | `viewId=view_vvv` 的所有记录被删除（包括 user_a 的个人默认） |
+
+---
+
+**步骤3：用户A刷新页面**
+
+组件重新挂载，`isInitialized` 重置为 `false`，触发初始化流程。
+
+| 状态项 | 值（过程） |
+|--------|-----------|
+| URL（初始） | `/project/proj_123/traces?viewId=view_vvv&filter=duration%3E5000` |
+| Session Storage `traces-proj_123-viewId` | `"view_vvv"`（仍然存在，未被通知失效） |
+| `default_views` 表 | 无相关记录（已被删除） |
+
+**初始化流程执行**：
+
+```typescript
+// useTableViewManager.ts:142-201
+useEffect(() => {
+  // 优先级1：URL 中有 viewId=view_vvv
+  if (selectedViewId && !isSystemPresetId(selectedViewId)) {
+    return;  // 让 getById 查询去加载
+  }
+  // ...
+}, [...]);
+
+// getById 查询失败
+const { error: selectedViewError, isError: isSelectedViewError } =
+  api.TableViewPresets.getById.useQuery(...);
+
+// 错误处理分支
+useEffect(() => {
+  if (!isSelectedViewError || !selectedViewError) return;
+
+  // 关键：终止初始化，清除无效 viewId
+  isInitializedRef.current = true;
+  setIsInitialized(true);
+  setIsLoading(false);
+  handleSetViewId(null);  // 同时清除 URL 和 Session Storage 中的 viewId
+  showErrorToast("Error applying view", selectedViewError.message, "WARNING");
+}, [...]);
+```
+
+| 状态项 | 值（最终） |
+|--------|-----------|
+| URL | `/project/proj_123/traces?filter=duration%3E5000`（viewId 被清除，filter 保留） |
+| Session Storage `traces-proj_123-viewId` | `null`（被 `handleSetViewId(null)` 清除） |
+| Session Storage `traces-filter-query-global` | `"duration>5000"`（保留未被清除） |
+| `default_views` 表 | 无相关记录 |
+| `isInitialized` | `true` |
+| `selectedViewId` | `null` |
+| 筛选状态 | 仍然使用 URL 中的 `filter=duration>5000`（因为已初始化，视图系统不再干预） |
+
+**关键发现**：
+1. 视图删除后，Session Storage 中的 `viewId` 不会自动清除，直到下次初始化
+2. 初始化时发现视图不存在，会主动清除 URL 和 Session Storage 中的无效 `viewId`
+3. 但已有的 `filter` 参数会保留，侧边栏筛选系统继续使用
+4. `default_views` 记录在删除视图时被事务性清理，下次加载时不会再返回该默认视图
+
+---
+
+### 场景3：手动切换视图与浏览器后退的交互
+
+**前置条件**：
+- 项目ID：`proj_123`
+- 存在视图X（ID: `view_xxx`，筛选: `env:production`）
+- 无默认视图
+
+---
+
+**步骤1：通过永久链接访问视图X**
+
+| 状态项 | 值 |
+|--------|----|
+| URL | `/project/proj_123/traces?viewId=view_xxx` |
+| Session Storage `traces-proj_123-viewId` | `"view_xxx"` |
+| Session Storage `traces-filter-query-global` | `"env:production"` |
+| `isInitialized` | `true` |
+| `selectedViewId` | `"view_xxx"` |
+| 浏览器历史栈 | `[... 其他页, Traces(?viewId=view_xxx)]` |
+
+---
+
+**步骤2：用户手动切换到"My view (default)"**
+
+点击视图抽屉中的"My view (default)"选项。
+
+**触发代码**：
+```typescript
+// data-table-view-presets-drawer.tsx:437-444
+<CommandItem
+  onSelect={() => handleSetViewId(null)}  // 关键：传入 null
+  className={selectedViewId === null && "bg-muted"}
+>
+  <span className="text-muted-foreground text-sm">My view (default)</span>
+</CommandItem>
+
+// useTableViewManager.ts:100-114
+const handleSetViewId = useCallback((viewId) => {
+  setStoredViewId(viewId);       // Session Storage 设为 null
+  setSelectedViewId(viewId);     // URL 中的 viewId 被清除
+
+  // 关键逻辑：显式选择 null 时立即终止初始化
+  if (viewId === null && !isInitializedRef.current) {
+    isInitializedRef.current = true;
+    setIsInitialized(true);
+    setIsLoading(false);
+  }
+}, [setStoredViewId, setSelectedViewId]);
+```
+
+| 状态项 | 值 |
+|--------|----|
+| URL | `/project/proj_123/traces`（viewId 参数被移除） |
+| Session Storage `traces-proj_123-viewId` | `null` |
+| Session Storage `traces-filter-query-global` | `"env:production"`（保留，但视图系统不再管理） |
+| `isInitialized` | `true` |
+| `selectedViewId` | `null` |
+| 浏览器历史栈 | `[... 其他页, Traces(?viewId=view_xxx), Traces]` |
+| 筛选显示 | 仍然显示 `env:production`（侧边栏系统独立维护） |
+
+---
+
+**步骤3：点击浏览器后退按钮**
+
+浏览器历史恢复到 `?viewId=view_xxx`。
+
+**关键机制**：
+- `QueryParamProvider` 使用 `NextAdapterPages` 监听路由变化
+- 浏览器后退触发 `popstate` 事件 → Next.js 路由更新 → `useQueryParam` 检测到 `viewId` 变化
+- 但此时 `isInitialized` 已经是 `true`，`useTableViewManager` 的初始化 effect 会永久跳过！
+
+```typescript
+// useTableViewManager.ts:142-201
+useEffect(() => {
+  if (isInitialized) return;  // isInitialized 为 true，直接返回！
+  if (!isRouterReady) return;
+  // ... 所有优先级逻辑都不会执行
+}, [isInitialized, isRouterReady, selectedViewId, ...]);
+
+// getById 查询也会被禁用
+const { data: selectedViewData } = api.TableViewPresets.getById.useQuery(
+  { viewId: selectedViewId, projectId },
+  {
+    enabled: !isInitialized && !!selectedViewId,  // !true = false，查询不执行
+  }
+);
+```
+
+| 状态项 | 值（意外结果） |
+|--------|---------------|
+| URL | `/project/proj_123/traces?viewId=view_xxx` |
+| Session Storage `traces-proj_123-viewId` | `null`（没有被同步更新） |
+| `isInitialized` | `true` |
+| `selectedViewId` | `"view_xxx"`（URL 同步了，但视图数据未加载） |
+| 筛选显示 | 仍然显示 `env:production`（没有应用视图X的完整配置） |
+| UI 状态 | 视图按钮显示 "Views" 而非 "View: 视图X"（因为 `selectedViewId` 与实际显示不匹配） |
+
+**这是一个潜在的状态不一致场景**：
+- URL 有 `viewId=view_xxx`，但视图数据没有被加载和应用
+- Session Storage 和 URL 不同步
+- 筛选状态可能与视图定义不一致
+
+---
+
+**步骤4：刷新页面**
+
+刷新导致组件重新挂载，`isInitialized` 重置为 `false`，触发完整初始化流程。
+
+| 状态项 | 值（恢复正常） |
+|--------|---------------|
+| URL | `/project/proj_123/traces?viewId=view_xxx` |
+| Session Storage `traces-proj_123-viewId` | `"view_xxx"`（初始化时同步） |
+| `isInitialized` | `true` |
+| `selectedViewId` | `"view_xxx"` |
+| 筛选显示 | 正确显示视图X的配置 |
+
+---
+
+### 场景总结
+
+| 场景 | 核心机制 | 关键点 |
+|------|---------|--------|
+| 前进后退 | `isInitialized` 是组件级状态，卸载后重置；URL 由浏览器历史管理 | 组件重挂载 → `isInitialized=false` → 重新触发完整初始化流程 |
+| 视图删除回退 | 事务性删除视图和默认视图引用；初始化时检测失效并清理 | Session Storage 不会实时同步删除，需等待下次加载检测 |
+| 手动切换+后退 | `isInitialized=true` 后永久跳过初始化；URL 变化但不触发重新加载 | 可能出现 URL `viewId` 与实际状态不一致，需刷新恢复 |
+
+**代码设计权衡**：
+- `isInitialized` 一次性锁设计避免了重复加载和状态抖动
+- 但也导致浏览器后退时无法自动恢复视图状态
+- 这是有意的设计选择：优先保证初始化后状态的稳定性，避免 URL 意外变化导致视图跳变
+
+---
+
+## 十一、关键文件索引
 
 | 文件路径 | 说明 |
 |---------|------|
