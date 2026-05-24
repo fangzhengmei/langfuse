@@ -595,10 +595,10 @@ const { data: subscriptionInfo } = api.cloudBilling.getSubscriptionInfo.useQuery
 | OTel 异步上传 | 统计到接收时间 | 统计到埋点时间 | 客户端缓存延迟 |
 | 重试事件 | 统计到最后一次成功时间 | 统计到原始事件时间 | 网络重试 |
 
-⚠️ **待验证假设**：5月31日产生的事件6月1日才上报
-- Stripe 对账（created_at）：计入 6 月账单
-- 免费额度（start_time）：计入 5 月额度
-- **逻辑推断正确，但无实际数据或测试用例证实**
+⚠️ **待验证假设**：跨周期上报事件会导致对账差异
+- **假设原因**：无实际数据或测试用例证实
+- **推断逻辑**：5月31日产生的事件6月1日才上报：Stripe 对账（`created_at`）计入6月，免费额度（`start_time`/`timestamp`）计入5月，两套口径归属不同计费周期
+- **验证方法**：构造 5月31日事件6月1日上报的测试用例，对比两套口径的统计结果
 
 ### 7.3 时间轴协同
 
@@ -616,9 +616,10 @@ UI 查询 → tRPC getUsage → Stripe Invoice Preview → 用量展示（付费
 事件产生 → ClickHouse 写入 → 天级聚合（+35min, start_time）→ org.cloudCurrentCycleUsage → UI 展示（免费）
 ```
 
-✅ **已证实**：Stripe meter 聚合周期约 60 分钟
-- 代码注释中无直接证据，但 Stripe 官方文档表明 meter 事件聚合需要时间
-- ⚠️ **注**：60分钟为 Stripe 平台特性，非本代码库可证实内容
+⚠️ **待验证假设**：Stripe meter 聚合存在延迟
+- **假设原因**：代码库中无任何关于 Stripe meter 聚合周期的注释或常量定义
+- **推断逻辑**：`getUsage` 方法通过 `invoice.preview` 实时计算用量（`stripeBillingService.ts:212-218`），不依赖 Stripe 后台聚合
+- **验证方法**：查阅 Stripe 官方文档或实测 meter 事件上报到 invoice preview 可见的延迟
 
 ### 7.4 指标口径对齐
 
@@ -642,43 +643,43 @@ UI 查询 → tRPC getUsage → Stripe Invoice Preview → 用量展示（付费
 
 ### ✅ 已证实事实（27项，均有直接代码依据）
 
-| 类别 | 事实 | 代码依据 |
-|------|------|----------|
-| **阈值常量** | 免费额度 = 50,000 events | `constants.ts:9` |
-| **阈值常量** | 告警线 = [50k, 100k, 200k] | `constants.ts:16-19` |
-| **阈值常量** | 封禁线 = 250,000 events（5倍免费额度） | `constants.ts:26` |
-| **阈值常量** | 4x 缓冲设计注释 | `traces.ts:1617-1619` 等3处 |
-| **状态机** | NORMAL: usage < 50k (state=null) | `thresholdProcessing.ts:361` |
-| **状态机** | WARNING: 50k ≤ usage < 250k | `thresholdProcessing.ts:357-359` |
-| **状态机** | BLOCKED: usage ≥ 250k | `thresholdProcessing.ts:355-356` |
-| **状态机** | 仅在状态转换时发送邮件（幂等） | `thresholdProcessing.ts:369` |
-| **状态机** | 付费组织跳过阈值检查 | `thresholdProcessing.ts:304` |
-| **状态机** | 功能开关可禁用强制执行 | `thresholdProcessing.ts:330-331` |
-| **拦截链路** | 5个采集入口检查 isIngestionSuspended | `ingestion.ts:88-94` 等5处 |
-| **拦截链路** | 缓存命中时从 API Key 读取 isIngestionSuspended | `apiAuth.ts:199` |
-| **拦截链路** | 缓存未命中时从组织状态派生 | `apiAuth.ts:489` |
-| **拦截链路** | BLOCK 状态变化时触发缓存失效 | `bulkUpdates.ts:84-102` |
-| **拦截链路** | isIngestionSuspended 是缓存字段 | `types.ts:19,70` |
-| **双时间口径** | traces 表有 timestamp 和 created_at | `traces.ts:1633-1636` |
-| **双时间口径** | observations 表有 start_time 和 created_at | `observations.ts:2027-2030` |
-| **双时间口径** | scores 表有 timestamp 和 created_at | `scores.ts:2295-2298` |
-| **双时间口径** | Stripe 对账使用 created_at | `observations.ts:1715-1716` |
-| **双时间口径** | 免费额度使用 start_time/timestamp | `observations.ts:2027-2030` |
-| **调度** | Stripe 对账每小时第5分钟执行 | `cloudUsageMeteringQueue.ts:60` |
-| **调度** | 免费额度每小时第35分钟执行 | `cloudFreeTierUsageThresholdQueue.ts:65` |
-| **调度** | 免费额度在 Stripe 对账后30分钟执行 | 两个 cron 表达式对比 |
-| **对账** | 付费用户优先从 Stripe 获取用量 | `stripeBillingService.ts:1778-1909` |
-| **对账** | 免费用户从组织缓存获取用量 | `stripeBillingService.ts:1778-1909` |
-| **对账** | Stripe 失败时降级到缓存 | `stripeBillingService.ts:1778-1909` |
-| **UI** | 免费进度条使用 MAX_EVENTS_FREE_PLAN | `BillingUsageChart.tsx:28` |
+| 类别 | 事实 | 精确代码依据 |
+|------|------|-------------|
+| **阈值常量** | 免费额度 = 50,000 events | `worker/src/ee/usageThresholds/constants.ts:9` |
+| **阈值常量** | 告警线 = [50k, 100k, 200k] | `worker/src/ee/usageThresholds/constants.ts:16-19` |
+| **阈值常量** | 封禁线 = 250,000 events（5倍免费额度） | `worker/src/ee/usageThresholds/constants.ts:26` |
+| **阈值常量** | 4x 缓冲设计注释（FINAL 跳过重计风险） | `packages/shared/src/server/repositories/traces.ts:1617-1619`、`observations.ts:2012-2014`、`scores.ts:2279-2281` |
+| **状态机** | NORMAL: usage < 50k (state=null) | `worker/src/ee/usageThresholds/thresholdProcessing.ts:361` |
+| **状态机** | WARNING: 50k ≤ usage < 250k | `worker/src/ee/usageThresholds/thresholdProcessing.ts:357-359` |
+| **状态机** | BLOCKED: usage ≥ 250k | `worker/src/ee/usageThresholds/thresholdProcessing.ts:355-356` |
+| **状态机** | 仅在状态转换时发送邮件（幂等设计） | `worker/src/ee/usageThresholds/thresholdProcessing.ts:369` |
+| **状态机** | 付费组织跳过阈值检查 | `worker/src/ee/usageThresholds/thresholdProcessing.ts:304` |
+| **状态机** | 功能开关可禁用强制执行 | `worker/src/ee/usageThresholds/thresholdProcessing.ts:330-331` |
+| **拦截链路** | 5个采集入口检查 isIngestionSuspended | `web/src/pages/api/public/ingestion.ts:88-94`、`scores/index.ts:27`、`otel/v1/traces/index.ts:40`、`media/index.ts:30`、`mcp/index.ts:100` |
+| **拦截链路** | 缓存命中时从 API Key 读取 isIngestionSuspended | `web/src/features/public-api/server/apiAuth.ts:199` |
+| **拦截链路** | 缓存未命中时从组织状态派生 | `web/src/features/public-api/server/apiAuth.ts:489` |
+| **拦截链路** | BLOCK 状态变化时触发缓存失效 | `worker/src/ee/usageThresholds/bulkUpdates.ts:84-102` |
+| **拦截链路** | isIngestionSuspended 是缓存字段 | `packages/shared/src/server/auth/types.ts:19,70` |
+| **双时间口径** | traces 表有 timestamp 和 created_at | `packages/shared/src/server/repositories/traces.ts:1633-1636` |
+| **双时间口径** | observations 表有 start_time 和 created_at | `packages/shared/src/server/repositories/observations.ts:2027-2030` |
+| **双时间口径** | scores 表有 timestamp 和 created_at | `packages/shared/src/server/repositories/scores.ts:2295-2298` |
+| **双时间口径** | Stripe 对账使用 created_at | `packages/shared/src/server/repositories/observations.ts:1715-1716` |
+| **双时间口径** | 免费额度使用 start_time/timestamp | `packages/shared/src/server/repositories/observations.ts:2027-2030` |
+| **调度** | Stripe 对账每小时第5分钟执行 | `packages/shared/src/server/redis/cloudUsageMeteringQueue.ts:60` |
+| **调度** | 免费额度每小时第35分钟执行 | `packages/shared/src/server/redis/cloudFreeTierUsageThresholdQueue.ts:65` |
+| **调度** | 免费额度在 Stripe 对账后30分钟执行 | `"5 * * * *"` vs `"35 * * * *"` cron 表达式对比 |
+| **对账** | 付费用户优先从 Stripe 获取用量 | `web/src/ee/features/billing/server/stripeBillingService.ts:1778-1909` |
+| **对账** | 免费用户从组织缓存获取用量 | `web/src/ee/features/billing/server/stripeBillingService.ts:1901-1908` |
+| **对账** | Stripe 失败时降级到缓存 | `web/src/ee/features/billing/server/stripeBillingService.ts:1890-1899` |
+| **UI** | 免费进度条使用 MAX_EVENTS_FREE_PLAN | `web/src/ee/features/billing/components/BillingUsageChart.tsx:28` |
 
 ### ⚠️ 待验证假设（3项，合理推断但无直接代码证据）
 
-| 假设 | 合理性 | 验证方法 |
-|------|--------|----------|
-| 付费与免费用户看到的用量数字存在差异 | 高（使用不同时间口径） | 对比同一组织在付费/免费状态下的 getUsage 返回值 |
-| 跨周期上报事件会导致对账差异 | 高（逻辑必然） | 构造 5月31日事件6月1日上报的测试用例 |
-| Stripe meter 聚合周期约 60 分钟 | 中（Stripe 平台特性） | 查阅 Stripe 官方文档或实测 |
+| 假设 | 假设原因 | 推断逻辑 | 验证方法 |
+|------|----------|----------|----------|
+| 付费与免费用户看到的用量数字存在差异 | 无代码直接证明差异存在 | 付费用户从 Stripe 获取（`created_at` 口径，`stripeBillingService.ts:1836-1846`），免费用户从组织缓存获取（业务时间口径，`stripeBillingService.ts:1901-1908`），两套口径统计规则不同 | 对比同一组织在付费/免费状态下的 `getUsage` 返回值 |
+| 跨周期上报事件会导致对账差异 | 无实际数据或测试用例证实 | 5月31日产生的事件6月1日才上报：Stripe 对账（`created_at`）计入6月，免费额度（`start_time`/`timestamp`）计入5月，两套口径归属不同计费周期 | 构造 5月31日事件6月1日上报的测试用例，对比两套口径的统计结果 |
+| Stripe meter 聚合存在延迟 | 代码库中无任何关于 Stripe meter 聚合周期的注释或常量定义 | `getUsage` 方法通过 `invoice.preview` 实时计算用量（`stripeBillingService.ts:212-218`），不依赖 Stripe 后台聚合，但 meter 事件上报到 invoice preview 可见可能存在延迟 | 查阅 Stripe 官方文档或实测 meter 事件上报到 invoice preview 可见的延迟 |
 
 ### ❌ 已删除的无依据推断
 
