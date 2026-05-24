@@ -1466,7 +1466,213 @@ const { data: selectedViewData } = api.TableViewPresets.getById.useQuery(
 
 ---
 
-## 十一、关键文件索引
+## 十一、后退场景分支分析与触发器文案核实
+
+### 11.1 触发器文案显示逻辑的代码证据
+
+**核心结论修正**：之前关于"浏览器后退后触发器文案会退回 Views"的结论不准确。实际显示逻辑取决于两个独立查询的状态和视图类型。
+
+**触发器文案计算逻辑**：
+`web/src/components/table/table-view-presets/components/data-table-view-presets-drawer.tsx:216-238`
+
+```typescript
+const selectedViewName = useMemo(() => {
+  // Check system filter presets first
+  const systemPreset = systemFilterPresets?.find(
+    (p) => p.id === selectedViewId,
+  );
+  if (systemPreset) {
+    const normalizedCurrent = normalizeForComparison(currentState.filters);
+    const normalizedPreset = normalizeForComparison(systemPreset.filters);
+    // If filters have been modified from the preset, show the generic trigger label instead
+    if (!isEqual(normalizedCurrent, normalizedPreset)) {
+      return undefined;  // 筛选不一致，显示 "Views"
+    }
+    return systemPreset.name;  // 筛选一致，显示 "View: {name}"
+  }
+  // Then check user presets
+  return TableViewPresetsList?.find((v) => v.id === selectedViewId)?.name;
+}, [selectedViewId, systemFilterPresets, TableViewPresetsList, currentState.filters]);
+```
+
+**触发器按钮显示**：
+`web/src/components/table/table-view-presets/components/data-table-view-presets-drawer.tsx:390-393`
+
+```typescript
+title={selectedViewName ? `View: ${selectedViewName}` : "Views"}
+{selectedViewName ? `View: ${selectedViewName}` : "Views"}
+```
+
+**两个独立查询的加载时机**：
+
+| 查询 | 位置 | `enabled` 条件 | 返回数据 |
+|------|------|---------------|---------|
+| `getByTableName` | `useViewData.ts:11-15` | 无条件（组件挂载即加载） | 视图列表，含 `id`, `name`, `filters` 等 |
+| `getById` | `useTableViewManager.ts:309-319` | `!isInitialized && !!selectedViewId` | 单个视图完整配置 |
+
+**关键差异**：
+- `getByTableName` 始终加载，数据被 tRPC 缓存，只要加载过一次就有数据
+- `getById` 仅在未初始化时才查询，`isInitialized=true` 后永久禁用
+- 对于**用户预设**：`selectedViewName` 只依赖 `getByTableName` 的结果，**不依赖 `getById`**
+- 对于**系统预设**：`selectedViewName` 依赖 `systemFilterPresets`（硬编码）和 `currentState.filters`，**不依赖任何后端查询**
+
+### 11.2 后退场景三分支拆分分析
+
+三个分支维度：
+1. **视图列表是否已加载**（`TableViewPresetsList` 是否有数据）
+2. **当前筛选是否与目标视图一致**（仅对系统预设有效）
+3. **是否重挂载**（`isInitialized` 是否重置）
+
+---
+
+#### 分支组合 1：视图列表已加载 + 不重挂载（最常见场景）
+
+**场景**：页面未刷新，浏览器在同标签页内前进后退。`getByTableName` 已查询过，数据在 tRPC 缓存中。
+
+**前置条件**：
+- 用户在 Traces 页选择视图X（`view_xxx`，用户预设）
+- 点击其他链接（如Sessions）→ 再点击浏览器后退
+- 组件未完全卸载（或卸载但 tRPC 缓存仍在）
+
+**状态变化**：
+
+| 状态项 | 后退前 | 后退后 | 原因 |
+|--------|--------|--------|------|
+| URL | `/project/proj_123/sessions` | `/project/proj_123/traces?viewId=view_xxx` | 浏览器历史恢复 |
+| `selectedViewId` | `null` | `"view_xxx"` | `useQueryParam` 同步 URL |
+| `isInitialized` | `true` | `true` | 组件未重挂载，状态保留 |
+| `TableViewPresetsList` | 有数据（含 view_xxx） | 有数据（tRPC 缓存） | `getByTableName` 无条件加载，缓存有效 |
+| `getById` enabled | `false` | `false` | `!isInitialized = false` |
+| `selectedViewName` | `undefined` | `"视图X"` | `TableViewPresetsList.find(...)?.name` 找到名称 |
+| 触发器文案 | `"Views"` | `"View: 视图X"` | `selectedViewName` 有值 |
+| 实际筛选显示 | Sessions 页的筛选 | **保持后退前的 Traces 页筛选** | `isInitialized=true`，`applyViewState` 永不调用 |
+
+**关键发现**：
+- ✅ 触发器文案**正确显示** `"View: 视图X"`（因为 `getByTableName` 缓存了数据）
+- ❌ 但实际显示的筛选**不是**视图X的筛选（因为 `getById` 未执行，`applyViewState` 未调用）
+- ⚠️ 这是**最容易误导用户**的场景：按钮显示选中了视图X，但实际表格显示的是之前的筛选
+
+---
+
+#### 分支组合 2：视图列表已加载 + 重挂载
+
+**场景**：刷新页面，或从其他网站跳转回来，组件完全重挂载。
+
+**状态变化**：
+
+| 状态项 | 初始 | 路由就绪 | getByTableName 返回 | getById 返回 | 最终 |
+|--------|------|---------|-------------------|-------------|------|
+| URL | `?viewId=view_xxx` | 不变 | 不变 | 不变 | 不变 |
+| `isInitialized` | `false` | `false` | `false` | `true` | `true` |
+| `TableViewPresetsList` | `undefined` | `undefined` | 有数据 | 有数据 | 有数据 |
+| `selectedViewId` | `"view_xxx"` | `"view_xxx"` | `"view_xxx"` | `"view_xxx"` | `"view_xxx"` |
+| `selectedViewName` | `undefined` | `undefined` | `"视图X"` | `"视图X"` | `"视图X"` |
+| 触发器文案 | `"Views"` | `"Views"` | `"View: 视图X"` | `"View: 视图X"` | `"View: 视图X"` |
+| 实际筛选 | 默认 | 默认 | 默认 | 视图X的筛选 | 视图X的筛选 |
+
+**时序细节**：
+1. 组件挂载 → `isInitialized=false`，`TableViewPresetsList=undefined`
+2. 两个查询同时开始：`getByTableName`（无条件）和 `getById`（`enabled=true`）
+3. `getByTableName` 先返回 → `TableViewPresetsList` 有数据 → `selectedViewName="视图X"` → 触发器显示 `"View: 视图X"`
+4. `getById` 后返回 → 调用 `applyViewState` → 应用视图X的筛选 → `isInitialized=true`
+
+**关键发现**：
+- 触发器文案在 `getByTableName` 返回后就显示正确名称
+- 但实际筛选要等 `getById` 返回后才会更新
+- 存在短暂的"文案已更新，但筛选未应用"的时间窗口
+
+---
+
+#### 分支组合 3：视图列表未加载 + 不重挂载
+
+**场景**：极少见，`getByTableName` 查询失败或被手动 invalidate 后未重新加载。
+
+**状态变化**：
+
+| 状态项 | 后退前 | 后退后 |
+|--------|--------|--------|
+| URL | `/project/proj_123/sessions` | `/project/proj_123/traces?viewId=view_xxx` |
+| `selectedViewId` | `null` | `"view_xxx"` |
+| `isInitialized` | `true` | `true` |
+| `TableViewPresetsList` | `undefined` | `undefined` |
+| `selectedViewName` | `undefined` | `undefined`（`TableViewPresetsList?.find(...)` 返回 undefined） |
+| 触发器文案 | `"Views"` | `"Views"` |
+| 实际筛选显示 | 保持不变 | 保持不变 |
+
+**关键发现**：
+- 当 `TableViewPresetsList` 为 `undefined` 时，即使 `selectedViewId` 有值，也找不到名称
+- 触发器文案确实显示 `"Views"`
+- 这是**唯一符合**之前结论的场景，但实际中很少发生
+
+---
+
+#### 分支组合 4：视图列表未加载 + 重挂载
+
+**场景**：组件重挂载，但 `getByTableName` 查询因网络问题延迟或失败。
+
+**状态变化**：
+
+| 状态项 | 初始 | 路由就绪 | getById 返回（先） | getByTableName 返回（后） |
+|--------|------|---------|-------------------|-------------------------|
+| URL | `?viewId=view_xxx` | 不变 | 不变 | 不变 |
+| `isInitialized` | `false` | `false` | `true` | `true` |
+| `TableViewPresetsList` | `undefined` | `undefined` | `undefined` | 有数据 |
+| `selectedViewName` | `undefined` | `undefined` | `undefined` | `"视图X"` |
+| 触发器文案 | `"Views"` | `"Views"` | `"Views"` | `"View: 视图X"` |
+| 实际筛选 | 默认 | 默认 | 视图X的筛选 | 视图X的筛选 |
+
+**关键发现**：
+- 即使 `getByTableName` 延迟返回，触发器文案最终仍会更新为正确的视图名称
+- 因为 `selectedViewName` 的 `useMemo` 依赖 `TableViewPresetsList`，会响应式更新
+
+---
+
+#### 分支组合 5-8：系统预设的特殊情况
+
+对于系统预设（`__langfuse_` 开头），`selectedViewName` 的计算不依赖 `TableViewPresetsList`，而是依赖 `currentState.filters` 与预设筛选的比较。
+
+| 分支 | 筛选一致？ | 重挂载？ | `selectedViewName` | 触发器文案 | 实际筛选 |
+|------|-----------|---------|-------------------|-----------|---------|
+| 5 | 是 | 否 | 预设名称 | `"View: {name}"` | 保持不变 |
+| 6 | 否 | 否 | `undefined` | `"Views"` | 保持不变 |
+| 7 | 是 | 是 | 预设名称 | `"View: {name}"` | 应用预设筛选 |
+| 8 | 否 | 是 | `undefined` | `"Views"` | 应用默认筛选 |
+
+**代码证据**：系统预设没有 `isInitialized` 限制，因为它们不通过 `getById` 查询加载。但 URL 中的系统预设会被主动清除：
+
+```typescript
+// useTableViewManager.ts:159-162
+if (selectedViewId && isSystemPresetId(selectedViewId)) {
+  handleSetViewId(null);  // 清除 URL 中的系统预设
+  return;
+}
+```
+
+### 11.3 分支总结与可观察证据
+
+| # | 视图列表已加载 | 筛选一致 | 重挂载 | 触发器文案 | 实际筛选 | 可观察证据 |
+|---|--------------|---------|--------|-----------|---------|-----------|
+| 1 | ✅ | 任意 | ❌ | `"View: 视图X"` | **不匹配** | 按钮显示视图名称，但表格数据不是该视图的筛选结果 |
+| 2 | ✅ | 任意 | ✅ | `"View: 视图X"` | 匹配 | 正常行为，文案和数据一致 |
+| 3 | ❌ | 任意 | ❌ | `"Views"` | 不匹配 | 按钮显示 "Views"，URL 有 `viewId`，数据不匹配 |
+| 4 | ❌ | 任意 | ✅ | 先 `"Views"` 后 `"View: 视图X"` | 最终匹配 | 文案有短暂闪烁，最终一致 |
+| 5 | 任意 | ✅ 系统预设 | ❌ | `"View: {预设名}"` | 不匹配 | 文案显示正确，但数据不匹配 |
+| 6 | 任意 | ❌ 系统预设 | ❌ | `"Views"` | 不匹配 | URL 有 `viewId` 但被清除，文案显示 "Views" |
+
+**最常见的不一致场景（分支1）的可观察证据**：
+1. URL 栏显示 `?viewId=view_xxx`
+2. 触发器按钮显示 `"View: 视图X"`
+3. 但表格显示的筛选条件与视图X定义不符
+4. 打开视图抽屉，视图X项有 `bg-muted` 高亮（因为 `selectedViewId` 匹配）
+5. 点击"Update view with current filters"按钮可用（因为当前状态与视图定义有差异）
+
+**验证方法**：打开浏览器开发者工具，观察 Network 面板：
+- 分支1（不重挂载）：后退时**没有** `getById` 请求
+- 分支2（重挂载）：后退时**有** `getById` 请求
+
+---
+
+## 十二、关键文件索引
 
 | 文件路径 | 说明 |
 |---------|------|
