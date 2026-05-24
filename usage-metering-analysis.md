@@ -429,17 +429,20 @@ if (env.LANGFUSE_FREE_TIER_USAGE_THRESHOLD_ENFORCEMENT_ENABLED !== "true") {
 
 ✅ **已证实**：双源数据策略
 
-**代码依据**：`web/src/ee/features/billing/server/stripeBillingService.ts:1778-1909`
+**代码依据**：
+- 付费路径：`stripeBillingService.ts:1797-1885`（`stripeCustomerId && stripeSubscriptionId` 条件分支）
+- 降级逻辑：`stripeBillingService.ts:1878-1884`（catch 块）
+- 免费/缓存路径：`stripeBillingService.ts:1890-1905`
 
 ```
 付费用户 → 优先从 Stripe 获取（主数据）
-  ├─ 1. 查订阅的 metered usage item
-  ├─ 2. 创建 invoice preview 获取累计用量
-  ├─ 3. 查 meter 获取显示名称
-  └─ 出错时降级到 org.cloudCurrentCycleUsage（免费额度聚合结果）
+  ├─ 1. 查订阅的 metered usage item（1810-1820）
+  ├─ 2. 创建 invoice preview 获取累计用量（1823-1827）
+  ├─ 3. 查 meter 获取显示名称（1858-1865）
+  └─ 出错时降级到 org.cloudCurrentCycleUsage（1878-1884 → 1890-1905）
 
 免费用户 → 从组织表缓存获取
-  └─ cloudCurrentCycleUsage 字段（由 usageAggregation job 更新，业务时间口径）
+  └─ cloudCurrentCycleUsage 字段（由 usageAggregation job 更新，业务时间口径）（1890-1905）
 ```
 
 ✅ **已证实**：从 invoice preview 提取用量的逻辑
@@ -538,10 +541,17 @@ const usagePercent = (usage.data.usageCount / hobbyPlanLimit) * 100;
 // 进度条宽度 = min(usagePercent, 100)%
 ```
 
-⚠️ **待验证假设**：付费用户与免费用户看到的用量数字可能存在差异
-- 付费用户：Stripe Invoice Preview 数据（created_at 口径，入库时间）
-- 免费用户：`cloudCurrentCycleUsage`（start_time/timestamp 口径，业务时间）
-- **没有代码证据**证明具体差异比例（删除原文档中 10%-40% 的推断）
+⚠️ **待验证假设**：付费与免费用户看到的用量数字可能存在差异
+- **假设原因**：无代码直接证明差异存在，付费用户的 Stripe 失败回落分支与免费用户路径会汇合
+- **推断逻辑**：
+  - **路径 A1（付费，Stripe 正常）**：从 `createInvoicePreview` 获取（`stripeBillingService.ts:1823-1827`），时间口径为 Stripe 接收事件时间，底层数据来自 Cloud Metering Job 的 `created_at` 统计（`observations.ts:1715-1716`）
+  - **路径 A2（付费，Stripe 失败）**：降级使用 `org.cloudCurrentCycleUsage` 缓存（`stripeBillingService.ts:1878-1884` → `stripeBillingService.ts:1890-1891`），与免费用户路径 B 完全相同
+  - **路径 B（免费）**：使用 `org.cloudCurrentCycleUsage` 缓存（`stripeBillingService.ts:1890-1891`），由 Usage Aggregation Job 每小时更新，时间口径为业务时间 `start_time`/`timestamp`（`observations.ts:2027-2030`）
+  - 路径 A1 与 B 使用不同统计口径，可能产生差异；路径 A2 与 B 口径一致，无差异
+- **验证方法**：
+  1. 对比同一付费组织在 Stripe 正常状态下，同时查询 Stripe API（路径 A1）和 ClickHouse 缓存（路径 B）的 `getUsage` 返回值
+  2. 对比同一付费组织在 Stripe 成功与失败（模拟）状态下的 `getUsage` 返回值
+  3. 对比同一组织在付费/免费状态下的 `getUsage` 返回值
 
 ### 6.3 发票列表渲染
 
@@ -597,7 +607,7 @@ const { data: subscriptionInfo } = api.cloudBilling.getSubscriptionInfo.useQuery
 
 ⚠️ **待验证假设**：跨周期上报事件会导致对账差异
 - **假设原因**：无实际数据或测试用例证实
-- **推断逻辑**：5月31日产生的事件6月1日才上报：Stripe 对账（`created_at`）计入6月，免费额度（`start_time`/`timestamp`）计入5月，两套口径归属不同计费周期
+- **推断逻辑**：5月31日产生的事件6月1日才上报：Stripe 对账（`created_at` 口径，`observations.ts:1715-1716`）计入6月，免费额度（业务时间口径，`observations.ts:2027-2030`）计入5月，两套口径归属不同计费周期
 - **验证方法**：构造 5月31日事件6月1日上报的测试用例，对比两套口径的统计结果
 
 ### 7.3 时间轴协同
@@ -616,9 +626,9 @@ UI 查询 → tRPC getUsage → Stripe Invoice Preview → 用量展示（付费
 事件产生 → ClickHouse 写入 → 天级聚合（+35min, start_time）→ org.cloudCurrentCycleUsage → UI 展示（免费）
 ```
 
-⚠️ **待验证假设**：Stripe meter 聚合存在延迟
+⚠️ **待验证假设**：Stripe meter 事件上报到 invoice preview 可见存在延迟
 - **假设原因**：代码库中无任何关于 Stripe meter 聚合周期的注释或常量定义
-- **推断逻辑**：`getUsage` 方法通过 `invoice.preview` 实时计算用量（`stripeBillingService.ts:212-218`），不依赖 Stripe 后台聚合
+- **推断逻辑**：`getUsage` 主流程通过 `createInvoicePreview` 实时计算用量（`stripeBillingService.ts:1823-1827`），该调用会遍历 Stripe 已处理的 meter 事件并生成预览发票，不依赖额外的后台聚合，但 meter 事件从提交到被 invoice preview 纳入统计可能存在延迟
 - **验证方法**：查阅 Stripe 官方文档或实测 meter 事件上报到 invoice preview 可见的延迟
 
 ### 7.4 指标口径对齐
@@ -668,18 +678,18 @@ UI 查询 → tRPC getUsage → Stripe Invoice Preview → 用量展示（付费
 | **调度** | Stripe 对账每小时第5分钟执行 | `packages/shared/src/server/redis/cloudUsageMeteringQueue.ts:60` |
 | **调度** | 免费额度每小时第35分钟执行 | `packages/shared/src/server/redis/cloudFreeTierUsageThresholdQueue.ts:65` |
 | **调度** | 免费额度在 Stripe 对账后30分钟执行 | `"5 * * * *"` vs `"35 * * * *"` cron 表达式对比 |
-| **对账** | 付费用户优先从 Stripe 获取用量 | `web/src/ee/features/billing/server/stripeBillingService.ts:1778-1909` |
-| **对账** | 免费用户从组织缓存获取用量 | `web/src/ee/features/billing/server/stripeBillingService.ts:1901-1908` |
-| **对账** | Stripe 失败时降级到缓存 | `web/src/ee/features/billing/server/stripeBillingService.ts:1890-1899` |
+| **对账** | 付费用户优先从 Stripe 获取用量 | `web/src/ee/features/billing/server/stripeBillingService.ts:1797-1885` |
+| **对账** | 免费用户从组织缓存获取用量 | `web/src/ee/features/billing/server/stripeBillingService.ts:1890-1905` |
+| **对账** | Stripe 失败时降级到缓存 | `web/src/ee/features/billing/server/stripeBillingService.ts:1878-1884` → `1890-1905` |
 | **UI** | 免费进度条使用 MAX_EVENTS_FREE_PLAN | `web/src/ee/features/billing/components/BillingUsageChart.tsx:28` |
 
 ### ⚠️ 待验证假设（3项，合理推断但无直接代码证据）
 
 | 假设 | 假设原因 | 推断逻辑 | 验证方法 |
 |------|----------|----------|----------|
-| 付费与免费用户看到的用量数字存在差异 | 无代码直接证明差异存在 | 付费用户从 Stripe 获取（`created_at` 口径，`stripeBillingService.ts:1836-1846`），免费用户从组织缓存获取（业务时间口径，`stripeBillingService.ts:1901-1908`），两套口径统计规则不同 | 对比同一组织在付费/免费状态下的 `getUsage` 返回值 |
-| 跨周期上报事件会导致对账差异 | 无实际数据或测试用例证实 | 5月31日产生的事件6月1日才上报：Stripe 对账（`created_at`）计入6月，免费额度（`start_time`/`timestamp`）计入5月，两套口径归属不同计费周期 | 构造 5月31日事件6月1日上报的测试用例，对比两套口径的统计结果 |
-| Stripe meter 聚合存在延迟 | 代码库中无任何关于 Stripe meter 聚合周期的注释或常量定义 | `getUsage` 方法通过 `invoice.preview` 实时计算用量（`stripeBillingService.ts:212-218`），不依赖 Stripe 后台聚合，但 meter 事件上报到 invoice preview 可见可能存在延迟 | 查阅 Stripe 官方文档或实测 meter 事件上报到 invoice preview 可见的延迟 |
+| 付费与免费用户看到的用量数字可能存在差异 | 无代码直接证明差异存在，付费用户的 Stripe 失败回落分支与免费用户路径会汇合 | **路径 A1（付费，Stripe 正常）**：从 `createInvoicePreview` 获取（`stripeBillingService.ts:1823-1827`），时间口径为 Stripe 接收事件时间，底层数据来自 Cloud Metering Job 的 `created_at` 统计（`observations.ts:1715-1716`）<br/>**路径 A2（付费，Stripe 失败）**：降级使用 `org.cloudCurrentCycleUsage` 缓存（`stripeBillingService.ts:1878-1884` → `1890-1891`），与免费用户路径 B 完全相同<br/>**路径 B（免费）**：使用 `org.cloudCurrentCycleUsage` 缓存（`stripeBillingService.ts:1890-1891`），由 Usage Aggregation Job 每小时更新，时间口径为业务时间 `start_time`/`timestamp`（`observations.ts:2027-2030`）<br/>路径 A1 与 B 口径不同可能产生差异；A2 与 B 口径一致无差异 | 1. 对比同一付费组织在 Stripe 正常状态下，同时查询 Stripe API（路径 A1）和 ClickHouse 缓存（路径 B）的 `getUsage` 返回值<br/>2. 对比同一付费组织在 Stripe 成功与失败（模拟）状态下的 `getUsage` 返回值<br/>3. 对比同一组织在付费/免费状态下的 `getUsage` 返回值 |
+| 跨周期上报事件会导致对账差异 | 无实际数据或测试用例证实 | 5月31日产生的事件6月1日才上报：Stripe 对账（`created_at` 口径，`observations.ts:1715-1716`）计入6月，免费额度（业务时间口径，`observations.ts:2027-2030`）计入5月，两套口径归属不同计费周期 | 构造 5月31日事件6月1日上报的测试用例，对比两套口径的统计结果 |
+| Stripe meter 事件上报到 invoice preview 可见存在延迟 | 代码库中无任何关于 Stripe meter 聚合周期的注释或常量定义 | `getUsage` 主流程通过 `createInvoicePreview` 实时计算用量（`stripeBillingService.ts:1823-1827`），该调用遍历 Stripe 已处理的 meter 事件生成预览发票，不依赖额外后台聚合，但 meter 事件从提交到被 invoice preview 纳入统计可能存在延迟 | 查阅 Stripe 官方文档或实测 meter 事件上报到 invoice preview 可见的延迟 |
 
 ### ❌ 已删除的无依据推断
 
@@ -709,7 +719,7 @@ UI 查询 → tRPC getUsage → Stripe Invoice Preview → 用量展示（付费
 | 查询（业务时间） | `packages/shared/src/server/repositories/traces.ts:1622-1663` | `getTraceCountsByProjectAndDay` (timestamp) |
 | 查询（业务时间） | `packages/shared/src/server/repositories/observations.ts:2016-2057` | `getObservationCountsByProjectAndDay` (start_time) |
 | 查询（业务时间） | `packages/shared/src/server/repositories/scores.ts:2284-2314` | `getScoreCountsByProjectAndDay` (timestamp) |
-| 对账 | `web/src/ee/features/billing/server/stripeBillingService.ts` | `getUsage`, `getInvoices` |
+| 对账 | `web/src/ee/features/billing/server/stripeBillingService.ts:1778-1909` | `getUsage`（1778-1909）, `getInvoices`（1547-1768）, `createInvoicePreview`（212-218） |
 | 路由 | `web/src/ee/features/billing/server/cloudBillingRouter.ts` | `cloudBillingRouter` |
 | UI | `web/src/ee/features/billing/components/BillingUsageChart.tsx` | `BillingUsageChart` |
 | UI | `web/src/ee/features/billing/components/BillingInvoiceTable.tsx` | `BillingInvoiceTable` |
