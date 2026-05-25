@@ -1,11 +1,11 @@
-# Project 删除流程梳理（第二轮代码理解）
+# Project 删除流程梳理（第三轮代码理解）
 
 本文从代码实现角度梳理 **删除一个 Project 时，哪些数据会被清掉、哪些会保留**，以及
 删除入口、级联范围、与后台任务的衔接关系。所有结论均以仓库当下的实现为准。
 
-> 本版本为第二轮代码理解，重点补充了：（1）所有真正触发 `ProjectDelete` 入队的入口的
-> 完整枚举与区分；（2）为何组织删除只做前置校验、不直接触发项目删除；（3）一张
-> 覆盖 PG / ClickHouse / S3 / Redis 四种数据类型的五维对照表。
+> 本版本为第三轮代码理解，重点修正了：（1）Redis API key 缓存失效的真实键模式和执行路径；
+> （2）`blob_storage_file_log` 的软删除机制（INSERT 而非 ALTER UPDATE）；（3）tRPC 组织删除与
+> Admin API 组织删除在 API key 缓存失效方面的不对称性及风险评估。
 
 ---
 
@@ -27,8 +27,8 @@
 输入: projectId, orgId
   │
   ├─ 1. RBAC 鉴权（两个入口各有各的鉴权逻辑）
-  ├─ 2. ApiAuthService.invalidateCachedProjectApiKeys(projectId)
-  │     └─ 从 Redis 里 DEL 掉该项目所有 API key 缓存
+  ├─ 2. invalidateCachedProjectApiKeys(projectId)
+  │     └─ 从 PG 查 API key → 取 fastHashedSecretKey → Redis DEL api-key:${hash}
   ├─ 3. prisma.apiKey.deleteMany({ where: { projectId, scope: PROJECT } })
   │     └─ 从 PG 里物理删掉 scope=PROJECT 的 API key
   ├─ 4. prisma.project.update({ data: { deletedAt: now() } })   ← 软删
@@ -123,9 +123,9 @@
 | `deleteObservationsByProjectId(projectId)` | `observations` | 总是执行 |
 | `deleteScoresByProjectId(projectId)` | `scores` | 总是执行 |
 | `deleteEventsByProjectId(projectId)` | `events_full` / `events_core` | 仅当 `LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE === "true"` |
-| `removeIngestionEventsFromS3AndDeleteClickhouseRefsForProject(projectId, undefined)` | `blob_storage_file_log` + S3 ingestion 归档 | 仅当 `LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true"`，内部按 500 一批软删 |
+| `removeIngestionEventsFromS3AndDeleteClickhouseRefsForProject(projectId, undefined)` | `blob_storage_file_log` + S3 ingestion 归档 | 仅当 `LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true"`，内部按 500 一批**INSERT 新的软删行**（非 ALTER UPDATE） |
 
-执行模式：每一个函数都先发一个 `SELECT 1 ... WHERE project_id = ? LIMIT 1`
+执行模式：除 `blob_storage_file_log` 外，每一个函数都先发一个 `SELECT 1 ... WHERE project_id = ? LIMIT 1`
 (`hasAnyTrace` 类) 确认还有数据，再发一个同步 `DELETE FROM <table> WHERE project_id = ?`。
 `request_timeout` 取 `LANGFUSE_CLICKHOUSE_DELETION_TIMEOUT_MS`。
 
@@ -245,8 +245,8 @@ prisma.project.delete({ where: { id: projectId, orgId } })
   调 `removeIngestionEventsFromS3AndDeleteClickhouseRefsForProject(projectId, undefined)`
   做全量 blob 清理。
 - 内部：`removeIngestionEventsFromS3AndDeleteClickhouseRefsForProject` 自身会按 500 一批
-  对 `blob_storage_file_log` 做 CH 软删，并在删 CH 前先调 S3 `deleteFiles`。
-  中途被打断是安全的——已经软删的行在下一次合并时会真正消失。
+  对 `blob_storage_file_log` 做 CH 软删（INSERT 新行，设置 `is_deleted="1"`），
+  并在删 CH 前先调 S3 `deleteFiles`。中途被打断是安全的——已经软删的行在下一次合并时会真正消失。
 
 ### 3.4 这些补偿之间的分工一览
 
@@ -259,7 +259,7 @@ prisma.project.delete({ where: { id: projectId, orgId } })
 
 ---
 
-## 4. 五维数据清理对照表（PG / CH / S3 / Redis）
+## 4. 六维数据清理对照表（PG / CH / S3 / Redis）
 
 下表按 **数据类型 → 数据对象 → 清理动作 → 触发位置 → 开关条件 → 失败后补偿**
 六个维度梳理，覆盖所有被影响的数据：
@@ -268,8 +268,11 @@ prisma.project.delete({ where: { id: projectId, orgId } })
 
 | 数据对象 | 清理动作 | 触发位置 | 开关条件 | 失败后补偿 |
 | --- | --- | --- | --- | --- |
-| API key 缓存（key 模式：`api_auth:api_keys:${projectId}:*` 等，由 `ApiAuthService` 管理） | Redis `DEL` 前缀匹配失效 | `projectsRouter.ts:173`、`projectById/index.ts:123`（入口同步执行） | Always（无 env 开关） | 下一次 API 请求时 `ApiAuthService` 会从 PG 重新读取并覆盖缓存；长期则靠缓存 TTL 自失效 |
+| **API key 缓存**（键名模式：`api-key:${fastHashedSecretKey}`） | 1. 从 PG 查询该 projectId 的所有 `scope=PROJECT` 的 API key；<br>2. 提取每个 key 的 `fastHashedSecretKey` 字段；<br>3. 用 `safeMultiDel` 逐个 Redis `DEL api-key:${hash}`（集群模式避免 CROSSSLOT） | `packages/shared/src/server/auth/invalidateApiKeys.ts:100`（`invalidateCachedProjectApiKeys`），在 `projectsRouter.ts:173` 和 `projectById/index.ts:123` 被调用（入口同步执行） | Always（无 env 开关） | 下一次 API 请求时 `ApiAuthService` 会从 PG 重新读取并覆盖缓存；长期则靠缓存 TTL 自失效 |
 | `BatchProjectCleaner` 等分布式锁 | Redis `SET` 带 TTL，结束后自动释放 | 各 `PeriodicExclusiveRunner` 内部 | 对应 cleaner 开了才有锁 | 锁自带 TTL（= DELETE timeout + 5min），worker 挂掉也会超时自动释放 |
+
+> **修正说明**：之前的版本错误地描述为"前缀匹配失效"。实际实现是**先查 DB 得到具体的 key 哈希值，再精确删除对应的 Redis 键**，
+> 不是 `api_auth:api_keys:${projectId}:*` 这种前缀模式。
 
 ### 4.2 PostgreSQL
 
@@ -304,57 +307,128 @@ prisma.project.delete({ where: { id: projectId, orgId } })
 | `scores` | `ALTER TABLE scores DELETE WHERE project_id = ?` | `projectDelete.ts:68`（步骤 B，`repositories/scores.ts:1676`） | Always | 同上 |
 | `dataset_run_items_rmt` | `ALTER TABLE dataset_run_items_rmt DELETE WHERE project_id = ?` | `projectDelete.ts:75`（步骤 C，`repositories/dataset-run-items.ts:1108`） | Always | 同上 + `BatchProjectCleaner`（它在 `BATCH_DELETION_TABLES` 里） |
 | `events_full` / `events_core` | `ALTER TABLE events_* DELETE WHERE project_id = ?` | `projectDelete.ts:69-71`（步骤 B，`repositories/events.ts:2477`） | `LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE === "true"` | 同上 + `BatchProjectCleaner`（仅当开关打开时才启动 events 表的 cleaner 实例） |
-| `blob_storage_file_log` | 先 `ALTER TABLE blob_storage_file_log UPDATE SET is_deleted = 1 WHERE project_id = ? AND is_deleted = 0`（按 500 一批软删），再由 CH merge 异步真正删 | `projectDelete.ts:60-65`（步骤 B，调用 `ingestionFileDeletion.ts:42` 的 `removeIngestionEventsFromS3AndDeleteClickhouseRefsForProject`） | `LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true"` | BullMQ 重试 + `BatchProjectBlobCleaner` 兜底 |
+| **`blob_storage_file_log`** | 表引擎是 `ReplacingMergeTree(event_ts, is_deleted)`，按 500 一批循环：<br>1. 查询待删行（`is_deleted=0`）；<br>2. 调 S3 `DeleteObjects` 删对象；<br>3. **INSERT 新行**到 CH，复制所有字段但设置 `is_deleted="1"`、`event_ts=now()`、`updated_at=now()`；<br>4. CH 后台合并时自动丢弃旧版本（软删生效） | `projectDelete.ts:60-65`（步骤 B），调用 `packages/shared/src/server/data-deletion/ingestionFileDeletion.ts:95` 的 `softDeleteInClickhouse` | `LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true"` | BullMQ 重试 + `BatchProjectBlobCleaner` 兜底 |
 | CH 物化视图 / 其他衍生表 | 不单独清理（依赖 CH 合并树的异步清理，或已通过主表 DELETE 级联到 MV） | —— | —— | CH 自身机制；`BatchProjectCleaner` 只清理主表 |
+
+> **修正说明**：之前的版本错误地描述为"ALTER TABLE ... UPDATE"。实际实现是 **INSERT 新的软删行**，
+> 利用 `ReplacingMergeTree(event_ts, is_deleted)` 引擎的去重特性——主键相同时取 `event_ts` 最大的版本，
+> 如果该版本的 `is_deleted=1` 则在合并时被视为"已删除"。这是 ClickHouse 的标准软删除模式。
 
 ### 4.4 S3
 
 | 数据对象 | 清理动作 | 触发位置 | 开关条件 | 失败后补偿 |
 | --- | --- | --- | --- | --- |
 | 媒体对象（路径 = `Media.bucketPath`） | S3 `DeleteObjects`（批量，最多 1000 个 key / 请求），然后删 PG `media` 行 | `projectDelete.ts:44-51`（步骤 A，调用 `media-deletion.ts:51` `deleteMediaFiles`） | `LANGFUSE_S3_MEDIA_UPLOAD_BUCKET` 已配置 | BullMQ 重试 + `BatchProjectMediaCleaner` 分批啃 |
-| Ingestion 归档对象（路径由 `blob_storage_file_log.bucket_path` 记录） | S3 `DeleteObjects` 按 500 一批删，然后 CH `blob_storage_file_log` 软删 | `projectDelete.ts:60-65`（步骤 B，`ingestionFileDeletion.ts:42`） | `LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true"` | BullMQ 重试 + `BatchProjectBlobCleaner` 兜底 |
+| Ingestion 归档对象（路径由 `blob_storage_file_log.bucket_path` 记录） | S3 `DeleteObjects` 按 500 一批删，然后 CH INSERT 软删行 | `projectDelete.ts:60-65`（步骤 B，`ingestionFileDeletion.ts:42`） | `LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG === "true"` | BullMQ 重试 + `BatchProjectBlobCleaner` 兜底 |
 | Blob Storage 导出文件（用户配置的导出 bucket 里的 Parquet / JSON） | **不清理** | —— | —— | 导出时已与 Project 解耦，走 BlobStorageIntegration 自己的保留期或用户手动管理 |
 | S3 billing / usage 计量归档 | **不清理**（本仓库不涉及） | —— | —— | Cloud 侧独立管理 |
 
 ---
 
-## 5. 删除链路的整体时序
+## 5. 组织删除的 API key 缓存失效：不对称性与风险评估
+
+### 5.1 tRPC 组织删除 vs Admin API 组织删除对比
+
+| 维度 | tRPC `organizations.delete` | EE Admin API `handleDeleteOrganization` |
+| --- | --- | --- |
+| 位置 | `organizationRouter.ts:178` | `organizationById.ts:148` |
+| 项目前置校验 | `countNonDeletedProjects == 0` 且 `countAllProjects == 0` | 完全相同 |
+| Stripe 订阅取消 | Cloud 环境会先 `cancelImmediatelyAndInvoice` | 无（Admin API 不处理 billing） |
+| **API key 缓存失效** | ✅ 删除组织后调用 `invalidateCachedOrgApiKeys(orgId)`（`organizationRouter.ts:245`） | ❌ **没有调用**（直接 `prisma.organization.delete()` 后返回） |
+| 审计日志 | ✅ 写 audit log | ✅ 写 audit log |
+
+### 5.2 技术细节：`invalidateCachedOrgApiKeys` 的工作原理
+
+```ts
+// packages/shared/src/server/auth/invalidateApiKeys.ts:58
+export async function invalidateCachedOrgApiKeys(
+  orgId: string,
+  redisClient: Redis | Cluster | null = redis,
+): Promise<void> {
+  // 查询属于该 Org 的所有 API key：
+  //   OR: [ { project: { orgId } }, { orgId } ]
+  // 即包含 Org 级 key 和该 Org 下所有 Project 的 key
+  const apiKeys = await prisma.apiKey.findMany({
+    where: { OR: [{ project: { orgId } }, { orgId }] },
+  });
+
+  // 精确删除 api-key:${fastHashedSecretKey}
+  const keysToDelete = apiKeys
+    .map((key) => key.fastHashedSecretKey)
+    .filter(Boolean)
+    .map((hash) => `api-key:${hash}`);
+
+  await safeMultiDel(redisClient, keysToDelete);
+}
+```
+
+### 5.3 风险评估：这是设计选择还是潜在 bug？
+
+**结论：这是一个需要修复的** 潜在安全风险 **，不是有意的设计选择。**
+
+代码依据：
+
+1. tRPC 路径里的注释明确说明了意图：
+   > `organizationRouter.ts:244` 的代码注释：`// the api keys contain which org they belong to, so we need to remove them from Redis`
+
+2. Admin API 路径删除组织的逻辑完全一样（先校验项目、再 `prisma.organization.delete()`、再写 audit log），
+   唯独缺了这一行 `invalidateCachedOrgApiKeys`。
+
+3. **安全影响**：如果用 Admin API 删除了一个组织，那么：
+   - PG 里的 `api_keys` 行会被外键级联删掉（因为 `ApiKey.organization` 是 `onDelete: Cascade`）
+   - 但 Redis 里的 `api-key:${hash}` 缓存**不会被清除**
+   - 在缓存 TTL 到期之前，攻击者还能用已撤销的 API key 访问（前提是缓存还在）
+
+4. 虽然 API key 在鉴权时最终会从 DB 重新验证（缓存 miss 时），但：
+   - 如果缓存命中，会直接使用缓存的 key 信息
+   - 缓存 TTL 通常是分钟级，这就有了一个攻击窗口
+
+> 建议修复：在 `web/src/ee/features/admin-api/server/organizations/organizationById.ts` 的
+> `prisma.organization.delete()` 之后，增加一行：
+> `await invalidateCachedOrgApiKeys(organizationId, redis)`。
+
+---
+
+## 6. 删除链路的整体时序
 
 ```
 用户点 Delete / 调 admin API
    │
    ▼
 projectsRouter.delete / handleDeleteProject
-   ├─ 1. invalidateCachedProjectApiKeys             （Redis，同步）
-   ├─ 2. prisma.apiKey.deleteMany(scope=PROJECT)    （PG，同步）
-   ├─ 3. prisma.project.update({ deletedAt: now })  （PG，软删，同步）
-   ├─ 4. auditLog("project", "delete")              （PG，同步）
-   └─ 5. enqueue ProjectDelete(projectId, orgId)    （BullMQ，异步）
-                                                                 
-   ▼                                                                 
-worker 消费 ProjectDelete                                          
-   ├─ A. S3 + PG Media 全量清理（10,000/批）                          
-   ├─ B. CH traces / observations / scores / events* / blob_storage_file_log 并行 DELETE
+   ├─ 1. invalidateCachedProjectApiKeys(projectId)  （Redis，同步：查 PG → 取 hash → DEL api-key:${hash}）
+   ├─ 2. prisma.apiKey.deleteMany(scope=PROJECT)     （PG，同步）
+   ├─ 3. prisma.project.update({ deletedAt: now })   （PG，软删，同步）
+   ├─ 4. auditLog("project", "delete")               （PG，同步）
+   └─ 5. enqueue ProjectDelete(projectId, orgId)     （BullMQ，异步）
+
+   ▼
+worker 消费 ProjectDelete
+   ├─ A. S3 + PG Media 全量清理（10,000/批）
+   ├─ B. CH traces / observations / scores / events* 并行 DELETE
+   │    └─ blob_storage_file_log：按 500 一批 S3 Delete + CH INSERT is_deleted=1
    ├─ C. CH dataset_run_items_rmt DELETE
-   └─ D. prisma.project.delete()                     （PG，真删）
+   └─ D. prisma.project.delete()                      （PG，真删）
          └─ 依赖 onDelete 级联清掉所有 PG 子表
 
-   ▲                                                
+   ▲
    │ 兜底：PeriodicExclusiveRunner 后台任务（持续运行）
    │  ├─ BatchProjectCleaner       扫软删 Project，批量清 CH 主表
    │  ├─ BatchProjectMediaCleaner  啃 Media 残留（按 BATCH_SIZE）
    │  └─ BatchProjectBlobCleaner   啃 blob_storage_file_log 残留
    │
    ▼
-organizations.delete（可选）
+organizations.delete（可选，两条路径）
    ├─ 校验 countNonDeletedProjects == 0 （活跃项目必须为 0）
    ├─ 校验 countAllProjects == 0      （软删项目也必须清完）
-   └─ 才允许删 Organization
+   ├─ prisma.organization.delete()
+   ├─ [tRPC 专有] invalidateCachedOrgApiKeys(orgId)  ← Admin API 缺失这一步！⚠️
+   └─ auditLog("organization", "delete")
 ```
 
 ---
 
-## 6. 容易被忽视的几个设计要点
+## 7. 容易被忽视的几个设计要点
 
 1. **两步删除（软删 → 真删）**：入口只打 `deletedAt`，真删交给异步任务。
    好处是 UI / API 能快速响应；坏处是 Org 删除、Admin 侧统计等必须同时考虑
@@ -367,10 +441,22 @@ organizations.delete（可选）
 3. **Media 清理是 S3 先行、PG 后删**（`media-deletion.ts:67-75`），防止孤儿 S3 对象；
    但这意味着如果 PG 回滚，S3 已经删了——重试时会幂等。
 
-4. **审计日志不删**，是刻意的合规选择。写审计日志的那一条发生在入口处（软删时），
+4. **`blob_storage_file_log` 的软删除是 INSERT 不是 ALTER UPDATE**：
+   利用 `ReplacingMergeTree(event_ts, is_deleted)` 的去重特性，写入一条相同主键但
+   `is_deleted="1"` 的新行，CH 后台合并时自动丢弃旧版本。这是 ClickHouse 的标准软删除模式，
+   避免了 ALTER UPDATE 的重写开销。
+
+5. **Redis API key 失效是精确删除，不是前缀匹配**：先从 PG 查询具体的 key，
+   取 `fastHashedSecretKey`，再逐个 DEL `api-key:${hash}`。集群模式下用 `safeMultiDel`
+   避免 CROSSSLOT 错误。
+
+6. **审计日志不删**，是刻意的合规选择。写审计日志的那一条发生在入口处（软删时），
    指向的 Project 会在步骤 D 被删掉，但日志行本身保留，`resourceId` 变成悬空字符串。
 
-5. **环境开关导致的差异**：
+7. **组织删除的 API key 缓存失效不对称**：tRPC 路径调用了 `invalidateCachedOrgApiKeys`，
+   但 Admin API 路径没有。这是一个潜在的安全风险，建议修复（见第 5 节）。
+
+8. **环境开关导致的差异**：
    - `LANGFUSE_S3_MEDIA_UPLOAD_BUCKET` 未配置 → 媒体相关步骤全部跳过。
    - `LANGFUSE_ENABLE_BLOB_STORAGE_FILE_LOG` 未开 → `blob_storage_file_log` 不走删除链路。
    - `LANGFUSE_EXPERIMENT_INSERT_INTO_EVENTS_TABLE` 未开 → `events_full` / `events_core`
@@ -379,9 +465,9 @@ organizations.delete（可选）
    - `LANGFUSE_BATCH_PROJECT_CLEANER_ENABLED` 关掉后，所有补偿任务都不跑；
      如果 `ProjectDelete` Job 失败，PG 里就会留下 `deletedAt IS NOT NULL` 的 Project 永远不真删。
 
-6. **Org 级联删除不会触发 Project 删除**：`organizations.delete` 反而要求所有 Project
+9. **Org 级联删除不会触发 Project 删除**：`organizations.delete` 反而要求所有 Project
    已经被清干净。如果要做 Org 级级联，需要先独立走完 Project 的删除链路。
 
-7. **入队点只有 2 个**：只有 tRPC `projects.delete` 和 EE Admin API `handleDeleteProject`
-   真正调用 `ProjectDeleteQueue.add(QueueJobs.ProjectDelete, ...)`。组织删除只是门禁，
-   公共 API 没有项目删除接口。
+10. **入队点只有 2 个**：只有 tRPC `projects.delete` 和 EE Admin API `handleDeleteProject`
+    真正调用 `ProjectDeleteQueue.add(QueueJobs.ProjectDelete, ...)`。组织删除只是门禁，
+    公共 API 没有项目删除接口。
