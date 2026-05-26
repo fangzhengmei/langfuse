@@ -838,41 +838,66 @@ kubectl exec -it <redis-pod> -- redis-cli HGETALL bull:batch-export-queue:active
 
 ## 十一、容易误判的边界机制详解
 
-### 11.1 create 接口队列实例缺失或入队失败时的真实行为
+### 11.1 create 接口入队去重与失败行为的真实分析
 
-#### 代码证据
+#### 11.1.1 入队去重：payload.id ≠ BullMQ jobId（关键校正）
 
-**文件：** `web/src/features/batch-exports/server/batchExport.ts:36-67`
+**代码证据：** `web/src/features/batch-exports/server/batchExport.ts:58-67`
 
 ```typescript
-// 步骤 1: 先写入数据库
-const exportJob = await ctx.prisma.batchExport.create({
-  data: {
-    projectId,
-    userId: ctx.session.user.id,
-    status: BatchExportStatus.QUEUED,  // ⚠️ 状态已设为 QUEUED
-    name,
-    format,
-    query,
-  },
-});
-
-// 步骤 2: 审计日志
-await auditLog({ ... });
-
-// 步骤 3: 投递队列（注意可选链 ?.）
 await BatchExportQueue.getInstance()?.add(QueueJobs.BatchExportJob, {
-  id: exportJob.id,
+  id: exportJob.id, // Use the batchExportId to deduplicate when the same job is sent multiple times
   name: QueueJobs.BatchExportJob,
   timestamp: new Date(),
-  payload: { batchExportId: exportJob.id, projectId },
+  payload: {
+    batchExportId: exportJob.id,
+    projectId,
+  },
 });
 ```
+
+**BullMQ add 方法签名：**
+```typescript
+queue.add(name: string, data: object, opts?: JobsOptions): Promise<Job>
+```
+- 第 2 个参数 `data`：任务数据（payload）
+- 第 3 个参数 `opts`：任务选项，其中 `jobId` 字段才是 BullMQ 的去重键
+
+**推导过程：**
+
+1. **代码注释的误导**：注释说 "Use the batchExportId to deduplicate"，但 `id: exportJob.id` 是在**第二个参数 data 内部**，不是 BullMQ 的去重键。
+
+2. **其他队列的正确用法（对比证据）：**
+   `packages/shared/src/server/redis/cloudUsageMeteringQueue.ts:51-68`
+   ```typescript
+   CloudUsageMeteringQueue.instance
+     .add(
+       QueueJobs.CloudUsageMeteringJob,
+       {},  // data 参数（空）
+       {    // opts 参数（包含 jobId）
+         repeat: { pattern: "5 * * * *" },
+         jobId: "cloud-usage-metering-recurring",  // ✅ 正确位置
+       },
+     )
+   ```
+
+3. **结论**：BatchExportQueue **没有利用 BullMQ 的去重机制**。如果重复调用 `add()`，会创建多个独立的 BullMQ 任务，每个任务都会被消费。代码注释与实际行为不一致。
+
+**用户可见影响：**
+- 快速双击导出按钮可能创建多个相同的导出任务
+- 每个任务都会独立消费，造成资源浪费
+- 数据库中会有多条相同的导出记录
+
+---
+
+#### 11.1.2 队列实例缺失或入队失败时的行为
+
+**代码证据：** `web/src/features/batch-exports/server/batchExport.ts:40-77`
 
 **关键代码细节：**
 - `BatchExportQueue.getInstance()` 可能返回 `null`（Redis 连接失败时）
 - 使用了可选链 `?.`，如果实例为 `null`，`add()` 不会被调用
-- 但因为是 `await ...?.add()`，如果 `add` 没执行，整个表达式返回 `undefined`，不会抛出异常
+- 但因为是 `await ...?.add()`，如果 `add` 没执行，整个表达式返回 `undefined`，**不会抛出异常**
 - 只有当 `add()` 本身失败（如 Redis 命令超时）才会抛出异常
 
 **catch 块行为（第 68-77 行）：**
@@ -907,7 +932,7 @@ await BatchExportQueue.getInstance()?.add(QueueJobs.BatchExportJob, {
 
 ---
 
-### 11.2 处理中点击取消后的状态竞争与最终落库状态
+### 11.2 处理中点击取消后的状态竞争与最终落库状态（校正版）
 
 #### 代码证据
 
@@ -920,78 +945,113 @@ cancel: protectedProjectProcedure
     // ...权限校验
     await ctx.prisma.batchExport.update({
       where: { id: input.batchExportId, projectId: input.projectId },
-      data: { status: BatchExportStatus.CANCELLED },  // ⚠️ 无条件更新
+      data: { status: BatchExportStatus.CANCELLED },  // ⚠️ 无条件更新，无版本校验
     });
   }),
 ```
 
-**处理前检查（worker 侧）：** `worker/src/features/batchExport/handleBatchExportJob.ts:72-78`
+**Worker 处理流程（精确时序）：** `worker/src/features/batchExport/handleBatchExportJob.ts:59-123`
 
 ```typescript
-// Check if the batch export has been cancelled
-if (jobDetails.status === BatchExportStatus.CANCELLED) {
-  logger.info(`[BATCH EXPORT] Batch export ${batchExportId} has been cancelled.`);
-  return; // Exit early without processing
+// 阶段 A: 查询 DB (line 59-64)
+const jobDetails = await prisma.batchExport.findFirst({...});
+
+// 阶段 B: 取消检查 (line 72-78)
+if (jobDetails.status === BatchExportStatus.CANCELLED) { return; }
+
+// 阶段 C: 30天过期检查 (line 80-106)
+if (jobDetails.createdAt < thirtyDaysAgo) { ...return; }
+
+// 阶段 D: 非 QUEUED 警告 (line 108-112)
+if (jobDetails.status !== BatchExportStatus.QUEUED) {
+  logger.warn(`Job has invalid status: ${jobDetails.status}. Retrying anyway.`);
 }
-```
 
-**状态更新为 PROCESSING：** `worker/src/features/batchExport/handleBatchExportJob.ts:114-123`
-
-```typescript
-// Set job status to processing
+// 阶段 E: 更新为 PROCESSING (line 114-123)
 await prisma.batchExport.update({
   where: { id: batchExportId, projectId },
-  data: { status: BatchExportStatus.PROCESSING },  // ⚠️ 会覆盖 CANCELLED 状态
+  data: { status: BatchExportStatus.PROCESSING },  // ⚠️ 无条件覆盖
 });
 ```
 
-#### 状态竞争时序分析
+#### 状态竞争时序分析（精确校正版）
 
-**场景 1：取消发生在处理前（正常）**
+**场景 1：取消发生在阶段 A 之前（正常路径）**
 
 ```
 时序：
-  T1: Worker 查询 DB → status=QUEUED ✓
-  T2: 用户点击取消 → DB status=CANCELLED
-  T3: Worker 执行取消检查 → status=CANCELLED → 退出 ✓
+  T0:  用户点击取消 → DB status=CANCELLED
+  T1:  Worker 阶段 A 查询 DB → status=CANCELLED ✓
+  T2:  Worker 阶段 B 取消检查 → 匹配 CANCELLED → 退出 ✓
 
 最终状态：CANCELLED ✓
 ```
 
-**场景 2：取消发生在"查询后、更新前"（竞态窗口）**
+**场景 2：取消发生在阶段 A 和阶段 B 之间（竞态窗口 1）**
 
 ```
 时序：
-  T1: Worker 查询 DB → status=QUEUED（内存中）
-  T2: 用户点击取消 → DB status=CANCELLED  ✅ 取消生效
-  T3: Worker 执行取消检查 → 检查的是 T1 读取的旧值 QUEUED ❌
-  T4: Worker 更新 DB → status=PROCESSING  🚨 覆盖了 CANCELLED
-  T5: Worker 开始流式处理...
+  T1:  Worker 阶段 A 查询 DB → status=QUEUED（读到内存）
+  T1.5: 用户点击取消 → DB status=CANCELLED ✅
+  T2:  Worker 阶段 B 取消检查 → 检查的是内存旧值 QUEUED ❌
+  T3:  Worker 阶段 C 30天检查 → 通过
+  T4:  Worker 阶段 D 警告 → 无警告（status=QUEUED 是合法的）
+  T5:  Worker 阶段 E 更新 DB → status=PROCESSING 🚨 覆盖了 CANCELLED
 
-最终状态：PROCESSING（然后 COMPLETED/FAILED），取消操作被静默覆盖
+最终状态：PROCESSING，取消被静默覆盖
 ```
 
-**场景 3：取消发生在处理中（流式阶段）**
+**场景 3：取消发生在阶段 B 和阶段 E 之间（竞态窗口 2 — 最隐蔽）**
 
 ```
 时序：
-  T1: Worker 已更新为 PROCESSING，正在流式读取 ClickHouse
-  T2: 用户点击取消 → DB status=CANCELLED
-  T3: Worker 继续处理...（流式处理中无取消检查点）
-  T4: Worker 上传 S3 成功 → 更新为 COMPLETED 🚨
+  T1:  Worker 阶段 A 查询 DB → status=QUEUED
+  T2:  Worker 阶段 B 取消检查 → QUEUED ≠ CANCELLED → 继续
+  T2.5: 用户点击取消 → DB status=CANCELLED ✅
+  T3:  Worker 阶段 C 30天检查 → 通过（不检查状态）
+  T4:  Worker 阶段 D 警告 → 读内存旧值 QUEUED → 无警告
+  T5:  Worker 阶段 E 更新 DB → status=PROCESSING 🚨 覆盖了 CANCELLED
+
+最终状态：PROCESSING，取消被静默覆盖
+```
+
+**场景 4：取消发生在阶段 E 之后（流式处理中）**
+
+```
+时序：
+  T1:  Worker 阶段 E 已完成 → DB status=PROCESSING
+  T2:  Worker 开始流式读取 ClickHouse（可能持续数分钟）
+  T3:  用户点击取消 → DB status=CANCELLED ✅
+  T4:  Worker 继续流式处理 → 无任何取消检查点
+  T5:  Worker 上传 S3 成功 → 更新为 COMPLETED 🚨
 
 最终状态：COMPLETED，用户看到取消无效
 ```
+
+#### 前端取消按钮的可见性控制（补充证据）
+
+**文件：** `web/src/features/batch-exports/components/BatchExportsTable.tsx:168-173`
+
+```typescript
+// Only show cancel button for queued or processing exports
+if (status !== "QUEUED" && status !== "PROCESSING") {
+  return null;  // FAILED / COMPLETED / CANCELLED 状态不显示取消按钮
+}
+```
+
+**推导：** 场景 3 和 4 中，用户在阶段 E 之后（status=PROCESSING）点击取消，按钮是可见的，用户能点击并看到状态变为 CANCELLED，但随后又被 Worker 覆盖。
 
 #### 用户可见影响
 
 1. **取消不生效**：用户点击取消后，任务可能仍继续执行并最终完成，用户会困惑为什么取消没起作用。
 
-2. **状态闪变**：用户可能短暂看到状态变为"已取消"，但很快又变回"处理中"或"已完成"。
+2. **状态闪变**：用户可能短暂看到状态变为"已取消"（红色），但很快又变回"处理中"（黄色）或"已完成"（绿色）。
 
 3. **资源浪费**：即使取消了，ClickHouse 查询、S3 上传等资源消耗仍然发生。
 
 4. **无检查点**：流式处理过程中（可能持续数分钟）没有任何取消检测点，一旦开始就无法中断。
+
+5. **取消按钮消失**：当状态最终变为 COMPLETED/FAILED 后，取消按钮会消失，用户无法再次操作。
 
 ---
 
@@ -1077,7 +1137,7 @@ await prisma.batchExport.update({
 
 ---
 
-### 11.4 下载链接过期判定在 worker 与 web 侧的口径差异
+### 11.4 下载链接过期判定在 worker 与 web 侧的口径差异（校正版）
 
 #### 代码证据
 
@@ -1097,11 +1157,12 @@ await prisma.batchExport.update({
 });
 ```
 
-**Web 侧过期判定：** `web/src/features/batch-exports/server/batchExport.ts:158-175`
+**Web 侧过期判定（关键校正：没有解构 expiresAt！）：**
+`web/src/features/batch-exports/server/batchExport.ts:158-175`
 
 ```typescript
 const exportsWithExpiration = exports.map((e) => {
-  const { finishedAt, url, expiresAt, ...rest } = e;  // ⚠️ 解构了 expiresAt 但没使用！
+  const { finishedAt, url, ...rest } = e;  // ⚠️ 校正：根本没有解构 expiresAt！
 
   let isExpired = false;
   if (finishedAt) {
@@ -1114,12 +1175,42 @@ const exportsWithExpiration = exports.map((e) => {
   return {
     ...rest,
     finishedAt,
-    // expiresAt 字段没有返回给前端！
     url: isExpired ? "expired" : url,
     user: userMap.get(e.userId) ?? null,
   };
 });
 ```
+
+**推导过程：**
+1. 解构语句 `const { finishedAt, url, ...rest } = e` 中没有 `expiresAt`
+2. 说明 `expiresAt` 会留在 `...rest` 中
+3. 但 `rest` 中包含哪些字段？需要看 `e` 是什么
+
+**检查查询语句：** `web/src/features/batch-exports/server/batchExport.ts:132-146`
+```typescript
+const exports = await ctx.prisma.batchExport.findMany({
+  where: { projectId: input.projectId },
+  select: {
+    id: true,
+    name: true,
+    status: true,
+    format: true,
+    createdAt: true,
+    finishedAt: true,
+    url: true,
+    userId: true,
+    log: true,
+    // ⚠️ expiresAt 字段根本没被 select！
+  },
+  // ...
+});
+```
+
+**结论链：**
+1. **Step 1**：查询时没有 `select expiresAt` → `e` 对象中根本没有 `expiresAt` 字段
+2. **Step 2**：解构时即使写了 `expiresAt` 也得不到值（实际上连解构都没写）
+3. **Step 3**：Web 侧完全不知道数据库里有 `expiresAt` 这个字段
+4. **Step 4**：用 `finishedAt + 1小时` 硬编码逻辑替代
 
 #### 口径差异对比
 
@@ -1127,52 +1218,149 @@ const exportsWithExpiration = exports.map((e) => {
 |------|-------------------|----------------|
 | **过期时间基准** | `Date.now() + expiresInSeconds` | `finishedAt + 1小时` |
 | **配置来源** | `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` | 硬编码 `60 * 60 * 1000` |
-| **使用字段** | 写入 `expiresAt` 字段 | 忽略 `expiresAt`，使用 `finishedAt` |
+| **字段可见性** | 写入 `expiresAt` 字段 | 查询时不 select `expiresAt`，完全不可见 |
 | **精度** | 上传完成时的精确时间 | finishedAt（可能略早于上传完成） |
+| **配置联动** | 随配置动态变化 | 与配置完全脱钩 |
 
 #### 不一致场景
 
-**当 `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` ≠ 1 时：**
+**当 `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` = 24 时：**
 
 ```
-假设配置为 24 小时：
-  Worker: expiresAt = 完成时间 + 24h
-  Web:    认为过期 = 完成时间 + 1h
+Worker: expiresAt = 完成时间 + 24h （写入 DB）
+Web:    认为过期 = 完成时间 + 1h   （硬编码）
 
 结果：
-  - 1小时后，Web 显示 "expired"，但实际 S3 签名 URL 还有 23 小时有效期
-  - 用户看到"已过期"但点击链接其实还能下载（直到 S3 URL 真正过期）
+  - 1小时后，Web 显示 "Expired"（灰色文字）
+  - 但数据库中 expiresAt 还有 23 小时
+  - 但 S3 签名 URL 本身也还有 23 小时有效期
+  - 结论：用户看到"已过期"，但如果知道 URL 其实还能下载（不过前端显示 Expired 不提供按钮）
 ```
 
-**当配置小于 1 小时（如 30 分钟）：**
+**当配置 = 30 分钟时：**
 
 ```
-Worker: expiresAt = 完成时间 + 30min
-Web:    认为过期 = 完成时间 + 1h
+Worker: expiresAt = 完成时间 + 30min  （写入 DB）
+Web:    认为过期 = 完成时间 + 1h      （硬编码）
 
 结果：
-  - 30min ~ 1h 之间：Web 显示"可下载"，但 S3 URL 实际上已过期
-  - 用户点击"下载"会得到 S3 访问拒绝错误
+  - 30min ~ 1h 之间：Web 显示"Download"按钮 ✅
+  - 但 S3 签名 URL 实际上已过期 ❌
+  - 用户点击"Download" → S3 返回 403 AccessDenied
+  - 用户体验极差，没有任何错误提示
 ```
 
 #### 额外发现
 
-1. **字段未返回**：`expiresAt` 在 Web API 的响应中被解构后丢弃了，前端无法获取真实的过期时间。
+1. **字段完全被忽略**：`expiresAt` 是一个"幽灵字段"——Worker 写了，但 Web 侧从不读取。
 
-2. **双重过期**：
-   - 第一层：S3 签名 URL 本身的过期时间
-   - 第二层：Web 侧基于 finishedAt 的 1 小时判定
-   - 两者独立，可能不一致
+2. **三重独立过期机制**：
+   - 第一层：S3 签名 URL 本身的过期时间（由签名时参数决定）
+   - 第二层：数据库 `expiresAt` 字段（Web 不读）
+   - 第三层：Web 侧基于 `finishedAt` 的 1 小时判定（用户实际看到的）
+   - 三者完全独立，可能都不一致
 
-3. **历史兼容性问题**：如果修改 `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` 配置，历史导出记录的过期判定会出错。
+3. **前端显示逻辑：** `web/src/features/batch-exports/components/BatchExportsTable.tsx:107-121`
+   ```typescript
+   if (url === "expired") {
+     return <span className="text-muted-foreground">Expired</span>;
+   }
+   return <ActionButton href={url}>Download</ActionButton>;
+   ```
+   Web 侧返回 `"expired"` 字符串时，前端显示灰色文字，不提供下载按钮。
 
 #### 用户可见影响
 
-1. **提前显示过期**：配置 > 1 小时时，用户看到"已过期"但实际还能下载。
+1. **提前显示过期**：配置 > 1 小时时，用户看到"Expired"灰色文字，误以为不能下载了。
 
-2. **过期后仍显示可下载**：配置 < 1 小时时，用户点击下载得到 S3 错误，体验很差。
+2. **过期后仍显示可下载**：配置 < 1 小时时，用户点击"Download"得到 S3 403 错误，体验很差。
 
-3. **配置修改陷阱**：管理员修改过期配置后，不会对 Web 侧的硬编码逻辑产生影响，造成认知偏差。
+3. **配置修改陷阱**：管理员修改 `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` 配置后，Web 侧行为完全不变，造成认知偏差。
+
+4. **数据库字段浪费**：`expiresAt` 字段被写入但从不使用，占用存储空间。
+
+---
+
+### 11.5 导出失败任务的前端可见性与提示链路（补充）
+
+#### 代码证据
+
+**前端列表列定义：** `web/src/features/batch-exports/components/BatchExportsTable.tsx:151-160`
+
+```typescript
+{
+  accessorKey: "log",
+  id: "log",
+  header: "Log",
+  size: 300,
+  cell: (row) => {
+    const log = row.getValue() as string | null;
+    return log ?? null;  // ⚠️ log 不为 null 时直接显示原始字符串
+  },
+},
+```
+
+**状态徽章映射：** `web/src/components/layouts/status-badge.tsx:10-11`
+
+```typescript
+const statusCategories = {
+  completed: ["completed", "done", "finished"],
+  error: ["error", "failed"],  // ✅ "failed" 映射到 error 类别
+};
+```
+
+**error 类别样式：** `web/src/components/layouts/status-badge.tsx:53-55`
+```typescript
+} else if (statusCategories.error.includes(normalizedType)) {
+  badgeColor = "bg-light-red text-dark-red";  // 红色背景
+  showDot = false;  // 不显示动画圆点
+}
+```
+
+**失败状态写入：** `worker/src/queues/batchExportQueue.ts:34-42`
+
+```typescript
+await prisma.batchExport.update({
+  where: { id: batchExportId, projectId },
+  data: {
+    status: BatchExportStatus.FAILED,
+    finishedAt: new Date(),
+    log: displayError,  // ✅ 写入错误信息到 log 字段
+  },
+});
+```
+
+#### 失败任务的完整显示链路
+
+```
+Worker 失败
+    ↓
+DB: status=FAILED, log="错误信息"
+    ↓
+Web API: select 包含 log 字段（在 rest 中返回）
+    ↓
+前端表格:
+  - Status 列 → 红色 "Failed" 徽章
+  - Log 列 → 显示原始错误文本
+  - Download URL 列 → url 为 null → 空
+  - Actions 列 → status≠QUEUED/PROCESSING → 不显示取消按钮
+```
+
+#### 用户可见影响
+
+| 元素 | FAILED 状态显示 |
+|------|----------------|
+| **Status 列** | 红色背景徽章，文字 "Failed"，无动画 |
+| **Log 列** | 显示完整错误信息（可能很长，包含 stack trace） |
+| **Download URL 列** | 空（url 为 null） |
+| **Actions 列** | 空（不显示取消按钮） |
+| **取消按钮** | 不显示 |
+
+#### 常见问题
+
+1. **Log 列内容过长**：错误信息可能包含完整的 stack trace，在表格中显示不友好
+2. **没有重试按钮**：用户需要重新创建导出任务，不能直接重试失败的任务
+3. **失败原因不直观**：技术错误信息对普通用户不友好
 
 ---
 
