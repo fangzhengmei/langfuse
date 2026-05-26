@@ -1181,46 +1181,63 @@ const exportsWithExpiration = exports.map((e) => {
 });
 ```
 
-**推导过程：**
-1. 解构语句 `const { finishedAt, url, ...rest } = e` 中没有 `expiresAt`
-2. 说明 `expiresAt` 会留在 `...rest` 中
-3. 但 `rest` 中包含哪些字段？需要看 `e` 是什么
+**推导过程（关键校正：findMany 没有 select！）：**
 
-**检查查询语句：** `web/src/features/batch-exports/server/batchExport.ts:132-146`
-```typescript
-const exports = await ctx.prisma.batchExport.findMany({
-  where: { projectId: input.projectId },
-  select: {
-    id: true,
-    name: true,
-    status: true,
-    format: true,
-    createdAt: true,
-    finishedAt: true,
-    url: true,
-    userId: true,
-    log: true,
-    // ⚠️ expiresAt 字段根本没被 select！
-  },
-  // ...
-});
-```
+1. **检查查询语句：** `web/src/features/batch-exports/server/batchExport.ts:112-122`
+   ```typescript
+   const [exports, totalCount] = await Promise.all([
+     ctx.prisma.batchExport.findMany({
+       where: { projectId: input.projectId },
+       take: input.limit,
+       skip: input.page * input.limit,
+       orderBy: { createdAt: "desc" },
+       // ⚠️ 校正：这里没有 select！返回 batchExport 表的 ALL 字段
+     }),
+     // ...
+   ]);
+   ```
 
-**结论链：**
-1. **Step 1**：查询时没有 `select expiresAt` → `e` 对象中根本没有 `expiresAt` 字段
-2. **Step 2**：解构时即使写了 `expiresAt` 也得不到值（实际上连解构都没写）
-3. **Step 3**：Web 侧完全不知道数据库里有 `expiresAt` 这个字段
-4. **Step 4**：用 `finishedAt + 1小时` 硬编码逻辑替代
+2. **对比 user 查询（有 select）：** `web/src/features/batch-exports/server/batchExport.ts:132-154`
+   ```typescript
+   const users = await ctx.prisma.user.findMany({
+     where: { ... },
+     select: { id: true, name: true, image: true },  // ✅ user 查询有 select
+   });
+   ```
+
+3. **解构语句：** `web/src/features/batch-exports/server/batchExport.ts:158-159`
+   ```typescript
+   const exportsWithExpiration = exports.map((e) => {
+     const { finishedAt, url, ...rest } = e;  // ⚠️ 没有解构 expiresAt
+     // ...
+   ```
+
+4. **返回值：** `web/src/features/batch-exports/server/batchExport.ts:169-174`
+   ```typescript
+   return {
+     ...rest,  // ⚠️ expiresAt 就在这里面！被返回给前端了
+     finishedAt,
+     url: isExpired ? "expired" : url,
+     user: userMap.get(e.userId) ?? null,
+   };
+   ```
+
+**校正后的结论链：**
+1. **Step 1**：查询时**没有** `select` → `e` 对象包含 batchExport 表**所有字段**，包括 `expiresAt`
+2. **Step 2**：解构时没有 `expiresAt` → 它留在 `...rest` 中
+3. **Step 3**：`...rest` 被原样返回 → 前端实际上收到了 `expiresAt` 字段
+4. **Step 4**：但 Web 侧的过期判定逻辑完全无视 `expiresAt`，用 `finishedAt + 1小时` 硬编码替代
+5. **Step 5**：前端代码也没有使用 `expiresAt` 字段（没在表格列中显示）
 
 #### 口径差异对比
 
-| 维度 | Worker 侧（写入时） | Web 侧（读取时） |
-|------|-------------------|----------------|
-| **过期时间基准** | `Date.now() + expiresInSeconds` | `finishedAt + 1小时` |
-| **配置来源** | `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` | 硬编码 `60 * 60 * 1000` |
-| **字段可见性** | 写入 `expiresAt` 字段 | 查询时不 select `expiresAt`，完全不可见 |
-| **精度** | 上传完成时的精确时间 | finishedAt（可能略早于上传完成） |
-| **配置联动** | 随配置动态变化 | 与配置完全脱钩 |
+| 维度 | Worker 侧（写入时） | Web 侧（读取时） | 前端（最终） |
+|------|-------------------|----------------|-------------|
+| **过期时间基准** | `Date.now() + expiresInSeconds` | `finishedAt + 1小时` | 显示 Web 侧结果 |
+| **配置来源** | `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` | 硬编码 `60 * 60 * 1000` | 硬编码 |
+| **字段可见性** | 写入 `expiresAt` 字段 | 实际收到但逻辑不使用 | 收到但不显示/使用 |
+| **精度** | 上传完成时的精确时间 | finishedAt（可能略早于上传完成） | - |
+| **配置联动** | 随配置动态变化 | 与配置完全脱钩 | 与配置完全脱钩 |
 
 #### 不一致场景
 
@@ -1252,11 +1269,11 @@ Web:    认为过期 = 完成时间 + 1h      （硬编码）
 
 #### 额外发现
 
-1. **字段完全被忽略**：`expiresAt` 是一个"幽灵字段"——Worker 写了，但 Web 侧从不读取。
+1. **字段被浪费但传输了**：`expiresAt` 不是"幽灵字段"——DB 写入了，Web API 也返回给前端了，但两端都**逻辑上不使用**。
 
 2. **三重独立过期机制**：
    - 第一层：S3 签名 URL 本身的过期时间（由签名时参数决定）
-   - 第二层：数据库 `expiresAt` 字段（Web 不读）
+   - 第二层：数据库 `expiresAt` 字段（Web API 返回但逻辑不使用）
    - 第三层：Web 侧基于 `finishedAt` 的 1 小时判定（用户实际看到的）
    - 三者完全独立，可能都不一致
 
@@ -1269,6 +1286,8 @@ Web:    认为过期 = 完成时间 + 1h      （硬编码）
    ```
    Web 侧返回 `"expired"` 字符串时，前端显示灰色文字，不提供下载按钮。
 
+4. **潜在性能问题**：由于没有 `select`，每次列表查询都会拉回完整的 `query` 字段（可能很大，包含完整的过滤器、搜索条件、排序规则），以及其他不需要的字段。
+
 #### 用户可见影响
 
 1. **提前显示过期**：配置 > 1 小时时，用户看到"Expired"灰色文字，误以为不能下载了。
@@ -1277,7 +1296,7 @@ Web:    认为过期 = 完成时间 + 1h      （硬编码）
 
 3. **配置修改陷阱**：管理员修改 `BATCH_EXPORT_DOWNLOAD_LINK_EXPIRATION_HOURS` 配置后，Web 侧行为完全不变，造成认知偏差。
 
-4. **数据库字段浪费**：`expiresAt` 字段被写入但从不使用，占用存储空间。
+4. **字段浪费**：`expiresAt` 字段被写入、被传输，但逻辑上不被使用。
 
 ---
 
@@ -1361,6 +1380,205 @@ Web API: select 包含 log 字段（在 rest 中返回）
 1. **Log 列内容过长**：错误信息可能包含完整的 stack trace，在表格中显示不友好
 2. **没有重试按钮**：用户需要重新创建导出任务，不能直接重试失败的任务
 3. **失败原因不直观**：技术错误信息对普通用户不友好
+
+---
+
+### 11.6 create 报错后导出记录的可见性与用户提示链路（新增）
+
+#### 代码证据
+
+**后端 create 流程：** `web/src/features/batch-exports/server/batchExport.ts:36-77`
+
+```typescript
+try {
+  // 步骤 1: 先写入 DB（成功）
+  const exportJob = await ctx.prisma.batchExport.create({
+    data: { ..., status: BatchExportStatus.QUEUED },
+  });
+
+  // 步骤 2: 审计日志（成功）
+  await auditLog({ ... });
+
+  // 步骤 3: 入队（可能失败）
+  await BatchExportQueue.getInstance()?.add(...);  // ← 这里失败
+} catch (e) {
+  // 捕获异常，但不回滚 DB！
+  logger.error("[BATCH EXPORT] Failed to create export job", e);
+  throw new TRPCError({
+    code: "INTERNAL_SERVER_ERROR",
+    message: "Creating export job failed.",
+  });
+}
+```
+
+**关键发现：catch 块只抛出错误，没有回滚数据库！**
+
+**前端创建按钮：** `web/src/components/BatchExportTableButton.tsx:38-73`
+
+```typescript
+const createExport = api.batchExport.create.useMutation({
+  onSettled: () => {
+    setIsExporting(false);
+  },
+  onSuccess: () => {
+    showSuccessToast({  // ✅ 成功提示
+      title: "Export queued",
+      description: "You will receive an email when the export is ready.",
+      duration: 10000,
+      link: { href: `/project/${props.projectId}/settings/exports`, text: "View exports" },
+    });
+  },
+  // ⚠️ 没有 onError 回调！
+});
+
+const handleExport = async (format: BatchExportFileFormat) => {
+  setIsExporting(true);
+  await createExport.mutateAsync({ ... });  // ← 没有 try-catch！
+};
+```
+
+**全局 tRPC 错误处理：** `web/src/utils/api.ts:223-224`
+
+```typescript
+mutations: {
+  onError: (error) => handleTrpcError(error),  // ✅ 全局错误处理
+  // ...
+},
+```
+
+**handleTrpcError 逻辑：** `web/src/utils/api.ts:105-133`
+
+```typescript
+const handleTrpcError = (error: unknown, shouldSilenceError: boolean = false) => {
+  if (error instanceof TRPCClientError) {
+    // ... 检查版本不匹配
+    captureException(error);  // 上报 Sentry
+  } else {
+    captureException(error);
+  }
+
+  if (!shouldSilenceError && shouldShowToast(error)) {
+    trpcErrorToast(error);  // ✅ 显示错误 Toast
+  }
+};
+```
+
+**前端列表查询逻辑：** `web/src/features/batch-exports/components/BatchExportsTable.tsx:39-43`
+
+```typescript
+const batchExports = api.batchExport.all.useQuery({
+  projectId: props.projectId,
+  limit: paginationState.pageSize,
+  page: paginationState.pageIndex,
+});
+// 列表查询没有过滤 status，会返回 ALL 记录
+```
+
+#### 完整链路分析
+
+**用户感知时序（入队失败场景）：**
+
+```
+T1: 用户点击 Export → CSV
+    ↓
+T2: 前端调用 createExport.mutateAsync()
+    ↓
+T3: 后端 create() 执行：
+    - DB insert 成功 ✅ (status=QUEUED)
+    - auditLog 成功 ✅
+    - 入队失败 ❌ (Redis 超时)
+    ↓
+T4: 后端 catch 块捕获，抛出 TRPCError(INTERNAL_SERVER_ERROR)
+    ↓
+T5: 前端收到错误：
+    - 全局 onError 触发 handleTrpcError()
+    - trpcErrorToast() 显示红色错误 Toast："Creating export job failed."
+    - onSettled 触发 setIsExporting(false)
+    ↓
+T6: 1~2 秒后，列表自动 refetch（React Query 行为）
+    ↓
+T7: 用户看到：
+    ✅ 错误 Toast（右上角）
+    ✅ 列表中多了一条 QUEUED 状态的导出记录
+    ✅ 这条记录有 Cancel 按钮（因为 status=QUEUED）
+```
+
+**关键结论：DB 记录没有回滚，用户既看到错误提示，又看到 QUEUED 状态的记录。**
+
+#### 用户可见影响
+
+| 现象 | 描述 |
+|------|------|
+| **矛盾的提示** | 用户同时看到"创建失败"的错误 Toast 和列表中新的 QUEUED 记录 |
+| **困惑** | 用户不知道这条记录是否会被处理，是否需要重新导出 |
+| **潜在的重复导出** | 用户可能因为看到错误提示而重新点击导出，导致重复任务 |
+| **可取消** | 这条 QUEUED 记录显示 Cancel 按钮，用户可以手动取消 |
+
+---
+
+### 11.7 入队失败 vs 静默未入队：用户感知差异对比（新增）
+
+#### 两条分支的代码路径
+
+**分支 A：静默未入队（可选链短路）**
+```typescript
+await BatchExportQueue.getInstance()?.add(...);
+// getInstance() 返回 null → ?. 短路 → add() 不执行 → await undefined → 不抛异常
+```
+
+**分支 B：入队失败（Redis 命令异常）**
+```typescript
+await BatchExportQueue.getInstance()?.add(...);
+// getInstance() 返回实例 → add() 执行 → Redis 超时 → 抛异常 → catch 块捕获
+```
+
+#### 对比分析
+
+| 维度 | 分支 A：静默未入队 | 分支 B：入队失败 |
+|------|------------------|----------------|
+| **触发条件** | Redis 连接失败，`getInstance() === null` | Redis 连接正常但命令超时/失败 |
+| **异常抛出** | ❌ 不抛异常 | ✅ 抛异常 |
+| **onSuccess 触发** | ✅ 触发（没有异常就是成功） | ❌ 不触发 |
+| **onError 触发** | ❌ 不触发 | ✅ 触发 |
+| **Toast 提示** | ✅ 绿色成功 Toast："Export queued" | ✅ 红色错误 Toast："Creating export job failed." |
+| **DB 记录** | ✅ status=QUEUED | ✅ status=QUEUED |
+| **列表可见性** | ✅ 可见 | ✅ 可见 |
+| **记录是否会被处理** | ❌ 永远不会 | ❌ 永远不会 |
+| **Cancel 按钮** | ✅ 显示 | ✅ 显示 |
+| **用户认知** | 认为导出已成功排队，会一直等 | 知道失败了，但困惑列表里为什么还有记录 |
+| **问题发现难度** | ⭐⭐⭐⭐⭐ 很难发现，除非用户等很久 | ⭐⭐ 容易发现，有明确错误提示 |
+| **日志证据** | ⚠️ 没有任何错误日志 | ✅ Web 日志："Failed to create export job" + stack trace |
+| **恢复方式** | 用户手动取消后重新导出 | 用户手动取消后重新导出 |
+
+#### 静默未入队的隐蔽性
+
+**用户视角（分支 A）：**
+1. 点击导出 → 看到绿色成功提示 ✅
+2. 跳转到导出列表 → 看到 QUEUED 状态 ✅
+3. 等了 10 分钟 → 还是 QUEUED ❓
+4. 再等 30 分钟 → 还是 QUEUED ❓❓
+5. 最终结论：要么系统很慢，要么卡住了 → 手动取消重试
+
+**用户视角（分支 B）：**
+1. 点击导出 → 看到红色错误提示 ❌
+2. 同时看到列表里多了一条 QUEUED 记录 ❓
+3. 结论：创建失败了，但为什么列表里有？→ 手动取消重试
+
+#### 共同问题
+
+两条分支的最终结果都是：**数据库中有一条 QUEUED 状态的记录，但永远不会被处理。**
+
+唯一的区别是用户是否被告知了真相。
+
+---
+
+### 11.8 校正总结：三个需要修正的原有结论
+
+| 原有结论 | 校正后结论 | 证据 |
+|---------|-----------|------|
+| findMany 使用了 select，没有查询 expiresAt | ❌ 错误。findMany **没有** select，返回所有字段，expiresAt 被返回给前端 | `batchExport.ts:112-122` |
+| create 入队失败后，DB 记录前端看不到 | ❌ 错误。DB 记录没有回滚，列表查询没有过滤，前端能看到 | `batchExport.ts:36-77` 无回滚 + `findMany` 无过滤 |
+| 入队失败和静默未入队用户感知差不多 | ❌ 错误。前者有明确错误提示，后者显示成功，隐蔽性差异巨大 | 见 11.7 对比表 |
 
 ---
 
