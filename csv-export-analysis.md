@@ -918,15 +918,15 @@ queue.add(name: string, data: object, opts?: JobsOptions): Promise<Job>
 
 | 场景 | 数据库状态 | 前端反馈 | 后续行为 |
 |------|-----------|---------|---------|
-| **队列实例为 null（可选链短路）** | ✅ 已写入，status=QUEUED | ✅ 显示成功，任务在列表中 | ⚠️ 任务永远卡在 QUEUED，不会被处理 |
+| **队列实例为 null（可选链短路）** | ✅ 已写入，status=QUEUED | ✅ 显示成功，任务在列表中 | ⚠️ 任务卡在 QUEUED，若无入队则不会处理（见 11.7 推理边界） |
 | **入队失败（Redis 命令异常）** | ✅ 已写入，status=QUEUED | ❌ 显示"创建导出任务失败" | ⚠️ DB 中存在僵尸任务，前端看不到 |
 | **正常路径** | ✅ 已写入，status=QUEUED | ✅ 显示成功 | ✅ Worker 正常处理 |
 
 #### 用户可见影响
 
-1. **静默失败（最危险）**：当 `getInstance()` 返回 null 时，前端显示"创建成功"，任务列表中显示状态为 QUEUED，但实际上任务永远不会被处理。用户会一直等待，直到手动取消或重新导出。
+1. **静默失败（最危险）**：当 `getInstance()` 返回 null 时，前端显示"创建成功"，任务列表中显示状态为 QUEUED。在当前代码版本下，若任务未成功入队则不会被处理，除非用户手动取消或重新创建。用户会持续等待，直到手动取消或重新导出。
 
-2. **僵尸任务**：当入队失败并抛出异常时，前端显示失败，但数据库中已经存在一条 status=QUEUED 的记录。这条记录不会出现在前端的错误提示中，但会一直留在数据库里。
+2. **僵尸任务（条件：用户导航到 Exports 页面）**：当入队失败并抛出异常时，前端显示失败，但数据库中已经存在一条 status=QUEUED 的记录。若用户导航到 Exports 页面，这条记录会出现在列表中。（详见 11.6 列表可见性分析）
 
 3. **诊断困难**：需要查看 Web 容器的日志才能发现 `[BATCH EXPORT] Failed to create export job`，但如果是可选链短路的情况，连错误日志都没有！
 
@@ -1476,43 +1476,61 @@ const batchExports = api.batchExport.all.useQuery({
 
 #### 完整链路分析
 
-**用户感知时序（入队失败场景）：**
+**入队失败场景的代码可证明时序：**
 
 ```
 T1: 用户点击 Export → CSV
     ↓
 T2: 前端调用 createExport.mutateAsync()
     ↓
-T3: 后端 create() 执行：
-    - DB insert 成功 ✅ (status=QUEUED)
-    - auditLog 成功 ✅
-    - 入队失败 ❌ (Redis 超时)
+T3: 后端 create() 执行（有代码证据）：
+    - DB insert 成功 ✅ (status=QUEUED)          ← batchExport.ts:37-46
+    - auditLog 成功 ✅                             ← batchExport.ts:49-56
+    - 入队失败 ❌ (Redis 超时 / 实例为null)        ← batchExport.ts:59-67
     ↓
 T4: 后端 catch 块捕获，抛出 TRPCError(INTERNAL_SERVER_ERROR)
+                                                    ← batchExport.ts:68-77
     ↓
-T5: 前端收到错误：
-    - 全局 onError 触发 handleTrpcError()
-    - trpcErrorToast() 显示红色错误 Toast："Creating export job failed."
-    - onSettled 触发 setIsExporting(false)
-    ↓
-T6: 1~2 秒后，列表自动 refetch（React Query 行为）
-    ↓
-T7: 用户看到：
-    ✅ 错误 Toast（右上角）
-    ✅ 列表中多了一条 QUEUED 状态的导出记录
-    ✅ 这条记录有 Cancel 按钮（因为 status=QUEUED）
+T5: 前端收到错误（有代码证据）：
+    - 全局 onError 触发 handleTrpcError()          ← api.ts:223-224
+    - trpcErrorToast() 显示红色错误 Toast           ← api.ts:130-131
+    - onSettled 触发 setIsExporting(false)          ← BatchExportTableButton.tsx:39-41
 ```
 
-**关键结论：DB 记录没有回滚，用户既看到错误提示，又看到 QUEUED 状态的记录。**
+**关键结论（有代码证据）：DB 记录没有回滚，用户会看到错误 Toast。**
+
+**列表可见性（需条件假设的行为）：**
+
+| 条件 | 用户是否看到 QUEUED 记录 | 触发路径 |
+|------|------------------------|---------|
+| 用户已在 Exports 页面 | ⚠️ 不一定 | React Query 不会自动 refetch mutation 错误后的查询。列表数据取决于：① 是否有 `staleTime` 过期触发重取；② 用户是否手动刷新；③ 是否有其他事件触发该 query key 失效 |
+| 用户点击成功 toast 中的 "View exports" 链接 | N/A（错误场景没有这个链接） | 错误路径没有 onSuccess，没有跳转链接 |
+| 用户稍后导航到 Exports 页面 | ✅ 会看到 | 新页面挂载时 `useQuery` 会触发新的 DB 查询 |
+| 用户刷新浏览器 | ✅ 会看到 | 页面刷新触发新的 DB 查询 |
+
+**代码证据：取消操作有显式 refetch，但 create 操作没有：**
+- `BatchExportsTable.tsx:45-51`：cancel mutation 的 `onSuccess` 中有 `void batchExports.refetch()`
+- `BatchExportTableButton.tsx:38-53`：create mutation 的 `onSuccess` 和全局配置中都**没有** refetch 或 invalidate 调用
+
+#### 可证明的行为 vs 条件假设的行为
+
+| 行为类型 | 具体描述 | 证据 / 假设边界 |
+|---------|---------|----------------|
+| **可证明** | 入队失败时 DB 记录已写入 | `batchExport.ts:37-46` 先于入队执行，无回滚 |
+| **可证明** | 入队失败时前端显示红色错误 Toast | `api.ts:223-224` 全局 mutation onError |
+| **可证明** | 记录状态为 QUEUED | `batchExport.ts:41` 硬编码 `status: BatchExportStatus.QUEUED` |
+| **条件假设** | 用户看到列表中的新记录 | 依赖用户是否导航到 Exports 页面、React Query 缓存状态 |
+| **条件假设** | 记录 "永远" 不会被处理 | 当前代码无重试机制，但未来可能添加 |
 
 #### 用户可见影响
 
-| 现象 | 描述 |
-|------|------|
-| **矛盾的提示** | 用户同时看到"创建失败"的错误 Toast 和列表中新的 QUEUED 记录 |
-| **困惑** | 用户不知道这条记录是否会被处理，是否需要重新导出 |
-| **潜在的重复导出** | 用户可能因为看到错误提示而重新点击导出，导致重复任务 |
-| **可取消** | 这条 QUEUED 记录显示 Cancel 按钮，用户可以手动取消 |
+| 现象 | 描述 | 置信度 |
+|------|------|--------|
+| **错误提示** | 用户看到红色 Toast："Creating export job failed." | ✅ 可证明 |
+| **DB 记录存在** | 数据库中有 status=QUEUED 的记录 | ✅ 可证明 |
+| **列表可见性** | 用户可能看到矛盾的提示（错误 + 列表中有记录） | ⚠️ 需条件 |
+| **困惑** | 用户不知道这条记录是否会被处理，是否需要重新导出 | ⚠️ 需条件 |
+| **可取消** | 如果用户看到记录，Cancel 按钮可用 | ⚠️ 需条件（用户看到列表） |
 
 ---
 
@@ -1532,41 +1550,53 @@ await BatchExportQueue.getInstance()?.add(...);
 // getInstance() 返回实例 → add() 执行 → Redis 超时 → 抛异常 → catch 块捕获
 ```
 
-#### 对比分析
+#### 对比分析（标注可证明性）
 
-| 维度 | 分支 A：静默未入队 | 分支 B：入队失败 |
-|------|------------------|----------------|
-| **触发条件** | Redis 连接失败，`getInstance() === null` | Redis 连接正常但命令超时/失败 |
-| **异常抛出** | ❌ 不抛异常 | ✅ 抛异常 |
-| **onSuccess 触发** | ✅ 触发（没有异常就是成功） | ❌ 不触发 |
-| **onError 触发** | ❌ 不触发 | ✅ 触发 |
-| **Toast 提示** | ✅ 绿色成功 Toast："Export queued" | ✅ 红色错误 Toast："Creating export job failed." |
-| **DB 记录** | ✅ status=QUEUED | ✅ status=QUEUED |
-| **列表可见性** | ✅ 可见 | ✅ 可见 |
-| **记录是否会被处理** | ❌ 永远不会 | ❌ 永远不会 |
-| **Cancel 按钮** | ✅ 显示 | ✅ 显示 |
-| **用户认知** | 认为导出已成功排队，会一直等 | 知道失败了，但困惑列表里为什么还有记录 |
-| **问题发现难度** | ⭐⭐⭐⭐⭐ 很难发现，除非用户等很久 | ⭐⭐ 容易发现，有明确错误提示 |
-| **日志证据** | ⚠️ 没有任何错误日志 | ✅ Web 日志："Failed to create export job" + stack trace |
-| **恢复方式** | 用户手动取消后重新导出 | 用户手动取消后重新导出 |
+| 维度 | 分支 A：静默未入队 | 分支 B：入队失败 | 可证明性 |
+|------|------------------|----------------|---------|
+| **触发条件** | Redis 连接失败，`getInstance() === null` | Redis 连接正常但命令超时/失败 | ✅ 可证明 |
+| **异常抛出** | ❌ 不抛异常 | ✅ 抛异常 | ✅ 可证明 |
+| **onSuccess 触发** | ✅ 触发（无异常即成功） | ❌ 不触发 | ✅ 可证明 |
+| **onError 触发** | ❌ 不触发 | ✅ 触发 | ✅ 可证明 |
+| **Toast 提示** | ✅ 绿色："Export queued" | ✅ 红色："Creating export job failed." | ✅ 可证明 |
+| **DB 记录** | ✅ status=QUEUED | ✅ status=QUEUED | ✅ 可证明 |
+| **列表可见性** | ✅ 可见（条件：用户到 Exports 页面） | ✅ 可见（条件：用户到 Exports 页面） | ⚠️ 条件假设 |
+| **记录是否会被处理** | ❌ 当前无机制会处理 | ❌ 当前无机制会处理 | ⚠️ 需条件 |
+| **Cancel 按钮** | ✅ 显示（条件：用户看到列表） | ✅ 显示（条件：用户看到列表） | ⚠️ 条件假设 |
+| **用户认知** | 认为导出已成功排队，会一直等 | 知道失败了，但困惑列表里为什么还有记录 | ⚠️ 条件假设 |
+| **问题发现难度** | ⭐⭐⭐⭐⭐ 极难发现 | ⭐⭐ 容易发现 | ⚠️ 条件假设 |
+| **日志证据** | ⚠️ 没有错误日志 | ✅ Web 日志："Failed to create export job" | ✅ 可证明 |
+| **恢复方式** | 用户手动取消后重新导出 | 用户手动取消后重新导出 | ✅ 可证明 |
+
+#### "记录不会被处理"的推理边界
+
+**可证明的部分：**
+- 当前代码中，只有 `create()` 接口会调用 `BatchExportQueue.getInstance()?.add()` 入队
+- Worker 侧 `handleBatchExportJob()` 只在队列消费时被调用
+- 没有 cron job、定时任务或其他机制会扫描 QUEUED 状态的记录
+
+**需要条件假设的部分：**
+- 如果未来添加了重试 QUEUED 记录的机制，则此结论不成立
+- 如果 Redis 恢复后有某种补偿逻辑重新入队，则此结论不成立
+- 严谨表述：**在当前代码版本（v2026-05-26）下，若任务未成功入队，则不会被处理，除非用户手动取消并重新创建。**
 
 #### 静默未入队的隐蔽性
 
 **用户视角（分支 A）：**
-1. 点击导出 → 看到绿色成功提示 ✅
-2. 跳转到导出列表 → 看到 QUEUED 状态 ✅
-3. 等了 10 分钟 → 还是 QUEUED ❓
-4. 再等 30 分钟 → 还是 QUEUED ❓❓
+1. 点击导出 → 看到绿色成功提示 ✅（可证明）
+2. 用户可能通过 toast 中的链接跳转到 Exports 页面 → 看到 QUEUED 状态 ✅（条件：用户点击链接）
+3. 等了 10 分钟 → 还是 QUEUED ❓（条件：用户等待）
+4. 再等 30 分钟 → 还是 QUEUED ❓❓（条件：用户继续等待）
 5. 最终结论：要么系统很慢，要么卡住了 → 手动取消重试
 
 **用户视角（分支 B）：**
-1. 点击导出 → 看到红色错误提示 ❌
-2. 同时看到列表里多了一条 QUEUED 记录 ❓
+1. 点击导出 → 看到红色错误提示 ❌（可证明）
+2. 用户可能稍后导航到 Exports 页面 → 看到 QUEUED 记录 ❓（条件：用户导航）
 3. 结论：创建失败了，但为什么列表里有？→ 手动取消重试
 
 #### 共同问题
 
-两条分支的最终结果都是：**数据库中有一条 QUEUED 状态的记录，但永远不会被处理。**
+两条分支的最终结果（在当前代码版本下）都是：**数据库中有一条 QUEUED 状态的记录，若未成功入队则不会被处理。**
 
 唯一的区别是用户是否被告知了真相。
 
@@ -1577,8 +1607,52 @@ await BatchExportQueue.getInstance()?.add(...);
 | 原有结论 | 校正后结论 | 证据 |
 |---------|-----------|------|
 | findMany 使用了 select，没有查询 expiresAt | ❌ 错误。findMany **没有** select，返回所有字段，expiresAt 被返回给前端 | `batchExport.ts:112-122` |
-| create 入队失败后，DB 记录前端看不到 | ❌ 错误。DB 记录没有回滚，列表查询没有过滤，前端能看到 | `batchExport.ts:36-77` 无回滚 + `findMany` 无过滤 |
+| create 入队失败后，DB 记录前端看不到 | ❌ 错误。DB 记录没有回滚，列表查询没有过滤，前端在导航到 Exports 页面时能看到 | `batchExport.ts:36-77` 无回滚 + `findMany` 无过滤 |
 | 入队失败和静默未入队用户感知差不多 | ❌ 错误。前者有明确错误提示，后者显示成功，隐蔽性差异巨大 | 见 11.7 对比表 |
+
+---
+
+### 11.9 推理边界与条件假设汇总
+
+本文档中的结论分为三类，读者需注意其适用范围：
+
+#### A 类：可直接从源码证明的结论（无歧义）
+
+| 结论 | 源码证据 |
+|------|---------|
+| create 先写 DB，再入队，入队失败不回滚 | `batchExport.ts:37-67` |
+| 入队失败时 catch 块仅抛异常，不回滚 DB | `batchExport.ts:68-77` |
+| 队列实例为 null 时，可选链短路不抛异常 | `batchExport.ts:59` |
+| 入队失败时前端显示红色错误 Toast | `api.ts:223-224` |
+| 入队成功时前端显示绿色成功 Toast | `BatchExportTableButton.tsx:43-53` |
+| 列表查询不使用 select，返回所有字段 | `batchExport.ts:112-122` |
+| 列表查询不按 status 过滤 | `batchExport.ts:113` |
+| 取消按钮仅对 QUEUED/PROCESSING 显示 | `BatchExportsTable.tsx:168-173` |
+| cancel mutation 显式调用 refetch | `BatchExportsTable.tsx:47` |
+| create mutation 不调用 refetch 或 invalidate | `BatchExportTableButton.tsx:38-53` |
+| 失败重试时 FAILED→PROCESSING 状态切换 | `batchExportQueue.ts:34-42` + `handleBatchExportJob.ts:114-123` |
+| 重试时检测到非 QUEUED 状态仍继续 | `handleBatchExportJob.ts:108-112` |
+| Worker 写入 expiresAt 但 Web 逻辑不使用 | `handleBatchExportJob.ts:286-291` vs `batchExport.ts:158-175` |
+| 无 cron/补偿机制重新处理 QUEUED 记录 | 全局搜索无匹配结果 |
+
+#### B 类：需要条件假设的结论（有边界）
+
+| 结论 | 适用条件 | 假设边界 |
+|------|---------|---------|
+| 用户看到列表中的 QUEUED 记录 | 用户导航到 Exports 页面，或手动刷新浏览器 | React Query 缓存状态、页面挂载时机 |
+| 记录不会被处理 | 当前代码版本，无未来的重试/补偿逻辑 | 代码版本更新后可能不成立 |
+| 用户因错误提示而困惑 | 用户同时看到错误 Toast 和列表记录 | 取决于用户是否注意到列表变化 |
+| 静默失败难以发现 | 用户不查看 Worker/Web 日志 | 取决于用户对系统的监控能力 |
+
+#### C 类：需要外部环境配合的行为（非代码决定）
+
+| 行为 | 影响因素 | 不确定性 |
+|------|---------|---------|
+| React Query 缓存过期 | `staleTime` 配置（未找到显式配置，使用默认值 0） | 默认值可能随版本变化 |
+| 用户是否点击 toast 中的链接 | 用户行为 | 不可预测 |
+| 用户等待多久后取消 | 用户耐心 | 不可预测 |
+
+**核心原则：** 本文档中所有涉及用户感知的结论均标注了置信度，涉及"永远"、"必然"等绝对表述均已替换为带前置条件的严谨结论。
 
 ---
 
